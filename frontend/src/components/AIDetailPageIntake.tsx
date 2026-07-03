@@ -58,8 +58,8 @@ export default function AIDetailPageIntake() {
 
       const data = await res.json();
       setRunId(data.id);
-    } catch (err: any) {
-      setError(err.message || "연결 요류가 발생했습니다.");
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "연결 오류가 발생했습니다.");
     } finally {
       setLoading(false);
     }
@@ -70,11 +70,11 @@ export default function AIDetailPageIntake() {
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col items-center justify-center p-6">
+    <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col items-center justify-center p-6 w-full">
       {/* Brand Context */}
       <div className="mb-6 flex items-center space-x-2">
-        <span className="text-xl font-bold tracking-tight text-indigo-600">Sellform</span>
-        <span className="bg-indigo-50 text-indigo-700 text-xs px-2.5 py-1 rounded-full font-semibold border border-indigo-100">
+        <span className="text-xl font-bold tracking-tight text-emerald-600">Sellform</span>
+        <span className="bg-emerald-50 text-emerald-700 text-xs px-2.5 py-1 rounded-full font-semibold border border-emerald-100">
           AI 상세페이지
         </span>
       </div>
@@ -83,7 +83,7 @@ export default function AIDetailPageIntake() {
       <div className="text-center max-w-xl mb-10">
         <h1 className="text-3xl font-extrabold tracking-tight text-slate-900 sm:text-4xl mb-4 leading-tight">
           상품 사진이나 URL을 넣으면 <br />
-          <span className="text-indigo-600 font-black">AI가 상세페이지를 만들어드려요.</span>
+          <span className="text-emerald-600 font-black">AI가 상세페이지를 만들어드려요.</span>
         </h1>
         <p className="text-slate-500 text-base leading-relaxed">
           상품을 어떻게 설명해야 할지 몰라도 괜찮아요. <br />
@@ -97,7 +97,7 @@ export default function AIDetailPageIntake() {
         className="w-full max-w-2xl bg-white rounded-2xl shadow-xl shadow-slate-100 border border-slate-100 p-8 space-y-6"
       >
         {error && (
-          <div className="bg-rose-50 border border-rose-100 text-rose-700 text-sm px-4 py-3 rounded-lg">
+          <div className="bg-rose-50 border border-rose-100 text-rose-700 text-sm px-4 py-3 rounded-lg animate-shake">
             {error}
           </div>
         )}
@@ -120,12 +120,12 @@ export default function AIDetailPageIntake() {
                     strokeLinecap="round"
                     strokeLinejoin="round"
                     strokeWidth="2"
-                    d="M13 13h3a3 3 0 0 0 0-6h-.025A5.56 5.56 0 0 0 16 6.5 5.5 5.5 0 0 0 5.207 5.021C5.137 5.017 5.071 5 5 5a4 4 0 0 0 0 8h2.167M10 15V6m0 0L8 8m2-2 2 2"
+                    d="M13 13h3a3 3 0 0 0 0-6h-.025A5.56 5.56 0 0 0 16 6.5 5.5 5.5 0 0 0 5.207 5.021C5.137 5.017 5.071 5 5 5a4 4 0 0 0 0 8h2.167"
                   />
                 </svg>
                 <p className="text-xs text-slate-500 font-medium">
                   {fileName ? (
-                    <span className="text-indigo-600 font-semibold">{fileName}</span>
+                    <span className="text-emerald-600 font-semibold">{fileName}</span>
                   ) : (
                     "클릭하여 이미지 업로드"
                   )}
@@ -145,7 +145,7 @@ export default function AIDetailPageIntake() {
               placeholder="상품 URL"
               value={productUrl}
               onChange={(e) => setProductUrl(e.target.value)}
-              className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent text-sm bg-slate-50 hover:bg-slate-100/50 transition-colors"
+              className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent text-sm bg-slate-50 hover:bg-slate-100/50 transition-colors"
             />
           </div>
           <div>
@@ -156,7 +156,7 @@ export default function AIDetailPageIntake() {
               value={productName}
               onChange={(e) => setProductName(e.target.value)}
               required
-              className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent text-sm bg-slate-50 hover:bg-slate-100/50 transition-colors"
+              className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent text-sm bg-slate-50 hover:bg-slate-100/50 transition-colors"
             />
           </div>
         </div>
@@ -169,7 +169,7 @@ export default function AIDetailPageIntake() {
             value={description}
             onChange={(e) => setDescription(e.target.value)}
             rows={3}
-            className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent text-sm bg-slate-50 hover:bg-slate-100/50 transition-colors resize-none"
+            className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent text-sm bg-slate-50 hover:bg-slate-100/50 transition-colors resize-none"
           />
         </div>
 
@@ -182,9 +182,9 @@ export default function AIDetailPageIntake() {
                 key={preset}
                 type="button"
                 onClick={() => setSelectedPreset(preset)}
-                className={`px-4 py-2 rounded-xl text-xs font-semibold border transition-all ${
+                className={`px-4 py-2 rounded-xl text-xs font-semibold border transition-all cursor-pointer ${
                   selectedPreset === preset
-                    ? "bg-indigo-600 text-white border-indigo-600 shadow-md shadow-indigo-100"
+                    ? "bg-emerald-600 text-white border-emerald-600 shadow-md shadow-emerald-100"
                     : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100 hover:text-slate-800"
                 }`}
               >
@@ -198,7 +198,7 @@ export default function AIDetailPageIntake() {
         <button
           type="submit"
           disabled={loading}
-          className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-4 px-6 rounded-xl transition-all shadow-lg shadow-indigo-200 hover:shadow-indigo-300 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center space-x-2 text-sm"
+          className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-4 px-6 rounded-xl transition-all shadow-lg shadow-emerald-100 hover:shadow-emerald-200 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center space-x-2 text-sm cursor-pointer"
         >
           {loading ? (
             <span>생성 요청 중...</span>

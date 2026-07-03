@@ -101,7 +101,7 @@ export default function GenerationProgressShell({ runId }: GenerationProgressShe
                 key={step}
                 className={`flex items-center space-x-4 p-3 rounded-xl border transition-all ${
                   status === "active"
-                    ? "bg-indigo-50 border-indigo-200 shadow-sm"
+                    ? "bg-emerald-50 border-emerald-200 shadow-sm"
                     : status === "completed"
                     ? "bg-slate-50/50 border-slate-100 opacity-60"
                     : "bg-white border-transparent opacity-40"
@@ -114,7 +114,7 @@ export default function GenerationProgressShell({ runId }: GenerationProgressShe
                       ✓
                     </span>
                   ) : status === "active" ? (
-                    <span className="w-6 h-6 rounded-full bg-indigo-600 text-white flex items-center justify-center text-xs font-bold animate-pulse">
+                    <span className="w-6 h-6 rounded-full bg-emerald-600 text-white flex items-center justify-center text-xs font-bold animate-pulse">
                       ●
                     </span>
                   ) : (
@@ -128,7 +128,7 @@ export default function GenerationProgressShell({ runId }: GenerationProgressShe
                 <div className="flex-1">
                   <p
                     className={`text-sm font-semibold ${
-                      status === "active" ? "text-indigo-900" : "text-slate-700"
+                      status === "active" ? "text-emerald-900" : "text-slate-700"
                     }`}
                   >
                     {step}
@@ -140,7 +140,7 @@ export default function GenerationProgressShell({ runId }: GenerationProgressShe
                   <span
                     className={`text-xs font-bold ${
                       status === "active"
-                        ? "text-indigo-600 font-extrabold"
+                        ? "text-emerald-600 font-extrabold"
                         : status === "completed"
                         ? "text-emerald-600"
                         : "text-slate-400"
@@ -159,7 +159,7 @@ export default function GenerationProgressShell({ runId }: GenerationProgressShe
           <div className="pt-4 flex justify-center animate-fade-in">
             <button
               onClick={handleNavigate}
-              className="w-full py-4 px-6 rounded-xl text-white font-bold text-base bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-700 hover:to-indigo-600 shadow-lg shadow-indigo-500/25 transition-all transform hover:-translate-y-0.5 active:translate-y-0 cursor-pointer"
+              className="w-full py-4 px-6 rounded-xl text-white font-bold text-base bg-gradient-to-r from-emerald-600 to-teal-500 hover:from-emerald-700 hover:to-teal-600 shadow-lg shadow-emerald-500/25 transition-all transform hover:-translate-y-0.5 active:translate-y-0 cursor-pointer"
             >
               생성된 상세페이지 보기
             </button>
