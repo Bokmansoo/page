@@ -131,6 +131,46 @@ class LLMRouter:
 
 
 def get_text_provider_by_settings() -> Any:
-    from src.services.provider_adapters import MockTextProvider
-    return MockTextProvider()
+    from src.services.provider_adapters import (
+        MockTextProvider,
+        OpenAITextProvider,
+        GeminiTextProvider,
+        ClaudeTextProvider,
+        FallbackTextProvider,
+    )
+
+    if settings.SELLFORM_GENERATION_MODE == "mock":
+        return MockTextProvider()
+
+    chain = []
+
+    def build_provider(p_name: str, m_name: str):
+        p = p_name.lower()
+        if p == "openai":
+            return OpenAITextProvider(model=m_name)
+        elif p in ("google", "gemini"):
+            return GeminiTextProvider(model=m_name)
+        elif p in ("anthropic", "claude"):
+            return ClaudeTextProvider(model=m_name)
+        elif p == "mock":
+            return MockTextProvider()
+        return None
+
+    p1 = build_provider(settings.SELLFORM_LLM_DEFAULT_PROVIDER, settings.SELLFORM_LLM_DEFAULT_MODEL)
+    if p1:
+        chain.append(p1)
+
+    p2 = build_provider(settings.SELLFORM_LLM_FALLBACK1_PROVIDER, settings.SELLFORM_LLM_FALLBACK1_MODEL)
+    if p2:
+        chain.append(p2)
+
+    p3 = build_provider(settings.SELLFORM_LLM_FALLBACK2_PROVIDER, settings.SELLFORM_LLM_FALLBACK2_MODEL)
+    if p3:
+        chain.append(p3)
+
+    if not chain:
+        return MockTextProvider()
+
+    return FallbackTextProvider(chain)
+
 
