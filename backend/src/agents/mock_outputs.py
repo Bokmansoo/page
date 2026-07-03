@@ -45,7 +45,7 @@ def build_mock_visual_plan(product_name: str) -> dict:
     return {
         "hero_image_prompt": f"A cute child riding {product_name} in a bright sunny park, warm lighting, photography",
         "detail_image_prompt": "Close up of training wheel with soft non-slip rubber, studio shot",
-        "color_palette": ["#4F46E5", "#F3F4F6", "#FFFFFF"],
+        "color_palette": ["#10B981", "#14B8A6", "#FFFFFF", "#F3F4F6"],
     }
 
 
@@ -56,14 +56,35 @@ def build_mock_generated_assets(product_name: str) -> dict:
                 "id": "mock-hero-visual",
                 "role": "hero",
                 "url": "https://images.unsplash.com/photo-1544161515-4ab6ce6db874",
+                "source_type": "uploaded",
             },
             {
-                "id": "mock-detail-visual",
-                "role": "detail",
+                "id": "mock-comparison-visual",
+                "role": "comparison",
+                "url": "https://images.unsplash.com/photo-1485965120184-e220f721d03e",
+                "source_type": "URL-extracted",
+            },
+            {
+                "id": "mock-detail-1-visual",
+                "role": "detail_1",
                 "url": "https://images.unsplash.com/photo-1517649763962-0c623066013b",
+                "source_type": "mock-generated",
+            },
+            {
+                "id": "mock-detail-2-visual",
+                "role": "detail_2",
+                "url": "https://images.unsplash.com/photo-1485965120184-e220f721d03e",
+                "source_type": "pending real generation",
+            },
+            {
+                "id": "mock-guarantee-visual",
+                "role": "guarantee",
+                "url": "https://images.unsplash.com/photo-1544161515-4ab6ce6db874",
+                "source_type": "mock-generated",
             },
         ]
     }
+
 
 
 def build_mock_page_assembly(product_name: str) -> dict:
