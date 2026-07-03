@@ -7,7 +7,9 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
-    JSON
+    JSON,
+    Float,
+    Boolean
 )
 from sqlalchemy.orm import relationship
 from src.db.database import Base
@@ -25,6 +27,7 @@ class User(Base):
     name = Column(String(255), nullable=False)
 
     workspaces = relationship("Workspace", back_populates="owner")
+    memberships = relationship("WorkspaceMember", back_populates="user", cascade="all, delete-orphan")
 
 
 class Workspace(Base):
@@ -37,6 +40,8 @@ class Workspace(Base):
     owner = relationship("User", back_populates="workspaces")
     brands = relationship("Brand", back_populates="workspace")
     projects = relationship("ProductProject", back_populates="workspace")
+    members = relationship("WorkspaceMember", back_populates="workspace", cascade="all, delete-orphan")
+    invitations = relationship("WorkspaceInvitation", back_populates="workspace", cascade="all, delete-orphan")
 
 
 class Brand(Base):
@@ -63,8 +68,18 @@ class ProductProject(Base):
     name = Column(String(255), nullable=False)
     status = Column(String(50), nullable=False, default="draft")  # draft, processing, checking, ready
     current_step = Column(String(50), nullable=False, default="raw_input")
+    category = Column(String(100), nullable=True)  # Fashion, Beauty, Food, Living
+    category_confirmed = Column(Boolean, nullable=False, default=False)
+    category_confirmed_by = Column(String(36), ForeignKey("users.id"), nullable=True)
+    category_confirmed_at = Column(DateTime, nullable=True)
     raw_input_url = Column(String(1000), nullable=True)
     raw_input_text = Column(Text, nullable=True)
+    selected_style = Column(String(50), nullable=True)
+    selected_background = Column(String(100), nullable=True)
+    intake_snapshot = Column(JSON, nullable=True)  # normalized intake and reviewed understanding data
+    style_candidates_snapshot = Column(JSON, nullable=True)  # list of style candidate dicts from last generation
+    style_generation = Column(Integer, nullable=False, default=0)  # increments on each regeneration
+    visual_package_jobs = Column(JSON, nullable=True)  # visual package planned/needs_generation image jobs
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
@@ -72,6 +87,11 @@ class ProductProject(Base):
     brand = relationship("Brand", back_populates="projects")
     assets = relationship("Asset", back_populates="project", cascade="all, delete-orphan")
     job_statuses = relationship("JobStatus", back_populates="project", cascade="all, delete-orphan")
+    facts = relationship("ProductFact", back_populates="project", cascade="all, delete-orphan")
+    job_logs = relationship("AiJobLog", back_populates="project", cascade="all, delete-orphan")
+    pages = relationship("ProductPage", back_populates="project", cascade="all, delete-orphan")
+    export_jobs = relationship("ExportJob", back_populates="project", cascade="all, delete-orphan")
+    published_pages = relationship("PublishedPage", back_populates="project", cascade="all, delete-orphan")
 
 
 class Asset(Base):
@@ -112,3 +132,329 @@ class JobStatus(Base):
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
     project = relationship("ProductProject", back_populates="job_statuses")
+
+
+class ProductFact(Base):
+    __tablename__ = "product_facts"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    project_id = Column(String(36), ForeignKey("product_projects.id"), nullable=False)
+    fact_text = Column(Text, nullable=False)
+    source_text = Column(Text, nullable=True)
+    source_asset_id = Column(String(36), ForeignKey("assets.id"), nullable=True)
+    verification_status = Column(String(50), nullable=False, default="unknown")  # unknown, confirmed, needs_revision
+    extraction_source = Column(String(50), nullable=True)  # manual_text, url, image, metadata
+    provider = Column(String(50), nullable=True)
+    model_name = Column(String(100), nullable=True)
+    confidence = Column(Float, nullable=True)
+    needs_review = Column(Boolean, nullable=False, default=True)
+    risk_flags = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    project = relationship("ProductProject", back_populates="facts")
+    source_asset = relationship("Asset")
+    histories = relationship("FactHistory", back_populates="fact", cascade="all, delete-orphan")
+
+
+class FactHistory(Base):
+    __tablename__ = "fact_histories"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    fact_id = Column(String(36), ForeignKey("product_facts.id", ondelete="CASCADE"), nullable=False)
+    previous_fact_text = Column(Text, nullable=False)
+    previous_source_text = Column(Text, nullable=True)
+    previous_source_asset_id = Column(String(36), ForeignKey("assets.id"), nullable=True)
+    previous_verification_status = Column(String(50), nullable=False)
+    updated_by = Column(String(36), ForeignKey("users.id"), nullable=False)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    fact = relationship("ProductFact", back_populates="histories")
+    user = relationship("User")
+    previous_source_asset = relationship("Asset")
+
+
+class AiJobLog(Base):
+    __tablename__ = "ai_job_logs"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False)
+    task_type = Column(String(100), nullable=False)  # e.g., fact_extraction, compliance_check
+    provider = Column(String(50), nullable=False)  # e.g., openai, anthropic, google
+    model_name = Column(String(100), nullable=False)
+    prompt_version = Column(String(50), nullable=False)
+    duration_ms = Column(Integer, nullable=False)
+    input_tokens = Column(Integer, nullable=True)
+    output_tokens = Column(Integer, nullable=True)
+    estimated_cost = Column(Float, nullable=True)
+    status = Column(String(50), nullable=False, default="pending")  # success, failed
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    project = relationship("ProductProject", back_populates="job_logs")
+
+
+class ProductPage(Base):
+    __tablename__ = "product_pages"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False)
+    theme_color = Column(String(50), nullable=False, default="#3B82F6")
+    font_family = Column(String(50), nullable=False, default="sans-serif")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    project = relationship("ProductProject", back_populates="pages")
+    sections = relationship("PageSection", back_populates="page", cascade="all, delete-orphan", order_by="PageSection.sort_order")
+    versions = relationship("PageVersion", back_populates="page", cascade="all, delete-orphan")
+    published_pages = relationship("PublishedPage", back_populates="page", cascade="all, delete-orphan")
+
+
+class PageSection(Base):
+    __tablename__ = "page_sections"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    page_id = Column(String(36), ForeignKey("product_pages.id", ondelete="CASCADE"), nullable=False)
+    section_type = Column(String(100), nullable=False)  # header, features, specifications, faq, etc.
+    title = Column(String(255), nullable=True)
+    body_copy = Column(Text, nullable=True)
+    associated_fact_ids = Column(JSON, nullable=True)  # list of fact UUIDs
+    image_asset_id = Column(String(36), ForeignKey("assets.id", ondelete="SET NULL"), nullable=True)
+    sort_order = Column(Integer, nullable=False, default=0)
+    is_visible = Column(Boolean, nullable=False, default=True)
+
+    page = relationship("ProductPage", back_populates="sections")
+    image_asset = relationship("Asset")
+
+
+class PageVersion(Base):
+    __tablename__ = "page_versions"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    page_id = Column(String(36), ForeignKey("product_pages.id", ondelete="CASCADE"), nullable=False)
+    version_number = Column(Integer, nullable=False)
+    page_data = Column(JSON, nullable=False)  # full schema backup
+    created_by = Column(String(36), ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    page = relationship("ProductPage", back_populates="versions")
+    user = relationship("User")
+
+
+class ExportJob(Base):
+    __tablename__ = "export_jobs"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False)
+    preset_name = Column(String(100), nullable=False)
+    status = Column(String(50), nullable=False, default="pending")  # pending, running, completed, failed
+    error_message = Column(Text, nullable=True)
+    zip_asset_id = Column(String(36), ForeignKey("assets.id", ondelete="SET NULL"), nullable=True)
+    output_images = Column(JSON, nullable=True)  # list of image URLs/paths
+    created_by = Column(String(36), ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+    project = relationship("ProductProject", back_populates="export_jobs")
+    zip_asset = relationship("Asset", foreign_keys=[zip_asset_id])
+    user = relationship("User")
+
+
+class FigmaExportJob(Base):
+    __tablename__ = "figma_export_jobs"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False)
+    workspace_id = Column(String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    target_file_url = Column(Text, nullable=False)
+    payload_hash = Column(String(64), nullable=False)
+    status = Column(String(50), nullable=False, default="queued")  # queued, authenticating, rendering, completed, failed
+    result_file_url = Column(Text, nullable=True)
+    result_node_url = Column(Text, nullable=True)
+    error_code = Column(String(50), nullable=True)
+    error_message = Column(Text, nullable=True)
+    auth_url = Column(Text, nullable=True)
+    attempt_count = Column(Integer, nullable=False, default=1)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    project = relationship("ProductProject")
+    workspace = relationship("Workspace")
+
+
+class PublishedPage(Base):
+    __tablename__ = "published_pages"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    project_id = Column(String(36), ForeignKey("product_projects.id"), nullable=False)
+    page_id = Column(String(36), ForeignKey("product_pages.id"), nullable=False)
+    slug = Column(String(100), unique=True, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    external_store_url = Column(String(1000), nullable=True)
+    config = Column(JSON, nullable=True)  # JSON config details
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    project = relationship("ProductProject", back_populates="published_pages")
+    page = relationship("ProductPage", back_populates="published_pages")
+
+
+class WorkspaceMember(Base):
+    __tablename__ = "workspace_members"
+
+    workspace_id = Column(String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    role = Column(String(50), nullable=False, default="member")  # owner, admin, member, viewer
+    joined_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    workspace = relationship("Workspace", back_populates="members")
+    user = relationship("User", back_populates="memberships")
+
+
+class WorkspaceInvitation(Base):
+    __tablename__ = "workspace_invitations"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    workspace_id = Column(String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    email = Column(String(255), nullable=False)
+    role = Column(String(50), nullable=False, default="member")
+    status = Column(String(50), nullable=False, default="pending")  # pending, accepted, declined
+    invited_by = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+
+    workspace = relationship("Workspace", back_populates="invitations")
+    inviter = relationship("User")
+
+
+class DetailPageVersion(Base):
+    __tablename__ = "detail_page_versions"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(255), nullable=False)
+    style_key = Column(String(50), nullable=False)
+    sections_json = Column(JSON, nullable=False)
+    is_final = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    project = relationship("ProductProject")
+
+    @property
+    def sections(self):
+        if isinstance(self.sections_json, dict):
+            return self.sections_json.get("sections", [])
+        return self.sections_json
+
+
+
+class ExportArtifact(Base):
+    __tablename__ = "export_artifacts"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False)
+    version_id = Column(String(36), ForeignKey("detail_page_versions.id", ondelete="CASCADE"), nullable=False)
+    artifact_type = Column(String(50), nullable=False)  # long_vertical_image, section_images_zip
+    file_path = Column(String(500), nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    project = relationship("ProductProject")
+    version = relationship("DetailPageVersion")
+
+
+class FigmaPluginExportTicket(Base):
+    __tablename__ = "figma_plugin_export_tickets"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False)
+    workspace_id = Column(String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    created_by = Column(String(36), ForeignKey("users.id"), nullable=False)
+    code_hash = Column(String(64), unique=True, nullable=False, index=True)
+    payload_json = Column(JSON, nullable=False)
+    asset_map_json = Column(JSON, nullable=False, default=dict)
+    status = Column(String(20), nullable=False, default="issued")
+    expires_at = Column(DateTime, nullable=False)
+    redeemed_at = Column(DateTime, nullable=True)
+    session_token_hash = Column(String(64), nullable=True)
+    session_expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    project = relationship("ProductProject")
+    workspace = relationship("Workspace")
+
+
+class ImageGenerationJobRecord(Base):
+    __tablename__ = "image_generation_jobs"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False)
+    job_id = Column(String(100), nullable=False, unique=True)
+    section_id = Column(String(100), nullable=False)
+    role = Column(String(50), nullable=False)
+    source_asset_ids = Column(JSON, nullable=True)  # List of asset IDs
+    prompt = Column(Text, nullable=False)
+    negative_prompt = Column(Text, nullable=True)
+    preserve_product_identity = Column(Boolean, default=True)
+    output_size = Column(String(50), default="1024x1024")
+    cost_tier = Column(String(50), default="standard")
+    status = Column(String(50), default="planned")  # planned, awaiting_cost_approval, generating, needs_review, approved, rejected, failed
+    provider = Column(String(50), nullable=True)
+    model = Column(String(100), nullable=True)
+    attempt_count = Column(Integer, default=0, nullable=False)
+    output_asset_id = Column(String(36), ForeignKey("assets.id", ondelete="SET NULL"), nullable=True)
+    error_code = Column(String(100), nullable=True)
+    warnings = Column(JSON, nullable=True)  # List of warning strings
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    project = relationship("ProductProject")
+    output_asset = relationship("Asset")
+
+
+class AgentRun(Base):
+    __tablename__ = "agent_runs"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    workspace_id = Column(String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False)
+    mode = Column(String(20), nullable=False, default="mock")
+    status = Column(String(50), nullable=False, default="created")
+    current_stage = Column(String(80), nullable=False, default="intake")
+    input_snapshot = Column(JSON, nullable=False, default=dict)
+    outputs_json = Column(JSON, nullable=False, default=dict)
+    cost_approval_status = Column(String(50), nullable=False, default="not_required")
+    estimated_cost = Column(Float, nullable=True)
+    actual_cost = Column(Float, nullable=True)
+    provider_trace = Column(JSON, nullable=False, default=list)
+    error_log = Column(JSON, nullable=False, default=list)
+    created_by = Column(String(36), ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+    project = relationship("ProductProject")
+    workspace = relationship("Workspace")
+    user = relationship("User")
+    steps = relationship("AgentRunStep", back_populates="run", cascade="all, delete-orphan")
+
+
+class AgentRunStep(Base):
+    __tablename__ = "agent_run_steps"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False)
+    stage = Column(String(80), nullable=False)
+    status = Column(String(50), nullable=False, default="pending")
+    input_json = Column(JSON, nullable=False, default=dict)
+    output_json = Column(JSON, nullable=False, default=dict)
+    provider = Column(String(50), nullable=True)
+    model = Column(String(100), nullable=True)
+    prompt_version = Column(String(100), nullable=True)
+    token_usage = Column(JSON, nullable=True)
+    estimated_cost = Column(Float, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    error_message = Column(Text, nullable=True)
+
+    run = relationship("AgentRun", back_populates="steps")
+
