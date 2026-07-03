@@ -36,6 +36,8 @@ class AgentRunResponseSchema(BaseModel):
     mode: str
     current_stage: str
     product_input: ProductInputSchema
+    outputs: Dict[str, Any] = {}
+
 
 
 @router.post("", response_model=AgentRunResponseSchema, status_code=201)
@@ -108,6 +110,35 @@ def create_agent_run(
             description=req.description,
             product_url=req.product_url,
             asset_ids=req.asset_ids,
-            reference_urls=req.reference_urls,
         ),
     )
+
+
+@router.post("/{id}/run-mock", response_model=AgentRunResponseSchema)
+def run_mock(
+    id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    from src.services.agent_run_service import AgentRunService
+    try:
+        run = AgentRunService.run_mock(id, db)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    return AgentRunResponseSchema(
+        id=run.id,
+        project_id=run.project_id,
+        workspace_id=run.workspace_id,
+        mode=run.mode,
+        current_stage=run.current_stage,
+        product_input=ProductInputSchema(
+            product_name=run.input_snapshot.get("product_name") or "",
+            description=run.input_snapshot.get("description"),
+            product_url=run.input_snapshot.get("product_url"),
+            asset_ids=run.input_snapshot.get("asset_ids") or [],
+            reference_urls=run.input_snapshot.get("reference_urls") or [],
+        ),
+        outputs=run.outputs_json,
+    )
+
