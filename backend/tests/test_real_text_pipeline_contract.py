@@ -1,4 +1,7 @@
 from src.agents.schemas import ProductUnderstandingOutput, SalesStrategyOutput
+from src.agents.graph import AgentGraph
+from src.agents.state import AgentRunMode, AgentRunState, ProductInput
+from src.services.provider_adapters import MockTextProvider
 
 
 def test_product_understanding_schema_requires_facts():
@@ -22,3 +25,17 @@ def test_sales_strategy_schema_has_recommended_direction():
         reason="초보 사용자의 구매 불안을 직접 해결한다",
     )
     assert output.recommended_direction == "문제 해결형"
+
+
+def test_real_text_graph_uses_provider_without_image_generation():
+    graph = AgentGraph.real_text(text_provider=MockTextProvider())
+    state = AgentRunState(
+        project_id="p1",
+        mode=AgentRunMode.REAL,
+        product_input=ProductInput(product_name="유아 자전거"),
+    )
+    completed = graph.run_text_generation(state)
+    assert "product_understanding" in completed.outputs
+    assert "sales_strategy" in completed.outputs
+    assert "copy_set" in completed.outputs
+    assert "generated_assets" not in completed.outputs

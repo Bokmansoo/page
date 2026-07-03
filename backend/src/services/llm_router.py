@@ -128,3 +128,9 @@ class LLMRouter:
                 )
             )
         return candidates
+
+
+def get_text_provider_by_settings() -> Any:
+    from src.services.provider_adapters import MockTextProvider
+    return MockTextProvider()
+
