@@ -38,11 +38,6 @@ class LLMRouter:
             if not self.enable_fallbacks and provider != settings.SELLFORM_LLM_DEFAULT_PROVIDER:
                 continue
 
-            # mock 모드인 경우 외부 API 호출 배제
-            if settings.SELLFORM_GENERATION_MODE == "mock" and provider not in ("deterministic", "mock"):
-                continue
-
-
             try:
                 if provider == "openai":
                     # OpenAI API Key 유효성 체크

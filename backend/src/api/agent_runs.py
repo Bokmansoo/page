@@ -121,8 +121,41 @@ def run_mock(
     auth_ctx: dict = Depends(get_current_user_and_workspace),
 ):
     from src.services.agent_run_service import AgentRunService
+    workspace = auth_ctx["workspace"]
+
     try:
-        run = AgentRunService.run_mock(id, db)
+        run = AgentRunService.run_mock(id, workspace.id, db)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    return AgentRunResponseSchema(
+        id=run.id,
+        project_id=run.project_id,
+        workspace_id=run.workspace_id,
+        mode=run.mode,
+        current_stage=run.current_stage,
+        product_input=ProductInputSchema(
+            product_name=run.input_snapshot.get("product_name") or "",
+            description=run.input_snapshot.get("description"),
+            product_url=run.input_snapshot.get("product_url"),
+            asset_ids=run.input_snapshot.get("asset_ids") or [],
+            reference_urls=run.input_snapshot.get("reference_urls") or [],
+        ),
+        outputs=run.outputs_json,
+    )
+
+
+@router.post("/{id}/run", response_model=AgentRunResponseSchema)
+def run_real(
+    id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    from src.services.agent_run_service import AgentRunService
+    workspace = auth_ctx["workspace"]
+
+    try:
+        run = AgentRunService.run_real_text(id, workspace.id, db)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 

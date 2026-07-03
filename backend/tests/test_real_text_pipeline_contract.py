@@ -1,7 +1,16 @@
+import pytest
 from src.agents.schemas import ProductUnderstandingOutput, SalesStrategyOutput
 from src.agents.graph import AgentGraph
 from src.agents.state import AgentRunMode, AgentRunState, ProductInput
 from src.services.provider_adapters import MockTextProvider
+
+
+@pytest.fixture
+def auth_headers():
+    return {
+        "X-Mock-User-Id": "00000000-0000-0000-0000-000000000001",
+        "X-Mock-Workspace-Id": "00000000-0000-0000-0000-000000000002",
+    }
 
 
 def test_product_understanding_schema_requires_facts():
@@ -39,3 +48,24 @@ def test_real_text_graph_uses_provider_without_image_generation():
     assert "sales_strategy" in completed.outputs
     assert "copy_set" in completed.outputs
     assert "generated_assets" not in completed.outputs
+
+    assert "page_assembly" in completed.outputs
+    sections = completed.outputs["page_assembly"]["sections"]
+    assert len(sections) > 0
+    assert sections[0]["title"]
+
+
+def test_run_real_api_endpoint(client, auth_headers):
+    created = client.post(
+        "/api/agent-runs",
+        headers=auth_headers,
+        json={"product_name": "유아 자전거", "description": "안전 바퀴 장착"},
+    ).json()
+
+    response = client.post(f"/api/agent-runs/{created['id']}/run", headers=auth_headers)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["current_stage"] == "review_editor"
+    assert "product_understanding" in data["outputs"]
+    assert "copy_set" in data["outputs"]
+    assert "page_assembly" in data["outputs"]

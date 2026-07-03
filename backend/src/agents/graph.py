@@ -43,11 +43,13 @@ class AgentGraph:
         description = state.product_input.description or "설명 없음"
         url = state.product_input.product_url or "URL 없음"
 
-        registry = PromptRegistry()
-        system_base = registry.load("system_base")
+        import os
+        base_dir = "prompts" if os.path.exists("prompts") else "backend/prompts"
+        registry = PromptRegistry(base_path=base_dir)
+        system_base = registry.load("system/sellform_agent_base")
 
         # 1. Product Understanding
-        pu_sys = system_base + "\n" + registry.load("product_understanding")
+        pu_sys = system_base + "\n" + registry.load("agents/product_understanding")
         pu_user = f"상품명: {pname}\n상품설명: {description}\n상품URL: {url}"
 
         res_pu = self.text_provider.generate_json(
@@ -63,7 +65,7 @@ class AgentGraph:
         state.outputs["product_understanding"] = pu_validated.model_dump()
 
         # 2. Sales Strategy
-        ss_sys = system_base + "\n" + registry.load("sales_strategy")
+        ss_sys = system_base + "\n" + registry.load("agents/sales_strategy")
         ss_user = f"상품 정보: {json.dumps(state.outputs['product_understanding'], ensure_ascii=False)}"
 
         res_ss = self.text_provider.generate_json(
@@ -79,7 +81,7 @@ class AgentGraph:
         state.outputs["sales_strategy"] = ss_validated.model_dump()
 
         # 3. Page Plan
-        pp_sys = system_base + "\n" + registry.load("page_planning")
+        pp_sys = system_base + "\n" + registry.load("agents/page_planning")
         pp_user = f"마케팅 전략: {json.dumps(state.outputs['sales_strategy'], ensure_ascii=False)}"
 
         res_pp = self.text_provider.generate_json(
@@ -95,7 +97,7 @@ class AgentGraph:
         state.outputs["page_plan"] = pp_validated.model_dump()
 
         # 4. Copy Set
-        cs_sys = system_base + "\n" + registry.load("copywriting")
+        cs_sys = system_base + "\n" + registry.load("agents/copywriting")
         cs_user = f"레이아웃 구조: {json.dumps(state.outputs['page_plan'], ensure_ascii=False)}"
 
         res_cs = self.text_provider.generate_json(
@@ -111,7 +113,7 @@ class AgentGraph:
         state.outputs["copy_set"] = cs_validated.model_dump()
 
         # 5. Visual Plan
-        vp_sys = system_base + "\n" + registry.load("visual_planning")
+        vp_sys = system_base + "\n" + registry.load("agents/visual_planning")
         vp_user = f"마케팅 카피: {json.dumps(state.outputs['copy_set'], ensure_ascii=False)}"
 
         res_vp = self.text_provider.generate_json(
@@ -131,7 +133,7 @@ class AgentGraph:
             ProviderRequest(
                 provider="mock",
                 model="mock-text",
-                system_prompt=system_base + "\n" + registry.load("qa_review"),
+                system_prompt=system_base + "\n" + registry.load("agents/qa_review"),
                 user_prompt=f"작성본 데이터: {json.dumps(state.outputs, ensure_ascii=False)}",
                 schema_name="qa_report",
             )
