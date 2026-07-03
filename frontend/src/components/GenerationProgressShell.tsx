@@ -1,12 +1,14 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 
 interface GenerationProgressShellProps {
   runId: string;
 }
 
 export default function GenerationProgressShell({ runId }: GenerationProgressShellProps) {
+  const router = useRouter();
   const steps = [
     "상품 이해",
     "판매 방향 추천",
@@ -19,6 +21,37 @@ export default function GenerationProgressShell({ runId }: GenerationProgressShe
   ];
 
   const [currentStepIdx, setCurrentStepIdx] = useState(0);
+  const [projectId, setProjectId] = useState<string | null>(null);
+  const [isApiCompleted, setIsApiCompleted] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const runMockGeneration = async () => {
+      try {
+        const uid = localStorage.getItem("X-Mock-User-Id") || "00000000-0000-0000-0000-000000000001";
+        const wid = localStorage.getItem("X-Mock-Workspace-Id") || "00000000-0000-0000-0000-000000000002";
+
+        const res = await fetch(`http://localhost:8000/api/agent-runs/${runId}/run-mock`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Mock-User-Id": uid,
+            "X-Mock-Workspace-Id": wid,
+          },
+        });
+        if (!res.ok) {
+          throw new Error("Mock generation API failed");
+        }
+        const data = await res.json();
+        setProjectId(data.project_id);
+        setIsApiCompleted(true);
+      } catch (err: any) {
+        setError(err.message || "An error occurred");
+      }
+    };
+
+    runMockGeneration();
+  }, [runId]);
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -29,10 +62,18 @@ export default function GenerationProgressShell({ runId }: GenerationProgressShe
         clearInterval(interval);
         return prev;
       });
-    }, 1500);
+    }, 500);
 
     return () => clearInterval(interval);
   }, []);
+
+  const handleNavigate = () => {
+    if (projectId) {
+      router.push(`/workspace/projects/${projectId}/page-editor`);
+    }
+  };
+
+  const isFinished = currentStepIdx === steps.length - 1 && isApiCompleted;
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col items-center justify-center p-6 w-full">
@@ -41,11 +82,19 @@ export default function GenerationProgressShell({ runId }: GenerationProgressShe
           AI 상세페이지 생성 진행 중...
         </h2>
 
+        {error && (
+          <div className="p-4 bg-red-50 text-red-700 rounded-xl text-sm border border-red-100 text-center animate-shake">
+            {error}
+          </div>
+        )}
+
         <div className="space-y-4">
           {steps.map((step, idx) => {
             let status = "pending"; // pending, active, completed
             if (idx < currentStepIdx) status = "completed";
-            else if (idx === currentStepIdx) status = "active";
+            else if (idx === currentStepIdx) {
+              status = isFinished ? "completed" : "active";
+            }
 
             return (
               <div
@@ -104,6 +153,18 @@ export default function GenerationProgressShell({ runId }: GenerationProgressShe
             );
           })}
         </div>
+
+        {/* CTA Button */}
+        {isFinished && projectId && (
+          <div className="pt-4 flex justify-center animate-fade-in">
+            <button
+              onClick={handleNavigate}
+              className="w-full py-4 px-6 rounded-xl text-white font-bold text-base bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-700 hover:to-indigo-600 shadow-lg shadow-indigo-500/25 transition-all transform hover:-translate-y-0.5 active:translate-y-0 cursor-pointer"
+            >
+              생성된 상세페이지 보기
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
