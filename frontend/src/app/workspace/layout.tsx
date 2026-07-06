@@ -30,7 +30,7 @@ export default function WorkspaceLayout({
     // Fetch actual brands from API
     const loadBrands = async () => {
       try {
-        const res = await fetch("http://localhost:8000/api/v1/brands", {
+        const res = await fetch("http://localhost:8001/api/v1/brands", {
           headers: {
             "X-Mock-User-Id": uid,
             "X-Mock-Workspace-Id": wid,
@@ -67,6 +67,7 @@ export default function WorkspaceLayout({
     window.location.reload(); // Reload to apply headers globally
   };
 
+  const isProjectFlow = pathname.startsWith("/workspace/projects/");
   const isIntakePage = pathname === "/workspace";
 
   const renderSettingsModal = () => (
@@ -111,6 +112,55 @@ export default function WorkspaceLayout({
           </button>
         </div>
       </div>
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col w-full">
+      <header className="w-full bg-white border-b border-slate-200/80 px-6 py-4 flex items-center justify-between sticky top-0 z-30">
+        <div className="flex items-center space-x-8">
+          <Link href="/workspace" className="flex items-center space-x-2.5 group">
+            <div className="w-8 h-8 rounded-lg bg-emerald-500 flex items-center justify-center font-bold text-white shadow-sm shadow-emerald-500/20">
+              S
+            </div>
+            <span className="text-lg font-bold tracking-tight text-slate-900">Sellform</span>
+          </Link>
+
+          <nav className="flex items-center space-x-6 text-sm font-medium text-slate-500">
+            <Link href="/workspace" className="text-emerald-700 font-semibold hover:text-emerald-800">
+              AI 상세페이지 생성
+            </Link>
+            <button
+              type="button"
+              onClick={() => alert("출력 이력 관리는 다음 단계에서 연결됩니다.")}
+              className="hover:text-slate-800 transition-colors cursor-pointer"
+            >
+              출력 이력
+            </button>
+          </nav>
+        </div>
+
+        <div className="bg-slate-100 border border-slate-200/60 rounded-lg px-3 py-1.5 text-xs text-slate-600 flex items-center space-x-2.5">
+          <div className="flex flex-col">
+            <span className="font-semibold text-slate-700">개발용 워크스페이스</span>
+            <span className="text-[10px] text-slate-500 truncate max-w-[120px]">
+              U: {mockUserId.slice(0, 8)}... / W: {mockWorkspaceId.slice(0, 8)}...
+            </span>
+          </div>
+          <button
+            onClick={() => setShowSettingsModal(true)}
+            className="text-emerald-600 hover:text-emerald-700 underline font-medium cursor-pointer"
+          >
+            변경
+          </button>
+        </div>
+      </header>
+
+      <main className="flex-1 w-full bg-slate-50">
+        <div className={isProjectFlow ? "w-full" : "max-w-6xl mx-auto p-8 w-full"}>{children}</div>
+      </main>
+
+      {showSettingsModal && renderSettingsModal()}
     </div>
   );
 

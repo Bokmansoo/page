@@ -42,6 +42,7 @@ class ProviderRequest(BaseModel):
     system_prompt: str
     user_prompt: str
     schema_name: str
+    product_name: Optional[str] = None
 
 
 class ProviderResult(BaseModel):
@@ -60,7 +61,7 @@ class TextProviderProtocol(Protocol):
 class MockTextProvider:
     def generate_json(self, req: ProviderRequest) -> Dict[str, Any]:
         schema = req.schema_name
-        pname = "유아 자전거"
+        pname = req.product_name or "상품"
 
         if schema == "product_understanding":
             content = build_mock_product_understanding(pname)
@@ -78,11 +79,11 @@ class MockTextProvider:
             content = {}
 
         result = ProviderResult(
-            provider=req.provider,
-            model=req.model,
+            provider="mock",
+            model="mock-text",
             content=content,
             token_usage={"prompt_tokens": 100, "completion_tokens": 200},
-            cost=0.001,
+            cost=0,
         )
         return result.model_dump()
 
@@ -123,7 +124,7 @@ class OpenAITextProvider:
                 "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
                 "completion_tokens": response.usage.completion_tokens if response.usage else 0,
             },
-            cost=0.0015,
+            cost=None,
         )
         return result.model_dump()
 
@@ -173,7 +174,7 @@ class GeminiTextProvider:
                 "prompt_tokens": input_tokens,
                 "completion_tokens": output_tokens,
             },
-            cost=0.0005,
+            cost=None,
         )
         return result.model_dump()
 
@@ -227,7 +228,7 @@ class ClaudeTextProvider:
                 "prompt_tokens": response.usage.input_tokens if response.usage else 0,
                 "completion_tokens": response.usage.output_tokens if response.usage else 0,
             },
-            cost=0.002,
+            cost=None,
         )
         return result.model_dump()
 

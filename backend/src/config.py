@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     # Sellform runtime uses PostgreSQL by default.
     # SQLite was used only in early MVP sprints and should not be used for
     # normal local development or product verification.
-    DATABASE_URL: str = "postgresql://sellform:sellformpassword@localhost:5434/sellform_dev"
+    DATABASE_URL: str = "postgresql://sellform:sellformpassword@localhost:5544/sellform_dev"
     UPLOAD_DIR: str = "./uploads"
     MAX_UPLOAD_SIZE_MB: int = 10
     SELLFORM_RAG_DEBUG_ENABLED: bool = Field(
@@ -22,8 +22,12 @@ class Settings(BaseSettings):
     # Generation & Agent Configuration (Sprint 48)
     SELLFORM_GENERATION_MODE: str = "mock"
     SELLFORM_TEXT_LLM_PRIMARY_PROVIDER: str = "openai"
+    SELLFORM_TEXT_LLM_PRIMARY_MODEL: str = "gpt-5.4-nano"
     SELLFORM_TEXT_LLM_FALLBACK1_PROVIDER: str = "gemini"
+    SELLFORM_TEXT_LLM_FALLBACK1_MODEL: str = "gemini-2.5-flash"
     SELLFORM_TEXT_LLM_FALLBACK2_PROVIDER: str = "claude"
+    SELLFORM_TEXT_LLM_FALLBACK2_MODEL: str = "claude-3-5-sonnet-20241022"
+    SELLFORM_TEXT_LLM_ENABLE_FALLBACKS: bool = True
     SELLFORM_IMAGE_PRIMARY_PROVIDER: str = "openai"
 
 
@@ -32,11 +36,14 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str | None = None
     GEMINI_API_KEY: str | None = None
 
-    # Image Generation Configurations (Sprint 44.5)
+    # Image Generation Configurations (Sprint 44.5 / 56)
     SELLFORM_IMAGE_PROVIDER: str = "openai"
-    SELLFORM_IMAGE_MODEL: str = "gpt-image-1.5"
+    SELLFORM_IMAGE_MODEL: str = "gpt-image-1-mini"
     SELLFORM_IMAGE_PREVIEW_MODEL: str = "gpt-image-1-mini"
     SELLFORM_IMAGE_OUTPUT_FORMAT: str = "png"
+    SELLFORM_IMAGE_GENERATION_MODE: str = "mock"
+    SELLFORM_IMAGE_COST_APPROVAL_REQUIRED: bool = True
+    SELLFORM_IMAGE_MAX_CANDIDATES_PER_SLOT: int = 3
 
     # AI Fact Extraction Configurations (Sprint 16)
     OPENAI_FACT_MODEL: str = "gpt-4o-mini"
@@ -101,10 +108,11 @@ class Settings(BaseSettings):
     SELLFORM_WEB_BROWSING_MODEL: str = "gpt-5.4-nano"
     SELLFORM_WEB_BROWSING_TIMEOUT_SECONDS: int = 30
     SELLFORM_WEB_BROWSING_MAX_CHARS: int = 12000
+    SELLFORM_URL_OCR_ENABLED: bool = False
 
     # Optional Figma collaboration integration (Sprint 32)
     SELLFORM_FIGMA_MCP_ENABLED: bool = False
-    SELLFORM_PUBLIC_ASSET_BASE_URL: str = "http://localhost:8000"
+    SELLFORM_PUBLIC_ASSET_BASE_URL: str = "http://localhost:8001"
 
     # Figma Bridge Configurations (Sprint 33)
     SELLFORM_FIGMA_BRIDGE_URL: str = "http://127.0.0.1:3417"

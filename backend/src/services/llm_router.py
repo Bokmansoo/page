@@ -151,21 +151,30 @@ def get_text_provider_by_settings() -> Any:
             return MockTextProvider()
         return None
 
-    p1 = build_provider(settings.SELLFORM_LLM_DEFAULT_PROVIDER, settings.SELLFORM_LLM_DEFAULT_MODEL)
+    p1 = build_provider(
+        settings.SELLFORM_TEXT_LLM_PRIMARY_PROVIDER,
+        settings.SELLFORM_TEXT_LLM_PRIMARY_MODEL,
+    )
     if p1:
         chain.append(p1)
 
-    p2 = build_provider(settings.SELLFORM_LLM_FALLBACK1_PROVIDER, settings.SELLFORM_LLM_FALLBACK1_MODEL)
-    if p2:
-        chain.append(p2)
+    if settings.SELLFORM_TEXT_LLM_ENABLE_FALLBACKS:
+        p2 = build_provider(
+            settings.SELLFORM_TEXT_LLM_FALLBACK1_PROVIDER,
+            settings.SELLFORM_TEXT_LLM_FALLBACK1_MODEL,
+        )
+        if p2:
+            chain.append(p2)
 
-    p3 = build_provider(settings.SELLFORM_LLM_FALLBACK2_PROVIDER, settings.SELLFORM_LLM_FALLBACK2_MODEL)
-    if p3:
-        chain.append(p3)
+        p3 = build_provider(
+            settings.SELLFORM_TEXT_LLM_FALLBACK2_PROVIDER,
+            settings.SELLFORM_TEXT_LLM_FALLBACK2_MODEL,
+        )
+        if p3:
+            chain.append(p3)
 
     if not chain:
         return MockTextProvider()
 
     return FallbackTextProvider(chain)
-
 

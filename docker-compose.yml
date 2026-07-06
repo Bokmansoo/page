@@ -9,9 +9,9 @@ services:
       POSTGRES_PASSWORD: sellformpassword
       POSTGRES_DB: sellform_dev
     ports:
-      - "5432:5432"
+      - "5544:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - sellform_postgres_data:/var/lib/postgresql/data
     restart: always
 
   redis:
@@ -24,5 +24,5 @@ services:
     restart: always
 
 volumes:
-  postgres_data:
+  sellform_postgres_data:
   redis_data:

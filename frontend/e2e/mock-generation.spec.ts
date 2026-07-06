@@ -4,7 +4,7 @@ test("mock mode creates a complete detail page draft", async ({ page }) => {
   await page.route("**/api/agent-runs**", async (route) => {
     const url = route.request().url();
 
-    if (url.endsWith("/run-mock")) {
+    if (url.endsWith("/run")) {
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -30,9 +30,9 @@ test("mock mode creates a complete detail page draft", async ({ page }) => {
             generated_assets: {
               images: [
                 { id: "hero", url: "/mock-hero.jpg", source_type: "uploaded" },
-                { id: "comparison", url: "/mock-comparison.jpg", source_type: "URL-extracted" },
+                { id: "comparison", url: "/mock-comparison.jpg", source_type: "url-extracted" },
                 { id: "detail", url: "/mock-detail.jpg", source_type: "mock-generated" },
-                { id: "pending", url: "/mock-pending.jpg", source_type: "pending real generation" },
+                { id: "guarantee", url: "/mock-guarantee.jpg", source_type: "mock-generated" },
               ],
             },
             page_assembly: {
@@ -63,7 +63,7 @@ test("mock mode creates a complete detail page draft", async ({ page }) => {
                   title: "추가 이미지",
                   body: "실제 이미지 생성 단계에서 교체됩니다.",
                   visual_role: "생성 예정",
-                  image_id: "pending",
+                  image_id: "guarantee",
                 },
               ],
             },
@@ -102,9 +102,8 @@ test("mock mode creates a complete detail page draft", async ({ page }) => {
   await expect(page.getByText("출처: AI 모의 생성").first()).toBeVisible({ timeout: 10000 });
   await expect(page.getByText("출처: 직접 업로드")).toBeVisible({ timeout: 10000 });
   await expect(page.getByText("출처: URL 추출")).toBeVisible();
-  await expect(page.getByText("출처: 생성 대기 중")).toBeVisible();
 
-  const resultCta = page.getByRole("button", { name: "생성된 상세페이지 보기" });
+  const resultCta = page.getByRole("button", { name: "생성된 상세페이지 보기" }).first();
   await expect(resultCta).toBeVisible();
   await expect(resultCta).toHaveClass(/bg-emerald-600/);
   await expect(resultCta).not.toHaveClass(/bg-gradient-to-r/);

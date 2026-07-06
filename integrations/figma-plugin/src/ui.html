@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      margin: 0;
+      padding: 16px;
+      background-color: #2c2c2c;
+      color: #e3e3e3;
+      font-size: 12px;
+      user-select: none;
+    }
+    h2 {
+      font-size: 14px;
+      font-weight: 600;
+      margin-top: 0;
+      margin-bottom: 12px;
+      color: #ffffff;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .tabs {
+      display: flex;
+      border-bottom: 1px solid #444;
+      margin-bottom: 16px;
+    }
+    .tab {
+      flex: 1;
+      padding: 8px 4px;
+      text-align: center;
+      cursor: pointer;
+      color: #aaa;
+      font-weight: 500;
+      border-bottom: 2px solid transparent;
+      transition: all 0.2s ease;
+    }
+    .tab.active {
+      color: #18a0fb;
+      border-bottom-2px-color: #18a0fb; /* fallback */
+      border-bottom: 2px solid #18a0fb;
+    }
+    .tab-content {
+      display: none;
+    }
+    .tab-content.active {
+      display: block;
+    }
+    .input-group {
+      margin-bottom: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    label {
+      font-weight: 500;
+      color: #b3b3b3;
+    }
+    input[type="text"] {
+      background-color: #1e1e1e;
+      border: 1px solid #555;
+      border-radius: 6px;
+      color: #fff;
+      padding: 8px 12px;
+      font-size: 12px;
+      outline: none;
+      font-family: monospace;
+    }
+    input[type="text"]:focus {
+      border-color: #18a0fb;
+    }
+    button {
+      background-color: #18a0fb;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      padding: 10px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background-color 0.2s ease;
+      width: 100%;
+    }
+    button:hover {
+      background-color: #0d8de3;
+    }
+    button:disabled {
+      background-color: #555;
+      color: #888;
+      cursor: not-allowed;
+    }
+    .file-drop {
+      border: 2px dashed #555;
+      border-radius: 8px;
+      padding: 24px 16px;
+      text-align: center;
+      color: #aaa;
+      cursor: pointer;
+      transition: border-color 0.2s ease;
+    }
+    .file-drop:hover {
+      border-color: #18a0fb;
+      color: #fff;
+    }
+    .file-drop input {
+      display: none;
+    }
+    .status-card {
+      margin-top: 16px;
+      padding: 10px 12px;
+      border-radius: 6px;
+      display: none;
+      font-size: 11px;
+      line-height: 1.4;
+    }
+    .status-card.error {
+      background-color: #442323;
+      border: 1px solid #723232;
+      color: #ff9494;
+      display: block;
+    }
+    .status-card.success {
+      background-color: #1d3324;
+      border: 1px solid #285435;
+      color: #9bf2b4;
+      display: block;
+    }
+    .status-card.loading {
+      background-color: #1c2b36;
+      border: 1px solid #264254;
+      color: #a5d8ff;
+      display: block;
+    }
+    .warning-list {
+      margin-top: 8px;
+      padding-left: 16px;
+      color: #ffd080;
+    }
+    .warning-list li {
+      margin-bottom: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h2>🎨 Sellform Importer</h2>
+  
+  <div class="tabs">
+    <div id="tab-code" class="tab active">티켓 코드로 불러오기</div>
+    <div id="tab-json" class="tab">JSON 파일 업로드</div>
+  </div>
+
+  <!-- Tab 1: Code Import -->
+  <div id="content-code" class="tab-content active">
+    <div class="input-group">
+      <label for="ticket-code">Sellform 내보내기 티켓 코드</label>
+      <input type="text" id="ticket-code" placeholder="SF-XXXX-XXXX" />
+    </div>
+    <button id="btn-import-code">가져오기 및 그리기</button>
+  </div>
+
+  <!-- Tab 2: JSON Import -->
+  <div id="content-json" class="tab-content">
+    <div class="file-drop" id="drop-zone">
+      <span>이곳을 클릭하거나<br>package.json 파일을 드래그하세요</span>
+      <input type="file" id="file-input" accept=".json" />
+    </div>
+  </div>
+
+  <!-- Status indicator -->
+  <div id="status-box" class="status-card">
+    <span id="status-message"></span>
+    <ul id="warning-box" class="warning-list" style="display: none;"></ul>
+  </div>
+
+  </body>
+</html>

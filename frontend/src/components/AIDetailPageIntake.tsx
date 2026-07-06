@@ -1,30 +1,100 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import GenerationProgressShell from "./GenerationProgressShell";
+import StructuredIntakeReview from "./StructuredIntakeReview";
+import { apiUrl, structureIntake, StructuredIntakeDraft } from "@/lib/api";
+import { useRouter, useSearchParams } from "next/navigation";
 
 export default function AIDetailPageIntake() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
   const [productName, setProductName] = useState("");
   const [description, setDescription] = useState("");
   const [productUrl, setProductUrl] = useState("");
+  const [referenceUrlsText, setReferenceUrlsText] = useState("");
+  const [freeformInput, setFreeformInput] = useState("");
+  const [structuredDraft, setStructuredDraft] = useState<StructuredIntakeDraft | null>(null);
   const [selectedPreset, setSelectedPreset] = useState("깔끔한");
   const [fileName, setFileName] = useState<string | null>(null);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null);
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [runId, setRunId] = useState<string | null>(null);
+  const runId = searchParams.get("runId");
 
   const presets = ["깔끔한", "감성적인", "프리미엄", "실용 강조", "선물용"];
 
+  useEffect(() => {
+    return () => {
+      if (imagePreviewUrl) {
+        URL.revokeObjectURL(imagePreviewUrl);
+      }
+    };
+  }, [imagePreviewUrl]);
+
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
-      setFileName(e.target.files[0].name);
+      const file = e.target.files[0];
+      setFileName(file.name);
+      setSelectedFile(file);
+      setImagePreviewUrl((previousUrl) => {
+        if (previousUrl) {
+          URL.revokeObjectURL(previousUrl);
+        }
+        return URL.createObjectURL(file);
+      });
     }
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleStructureIntake = async () => {
+    if (!freeformInput.trim() && !productName.trim() && !productUrl.trim() && !selectedFile) {
+      setError("상품 사진, URL, 설명 중 하나는 입력해주세요.");
+      return;
+    }
+
+    const uid = localStorage.getItem("X-Mock-User-Id") || "00000000-0000-0000-0000-000000000001";
+    const wid = localStorage.getItem("X-Mock-Workspace-Id") || "00000000-0000-0000-0000-000000000002";
+
+    setLoading(true);
+    setError(null);
+    try {
+      const draft = await structureIntake(
+        {
+          freeform_input: freeformInput,
+          product_name: productName,
+          description,
+          product_url: productUrl,
+          reference_urls: referenceUrlsText.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+          desired_mood: selectedPreset,
+          asset_ids: [],
+        },
+        {
+          "X-Mock-User-Id": uid,
+          "X-Mock-Workspace-Id": wid,
+        }
+      );
+      setStructuredDraft(draft);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "상품 자료를 정리하지 못했습니다.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSubmitConfirmedDraft = async (confirmedDraft: StructuredIntakeDraft) => {
+    setStructuredDraft(confirmedDraft);
+    await handleSubmit({ preventDefault() {} } as React.FormEvent, confirmedDraft);
+  };
+
+  const handleSubmit = async (
+    e: React.FormEvent,
+    confirmedDraft: StructuredIntakeDraft | null = structuredDraft
+  ) => {
     e.preventDefault();
-    if (!productName.trim()) {
+    const finalProductName = confirmedDraft?.product_name.value || productName.trim() || "";
+    if (!finalProductName.trim() && !freeformInput.trim() && !productUrl.trim() && !selectedFile) {
       setError("상품명을 입력해주세요.");
       return;
     }
@@ -36,7 +106,7 @@ export default function AIDetailPageIntake() {
     const wid = localStorage.getItem("X-Mock-Workspace-Id") || "00000000-0000-0000-0000-000000000002";
 
     try {
-      const res = await fetch("http://localhost:8000/api/agent-runs", {
+      const res = await fetch(apiUrl("/api/agent-runs"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -44,11 +114,18 @@ export default function AIDetailPageIntake() {
           "X-Mock-Workspace-Id": wid,
         },
         body: JSON.stringify({
-          product_name: productName,
-          description: description,
+          product_name: finalProductName,
+          description: confirmedDraft?.description?.value || description || freeformInput,
           product_url: productUrl,
+          freeform_input: freeformInput,
           asset_ids: [],
-          reference_urls: [],
+          reference_urls:
+            confirmedDraft?.reference_urls ||
+            referenceUrlsText.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+          selling_points: confirmedDraft?.selling_points.map((point) => point.text) || [],
+          price: confirmedDraft?.price?.value || "",
+          shipping: confirmedDraft?.shipping?.value || "",
+          desired_mood: confirmedDraft?.desired_mood || [selectedPreset],
         }),
       });
 
@@ -57,7 +134,29 @@ export default function AIDetailPageIntake() {
       }
 
       const data = await res.json();
-      setRunId(data.id);
+      if (selectedFile) {
+        const formData = new FormData();
+        formData.append("project_id", data.project_id);
+        formData.append("source_type", "uploaded");
+        formData.append("file", selectedFile);
+
+        const uploadRes = await fetch(apiUrl("/api/v1/files/upload"), {
+          method: "POST",
+          headers: {
+            "X-Mock-User-Id": uid,
+            "X-Mock-Workspace-Id": wid,
+          },
+          body: formData,
+        });
+
+        if (!uploadRes.ok) {
+          throw new Error("상품 사진 업로드에 실패했습니다.");
+        }
+      }
+      if (typeof window !== "undefined") {
+        sessionStorage.setItem("sellform:lastGenerationRunId", data.id);
+      }
+      router.push(`/workspace?runId=${data.id}`);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "연결 오류가 발생했습니다.");
     } finally {
@@ -67,6 +166,23 @@ export default function AIDetailPageIntake() {
 
   if (runId) {
     return <GenerationProgressShell runId={runId} />;
+  }
+
+  if (structuredDraft) {
+    return (
+      <div className="flex min-h-screen w-full flex-col items-center justify-center bg-slate-50 p-6 text-slate-800">
+        {error && (
+          <div className="mb-4 w-full max-w-3xl rounded-lg border border-rose-100 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+            {error}
+          </div>
+        )}
+        <StructuredIntakeReview
+          draft={structuredDraft}
+          onBack={() => setStructuredDraft(null)}
+          onConfirm={handleSubmitConfirmedDraft}
+        />
+      </div>
+    );
   }
 
   return (
@@ -106,8 +222,20 @@ export default function AIDetailPageIntake() {
         <div>
           <label className="block text-sm font-semibold text-slate-700 mb-2">상품 사진</label>
           <div className="flex items-center justify-center w-full">
-            <label className="flex flex-col items-center justify-center w-full h-32 border-2 border-slate-200 border-dashed rounded-xl cursor-pointer bg-slate-50 hover:bg-slate-100 transition-colors">
-              <div className="flex flex-col items-center justify-center pt-5 pb-6">
+            <label className="flex flex-col items-center justify-center w-full min-h-48 border-2 border-slate-200 border-dashed rounded-xl cursor-pointer bg-slate-50 hover:bg-slate-100 transition-colors overflow-hidden">
+              {imagePreviewUrl && (
+                <div className="relative h-56 w-full bg-white">
+                  <img
+                    src={imagePreviewUrl}
+                    alt={fileName ? `${fileName} 미리보기` : "업로드 이미지 미리보기"}
+                    className="h-full w-full object-contain p-3"
+                  />
+                  <div className="absolute bottom-3 left-1/2 max-w-[90%] -translate-x-1/2 rounded-full bg-white/90 px-3 py-1 text-xs font-semibold text-emerald-700 shadow-sm">
+                    사진 변경하기
+                  </div>
+                </div>
+              )}
+              <div className={`flex flex-col items-center justify-center pt-5 pb-6 ${imagePreviewUrl ? "hidden" : ""}`}>
                 <svg
                   className="w-8 h-8 mb-2 text-slate-400"
                   aria-hidden="true"
@@ -136,6 +264,29 @@ export default function AIDetailPageIntake() {
           </div>
         </div>
 
+        <div>
+          <label className="block text-sm font-semibold text-slate-700 mb-2" htmlFor="freeform-input">
+            상품 자료
+          </label>
+          <textarea
+            id="freeform-input"
+            aria-label="상품 자료"
+            value={freeformInput}
+            onChange={(event) => setFreeformInput(event.target.value)}
+            placeholder="상품 설명, URL, 스펙, 가격, 원하는 분위기를 자유롭게 적어주세요."
+            rows={6}
+            className="w-full resize-none rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm focus:border-transparent focus:outline-none focus:ring-2 focus:ring-emerald-500"
+          />
+          <button
+            type="button"
+            onClick={handleStructureIntake}
+            disabled={loading}
+            className="mt-3 rounded-xl bg-slate-900 px-5 py-3 text-sm font-bold text-white hover:bg-slate-800 disabled:opacity-50"
+          >
+            {loading ? "자료 확인 중..." : "자료 확인하기"}
+          </button>
+        </div>
+
         {/* Inputs row */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
@@ -155,10 +306,24 @@ export default function AIDetailPageIntake() {
               placeholder="상품명"
               value={productName}
               onChange={(e) => setProductName(e.target.value)}
-              required
               className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent text-sm bg-slate-50 hover:bg-slate-100/50 transition-colors"
             />
           </div>
+        </div>
+
+        <div>
+          <label className="block text-sm font-semibold text-slate-700 mb-2" htmlFor="reference-urls">
+            참고 상세페이지 URL
+          </label>
+          <textarea
+            id="reference-urls"
+            aria-label="참고 상세페이지 URL"
+            value={referenceUrlsText}
+            onChange={(event) => setReferenceUrlsText(event.target.value)}
+            placeholder="한 줄에 하나씩 입력"
+            rows={2}
+            className="w-full resize-none rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm"
+          />
         </div>
 
         {/* Description Textarea */}

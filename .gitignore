@@ -1,18 +1,70 @@
+# Node / Next
+node_modules/
+.next/
+frontend/.next/
+frontend/node_modules/
+frontend/playwright-report/
+
+# Logs
+*.log
+*.err.log
+
 # Python-generated files
 __pycache__/
 *.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
+.pytest_cache/
+backend/.pytest_cache/
 
 # Virtual environments
-.venv
+.venv/
+backend/.venv/
 
-# Local runtime state
-.pytest_cache/
-*.db
-uploads/
-.superpowers/
+# Local secrets / editor / agent scratch
+.env
+.env.*
+!.env.example
 .vscode/
+.superpowers/
 .worktrees/
+__*probe*
+*.bak
+
+# Local DB / SQLite
+*.db
+*.sqlite3
+*.sqlite3-journal
+*.db-journal
+*.db.backup*
+*.backup-*
+sellform_dev.db
+sellform_run.db
+test_temp.db
+
+# Test / browser outputs
+test-results*/
+playwright-report/
+frontend/test-results*/
+frontend/.e2e-*/
+.pytest-tmp*/
+backend/.pytest-tmp*/
+backend/.test-tmp*/
+backend/.pytest_cache_temp/
+
+# Temp / generated output
+tmp/
+output/
+
+# Runtime uploads
+uploads/
+backend/uploads/
+
+# Figma bridge local state and JavaScript build artifacts
+.sellform/
+integrations/figma-bridge/.sellform/
+integrations/figma-bridge/node_modules/
+integrations/figma-bridge/dist/
+
+# Figma plugin build and local state
+integrations/figma-plugin/node_modules/
+integrations/figma-plugin/dist/
+integrations/figma-plugin/manifest.json

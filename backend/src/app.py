@@ -40,14 +40,19 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Enable CORS for frontend requests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust for production
+    allow_origins=[
+        "http://localhost:3100",
+        "http://127.0.0.1:3100",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 from src.api.figma_plugin import router as figma_plugin_router
 from src.api.image_generation import router as image_generation_router

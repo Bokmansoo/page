@@ -1,0 +1,21 @@
+{
+  "name": "figma-plugin",
+  "version": "1.0.0",
+  "description": "Sellform Detail Page Importer Figma Plugin",
+  "type": "module",
+  "scripts": {
+    "configure": "node scripts/configure-manifest.mjs",
+    "build": "node esbuild.mjs",
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand",
+    "watch": "node esbuild.mjs --watch"
+  },
+  "devDependencies": {
+    "@figma/plugin-typings": "^1.83.0",
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.14.9",
+    "esbuild": "^0.21.5",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.5",
+    "typescript": "^5.5.2"
+  }
+}

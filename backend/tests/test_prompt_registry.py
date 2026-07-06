@@ -1,4 +1,4 @@
-from backend.src.services.prompt_registry import PromptRegistry
+from src.services.prompt_registry import PromptRegistry
 
 
 def test_prompt_registry_loads_named_prompt():
@@ -16,3 +16,11 @@ def test_prompt_registry_rejects_path_traversal():
         assert "Invalid prompt name" in str(exc)
     else:
         raise AssertionError("path traversal should be rejected")
+
+
+def test_prompt_registry_loads_agent_node_prompt_by_agent_name():
+    registry = PromptRegistry(base_path="backend/src/agents/nodes")
+    prompt = registry.load_agent_prompt("copywriting")
+
+    assert "카피라이팅" in prompt
+    assert "상세페이지" in prompt

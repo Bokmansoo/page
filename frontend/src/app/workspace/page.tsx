@@ -1,8 +1,12 @@
 "use client";
 
-import React from "react";
+import React, { Suspense } from "react";
 import AIDetailPageIntake from "@/components/AIDetailPageIntake";
 
 export default function WorkspaceDashboard() {
-  return <AIDetailPageIntake />;
+  return (
+    <Suspense fallback={<div className="min-h-screen bg-slate-50" />}>
+      <AIDetailPageIntake />
+    </Suspense>
+  );
 }

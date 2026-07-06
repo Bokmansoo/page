@@ -1,8 +1,22 @@
 from abc import ABC, abstractmethod
-from backend.src.agents.state import AgentRunState
+from collections.abc import Callable
+from typing import Any
+
+from src.agents.state import AgentRunState
+
+RealTextGenerator = Callable[[str, str, dict[str, Any], type], dict[str, Any]]
 
 
-class BaseNode(ABC):
+class AgentNode(ABC):
+    name: str
+
     @abstractmethod
     def run(self, state: AgentRunState) -> AgentRunState:
-        pass
+        raise NotImplementedError
+
+    def run_real_text(
+        self,
+        state: AgentRunState,
+        generate_output: RealTextGenerator,
+    ) -> AgentRunState:
+        return self.run(state)

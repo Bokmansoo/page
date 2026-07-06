@@ -1,4 +1,4 @@
-from backend.src.services.generation_mode import GenerationMode, resolve_generation_mode
+from src.services.generation_mode import GenerationMode, resolve_generation_mode
 
 
 def test_generation_mode_defaults_to_mock(monkeypatch):

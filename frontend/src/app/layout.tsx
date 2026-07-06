@@ -16,8 +16,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="ko" className={`${inter.variable} ${outfit.variable} dark`}>
-      <body className="antialiased selection:bg-indigo-500/30">
+    <html lang="ko" className={`${inter.variable} ${outfit.variable}`}>
+      <body className="bg-slate-50 text-slate-900 antialiased selection:bg-emerald-200/70">
         {children}
       </body>
     </html>

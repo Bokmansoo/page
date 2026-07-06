@@ -38,8 +38,13 @@ class CopySetOutput(BaseModel):
     hero_title: str
     hero_subtitle: str
     painpoint_title: str
+    painpoint_body: str
     feature_1_title: str
+    feature_1_body: str
     feature_2_title: str
+    feature_2_body: str
+    guarantee_title: str
+    guarantee_body: str
     cta_text: str
 
 

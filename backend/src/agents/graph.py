@@ -1,3 +1,7 @@
+import json
+import os
+from typing import Any, Callable
+
 from src.agents.state import AgentRunState, AgentStage
 from src.agents.schemas import (
     ProductUnderstandingOutput,
@@ -7,197 +11,343 @@ from src.agents.schemas import (
     VisualPlanOutput,
     QAReportOutput,
 )
-from src.services.provider_adapters import ProviderRequest
+from src.services.provider_adapters import ProviderRequest, TextProviderProtocol
+
+# Import 11 agents
+from src.agents.nodes.input_router.agent import InputRouterAgent
+from src.agents.nodes.source_collection.agent import SourceCollectionAgent
+from src.agents.nodes.product_understanding.agent import ProductUnderstandingAgent
+from src.agents.nodes.reference_analysis.agent import ReferenceAnalysisAgent
+from src.agents.nodes.sales_strategy.agent import SalesStrategyAgent
+from src.agents.nodes.page_planning.agent import PagePlanningAgent
+from src.agents.nodes.copywriting.agent import CopywritingAgent
+from src.agents.nodes.visual_planning.agent import VisualPlanningAgent
+from src.agents.nodes.image_generation.agent import ImageGenerationAgent
+from src.agents.nodes.page_assembly.agent import PageAssemblyAgent
+from src.agents.nodes.qa_review.agent import QAReviewAgent
 
 
 class AgentGraph:
     def __init__(self, is_mock: bool = True):
         self.is_mock = is_mock
-        self.text_provider = None
+        self.text_provider: TextProviderProtocol | None = None
+
+        # Instantiate 11 agents
+        self.agents = [
+            InputRouterAgent(),
+            SourceCollectionAgent(),
+            ProductUnderstandingAgent(),
+            ReferenceAnalysisAgent(),
+            SalesStrategyAgent(),
+            PagePlanningAgent(),
+            CopywritingAgent(),
+            VisualPlanningAgent(),
+            ImageGenerationAgent(),
+            PageAssemblyAgent(),
+            QAReviewAgent(),
+        ]
 
     @classmethod
     def mock(cls) -> "AgentGraph":
         return cls(is_mock=True)
 
     @classmethod
-    def real_text(cls, text_provider) -> "AgentGraph":
+    def real_text(cls, text_provider: TextProviderProtocol) -> "AgentGraph":
         instance = cls(is_mock=False)
         instance.text_provider = text_provider
         return instance
 
-    def run_next(self, state: AgentRunState) -> AgentRunState:
-        if state.current_stage == AgentStage.INTAKE:
-            state.current_stage = AgentStage.PRODUCT_UNDERSTANDING
-            state.outputs["product_understanding"] = {
-                "mocked": True,
-                "product_name": state.product_input.product_name,
-                "facts": ["검증된 사실 1"],
-            }
-        return state
+    def run(self, state: AgentRunState) -> AgentRunState:
+        # Run all 11 agents in order
+        for agent in self.agents:
+            state.current_stage = AgentStage(agent.name)
+            state = agent.run(state)
 
-    def run_text_generation(self, state: AgentRunState) -> AgentRunState:
-        import json
-        from src.services.prompt_registry import PromptRegistry
-
-        pname = state.product_input.product_name or "유아 자전거"
-        description = state.product_input.description or "설명 없음"
-        url = state.product_input.product_url or "URL 없음"
-
-        import os
-        base_dir = "prompts" if os.path.exists("prompts") else "backend/prompts"
-        registry = PromptRegistry(base_path=base_dir)
-        system_base = registry.load("system/sellform_agent_base")
-
-        # 1. Product Understanding
-        pu_sys = system_base + "\n" + registry.load("agents/product_understanding")
-        pu_user = f"상품명: {pname}\n상품설명: {description}\n상품URL: {url}"
-
-        res_pu = self.text_provider.generate_json(
-            ProviderRequest(
-                provider="mock",
-                model="mock-text",
-                system_prompt=pu_sys,
-                user_prompt=pu_user,
-                schema_name="product_understanding",
-            )
-        )
-        pu_validated = ProductUnderstandingOutput.model_validate(res_pu["content"])
-        state.outputs["product_understanding"] = pu_validated.model_dump()
-
-        # 2. Sales Strategy
-        ss_sys = system_base + "\n" + registry.load("agents/sales_strategy")
-        ss_user = f"상품 정보: {json.dumps(state.outputs['product_understanding'], ensure_ascii=False)}"
-
-        res_ss = self.text_provider.generate_json(
-            ProviderRequest(
-                provider="mock",
-                model="mock-text",
-                system_prompt=ss_sys,
-                user_prompt=ss_user,
-                schema_name="sales_strategy",
-            )
-        )
-        ss_validated = SalesStrategyOutput.model_validate(res_ss["content"])
-        state.outputs["sales_strategy"] = ss_validated.model_dump()
-
-        # 3. Page Plan
-        pp_sys = system_base + "\n" + registry.load("agents/page_planning")
-        pp_user = f"마케팅 전략: {json.dumps(state.outputs['sales_strategy'], ensure_ascii=False)}"
-
-        res_pp = self.text_provider.generate_json(
-            ProviderRequest(
-                provider="mock",
-                model="mock-text",
-                system_prompt=pp_sys,
-                user_prompt=pp_user,
-                schema_name="page_plan",
-            )
-        )
-        pp_validated = DetailPagePlanOutput.model_validate(res_pp["content"])
-        state.outputs["page_plan"] = pp_validated.model_dump()
-
-        # 4. Copy Set
-        cs_sys = system_base + "\n" + registry.load("agents/copywriting")
-        cs_user = f"레이아웃 구조: {json.dumps(state.outputs['page_plan'], ensure_ascii=False)}"
-
-        res_cs = self.text_provider.generate_json(
-            ProviderRequest(
-                provider="mock",
-                model="mock-text",
-                system_prompt=cs_sys,
-                user_prompt=cs_user,
-                schema_name="copy_set",
-            )
-        )
-        cs_validated = CopySetOutput.model_validate(res_cs["content"])
-        state.outputs["copy_set"] = cs_validated.model_dump()
-
-        # 5. Visual Plan
-        vp_sys = system_base + "\n" + registry.load("agents/visual_planning")
-        vp_user = f"마케팅 카피: {json.dumps(state.outputs['copy_set'], ensure_ascii=False)}"
-
-        res_vp = self.text_provider.generate_json(
-            ProviderRequest(
-                provider="mock",
-                model="mock-text",
-                system_prompt=vp_sys,
-                user_prompt=vp_user,
-                schema_name="visual_plan",
-            )
-        )
-        vp_validated = VisualPlanOutput.model_validate(res_vp["content"])
-        state.outputs["visual_plan"] = vp_validated.model_dump()
-
-        # 6. QA Report
-        res_qa = self.text_provider.generate_json(
-            ProviderRequest(
-                provider="mock",
-                model="mock-text",
-                system_prompt=system_base + "\n" + registry.load("agents/qa_review"),
-                user_prompt=f"작성본 데이터: {json.dumps(state.outputs, ensure_ascii=False)}",
-                schema_name="qa_report",
-            )
-        )
-        qa_validated = QAReportOutput.model_validate(res_qa["content"])
-        state.outputs["qa_report"] = qa_validated.model_dump()
-
-        # 7. Page Assembly (LLM 결과 기반 동적 조립)
-        copy_set = state.outputs.get("copy_set", {})
-        page_plan = state.outputs.get("page_plan", {})
-        sections_plan = page_plan.get("sections", [])
-
-        assembled_sections = []
-        role_map = {
-            0: ("hero", "mock-hero-visual", copy_set.get("hero_title", ""), copy_set.get("hero_subtitle", "")),
-            1: ("comparison", "mock-comparison-visual", copy_set.get("painpoint_title", ""), "흔들리는 저가형 제품과 비교해 보세요."),
-            2: ("detail_1", "mock-detail-1-visual", copy_set.get("feature_1_title", ""), "체형 변화에 맞춰 편리하게 안장 높이를 조절합니다."),
-            3: ("detail_2", "mock-detail-2-visual", copy_set.get("feature_2_title", ""), "KC 유해물질 검사를 완료하여 안심하고 태울 수 있습니다."),
-            4: ("guarantee", "mock-guarantee-visual", "안심 구매 보장 & 정품 마크", copy_set.get("cta_text", "지금 구매하기")),
-        }
-
-        for idx, sec in enumerate(sections_plan):
-            sec_id = sec.get("id") or f"sec-{idx+1}"
-            sec_name = sec.get("name") or "세부 정보"
-            role_data = role_map.get(idx, ("detail_1", "mock-detail-1-visual", sec_name, "상세 정보 설명"))
-            
-            assembled_sections.append({
-                "id": sec_id,
-                "title": role_data[2],
-                "body": role_data[3],
-                "visual_role": role_data[0],
-                "image_id": role_data[1],
-            })
-
-        state.outputs["page_assembly"] = {
-            "sections": assembled_sections
-        }
-
-        state.current_stage = AgentStage.REVIEW_EDITOR
+        self._add_legacy_compatibility(state)
         return state
 
     def run_all(self, state: AgentRunState) -> AgentRunState:
-        from src.agents.mock_outputs import (
-            build_mock_product_understanding,
-            build_mock_sales_strategy,
-            build_mock_page_plan,
-            build_mock_copy_set,
-            build_mock_visual_plan,
-            build_mock_generated_assets,
-            build_mock_page_assembly,
-            build_mock_qa_report,
-        )
+        return self.run(state)
 
-        pname = state.product_input.product_name or "무명 상품"
-
-        state.outputs["product_understanding"] = build_mock_product_understanding(pname)
-        state.outputs["sales_strategy"] = build_mock_sales_strategy(pname)
-        state.outputs["page_plan"] = build_mock_page_plan(pname)
-        state.outputs["copy_set"] = build_mock_copy_set(pname)
-        state.outputs["visual_plan"] = build_mock_visual_plan(pname)
-        state.outputs["generated_assets"] = build_mock_generated_assets(pname)
-        state.outputs["page_assembly"] = build_mock_page_assembly(pname)
-        state.outputs["qa_report"] = build_mock_qa_report(pname)
-
-        state.current_stage = AgentStage.REVIEW_EDITOR
+    def run_next(self, state: AgentRunState) -> AgentRunState:
+        agent_names = [agent.name for agent in self.agents]
+        current_index = agent_names.index(state.current_stage.value)
+        next_index = min(current_index + 1, len(self.agents) - 1)
+        next_agent = self.agents[next_index]
+        state.current_stage = AgentStage(next_agent.name)
+        state = next_agent.run(state)
+        self._add_legacy_compatibility(state)
         return state
 
+    def _run_text_generation_legacy_manual_pipeline(self, state: AgentRunState) -> AgentRunState:
+        from src.services.prompt_registry import PromptRegistry
+
+        text_provider = self.text_provider
+        if text_provider is None:
+            raise RuntimeError("Text provider is required for real text generation.")
+
+        pname = state.product_input.product_name or "상품"
+        system_prompt_dir = "prompts" if os.path.exists("prompts") else "backend/prompts"
+        node_prompt_dir = (
+            "src/agents/nodes"
+            if os.path.exists("src/agents/nodes")
+            else "backend/src/agents/nodes"
+        )
+        system_registry = PromptRegistry(base_path=system_prompt_dir)
+        node_prompt_registry = PromptRegistry(base_path=node_prompt_dir)
+        system_base = system_registry.load("system/sellform_agent_base")
+
+        product_context = state.product_input.model_dump()
+
+        def generate_output(schema_name, prompt_name, context, schema_cls):
+            result = text_provider.generate_json(
+                ProviderRequest(
+                    provider="router",
+                    model="configured",
+                    system_prompt=system_base + "\n" + node_prompt_registry.load_agent_prompt(prompt_name),
+                    user_prompt=json.dumps(context, ensure_ascii=False),
+                    schema_name=schema_name,
+                    product_name=pname,
+                )
+            )
+            validated = schema_cls.model_validate(result["content"]).model_dump()
+            state.provider_trace.append(
+                {
+                    "stage": schema_name,
+                    "provider": result.get("provider"),
+                    "model": result.get("model"),
+                    "token_usage": result.get("token_usage"),
+                    "cost": result.get("cost"),
+                }
+            )
+            cost = result.get("cost")
+            if isinstance(cost, (int, float)):
+                state.actual_cost = (state.actual_cost or 0) + cost
+            return validated
+
+        # 1. input_router
+        state.current_stage = AgentStage.INPUT_ROUTER
+        state.outputs["input_router"] = {
+            "input_type": "mixed",
+            "missing_inputs": [],
+        }
+
+        # 2. source_collection
+        state.current_stage = AgentStage.SOURCE_COLLECTION
+        state.outputs["source_collection"] = {
+            "sources": [],
+            "status": "completed",
+        }
+
+        # 3. product_understanding
+        state.current_stage = AgentStage.PRODUCT_UNDERSTANDING
+        state.outputs["product_understanding"] = generate_output(
+            "product_understanding",
+            "product_understanding",
+            {"product_input": product_context},
+            ProductUnderstandingOutput,
+        )
+
+        # 4. reference_analysis
+        state.current_stage = AgentStage.REFERENCE_ANALYSIS
+        has_ref = bool(state.product_input.reference_urls or state.product_input.product_url)
+        if not has_ref:
+            state.outputs["reference_analysis"] = {"skipped": True}
+        else:
+            state.outputs["reference_analysis"] = {
+                "skipped": False,
+                "analyzed_references": ["참조 링크 분석 완료"],
+            }
+
+        # 5. sales_strategy
+        state.current_stage = AgentStage.SALES_STRATEGY
+        state.outputs["sales_strategy"] = generate_output(
+            "sales_strategy",
+            "sales_strategy",
+            {
+                "product_input": product_context,
+                "product_understanding": state.outputs["product_understanding"],
+            },
+            SalesStrategyOutput,
+        )
+
+        # 6. page_planning
+        state.current_stage = AgentStage.PAGE_PLANNING
+        state.outputs["page_planning"] = generate_output(
+            "page_plan",
+            "page_planning",
+            {
+                "product_input": product_context,
+                "product_understanding": state.outputs["product_understanding"],
+                "sales_strategy": state.outputs["sales_strategy"],
+            },
+            DetailPagePlanOutput,
+        )
+
+        # 7. copywriting
+        state.current_stage = AgentStage.COPYWRITING
+        state.outputs["copywriting"] = generate_output(
+            "copy_set",
+            "copywriting",
+            {
+                "product_input": product_context,
+                "product_understanding": state.outputs["product_understanding"],
+                "sales_strategy": state.outputs["sales_strategy"],
+                "page_plan": state.outputs["page_planning"],
+            },
+            CopySetOutput,
+        )
+
+        # 8. visual_planning
+        state.current_stage = AgentStage.VISUAL_PLANNING
+        state.outputs["visual_planning"] = generate_output(
+            "visual_plan",
+            "visual_planning",
+            {
+                "product_input": product_context,
+                "page_plan": state.outputs["page_planning"],
+                "copy_set": state.outputs["copywriting"],
+            },
+            VisualPlanOutput,
+        )
+
+        # 9. image_generation
+        state.current_stage = AgentStage.IMAGE_GENERATION
+        uploaded_list = []
+        try:
+            from src.db.database import SessionLocal
+            from src.db.models import Asset
+            db = SessionLocal()
+            try:
+                if state.product_input.asset_ids:
+                    assets = db.query(Asset).filter(Asset.id.in_(state.product_input.asset_ids)).all()
+                else:
+                    assets = db.query(Asset).filter(Asset.project_id == state.project_id).all()
+                for a in assets:
+                    uploaded_list.append({
+                        "id": a.id,
+                        "filename": a.filename,
+                        "url": f"/api/assets/{a.id}/file"
+                    })
+            finally:
+                db.close()
+        except Exception:
+            pass
+
+
+        # 10. page_assembly
+        state.current_stage = AgentStage.PAGE_ASSEMBLY
+        from src.agents.mock_outputs import build_mock_page_assembly
+        copy_set = state.outputs.get("copywriting", {})
+        state.outputs["page_assembly"] = build_mock_page_assembly(
+            pname,
+            uploaded_assets=uploaded_list,
+            product_url=state.product_input.product_url or "",
+            copy_set=copy_set
+        )
+
+        # 11. qa_review
+        state.current_stage = AgentStage.QA_REVIEW
+        state.outputs["qa_review"] = generate_output(
+            "qa_report",
+            "qa_review",
+            {
+                "product_input": product_context,
+                "outputs": state.outputs,
+            },
+            QAReportOutput,
+        )
+
+        self._add_legacy_compatibility(state)
+        return state
+
+    def run_text_generation(
+        self,
+        state: AgentRunState,
+        progress_callback: Callable[
+            [str, str, AgentRunState, Exception | None],
+            None,
+        ]
+        | None = None,
+    ) -> AgentRunState:
+        from src.services.prompt_registry import PromptRegistry
+
+        product_name = state.product_input.product_name or "상품"
+        text_provider = self.text_provider
+        if text_provider is None:
+            raise RuntimeError("Text provider is required for real text generation.")
+        system_prompt_dir = "prompts" if os.path.exists("prompts") else "backend/prompts"
+        node_prompt_dir = (
+            "src/agents/nodes"
+            if os.path.exists("src/agents/nodes")
+            else "backend/src/agents/nodes"
+        )
+        system_registry = PromptRegistry(base_path=system_prompt_dir)
+        node_prompt_registry = PromptRegistry(base_path=node_prompt_dir)
+        system_base = system_registry.load("system/sellform_agent_base")
+
+        def generate_output(schema_name, prompt_name, context, schema_cls):
+            result = text_provider.generate_json(
+                ProviderRequest(
+                    provider="router",
+                    model="configured",
+                    system_prompt=system_base + "\n" + node_prompt_registry.load_agent_prompt(prompt_name),
+                    user_prompt=json.dumps(context, ensure_ascii=False),
+                    schema_name=schema_name,
+                    product_name=product_name,
+                )
+            )
+            validated = schema_cls.model_validate(result["content"]).model_dump()
+            state.provider_trace.append(
+                {
+                    "stage": schema_name,
+                    "provider": result.get("provider"),
+                    "model": result.get("model"),
+                    "token_usage": result.get("token_usage"),
+                    "cost": result.get("cost"),
+                }
+            )
+            cost = result.get("cost")
+            if isinstance(cost, (int, float)):
+                state.actual_cost = (state.actual_cost or 0) + cost
+            return validated
+
+        for agent in self.agents:
+            state.current_stage = AgentStage(agent.name)
+            if progress_callback:
+                progress_callback(agent.name, "running", state, None)
+            try:
+                state = agent.run_real_text(state, generate_output)
+            except Exception as exc:
+                if progress_callback:
+                    progress_callback(agent.name, "failed", state, exc)
+                raise
+            if progress_callback:
+                progress_callback(agent.name, "completed", state, None)
+
+        self._add_legacy_compatibility(state)
+        return state
+
+    def _add_legacy_compatibility(self, state: AgentRunState):
+        state.outputs["legacy"] = {
+            "product_understanding": state.outputs.get("product_understanding"),
+            "sales_strategy": state.outputs.get("sales_strategy"),
+            "page_plan": state.outputs.get("page_planning"),
+            "copy_set": state.outputs.get("copywriting"),
+            "visual_plan": state.outputs.get("visual_planning"),
+            "page_assembly": state.outputs.get("page_assembly"),
+            "qa_report": state.outputs.get("qa_review"),
+        }
+
+        # Root outputs compatibility keys for older tests/services
+        state.outputs["copy_set"] = state.outputs.get("copywriting")
+        state.outputs["page_plan"] = state.outputs.get("page_planning")
+        state.outputs["visual_plan"] = state.outputs.get("visual_planning")
+        state.outputs["qa_report"] = state.outputs.get("qa_review")
+        image_generation = state.outputs.get("image_generation")
+        if (
+            isinstance(image_generation, dict)
+            and not image_generation.get("skipped")
+            and bool(image_generation.get("images"))
+        ):
+            state.outputs["generated_assets"] = image_generation

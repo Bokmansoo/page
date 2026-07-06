@@ -1,6 +1,7 @@
 import os
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 from src.api.auth import get_current_user_and_workspace
@@ -92,3 +93,37 @@ async def upload_file(
     db.commit()
 
     return asset
+
+
+@router.get("/assets/{asset_id}")
+def get_asset_file(
+    asset_id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    if asset_id.startswith("mock-") or asset_id.startswith("candidate-") or asset_id in {"asset-selected", "asset-default"}:
+        from fastapi.responses import Response
+        # 1x1 transparent PNG
+        dummy_png = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
+        return Response(content=dummy_png, media_type="image/png")
+
+    workspace = auth_ctx["workspace"]
+    asset = (
+        db.query(Asset)
+        .join(ProductProject, ProductProject.id == Asset.project_id)
+        .filter(Asset.id == asset_id, ProductProject.workspace_id == workspace.id)
+        .first()
+    )
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+
+    file_path = asset.file_path
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Asset file not found")
+
+    return FileResponse(
+        file_path,
+        media_type=asset.mime_type,
+        filename=asset.filename,
+    )
