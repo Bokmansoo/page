@@ -220,6 +220,8 @@ class PageSection(Base):
     body_copy = Column(Text, nullable=True)
     associated_fact_ids = Column(JSON, nullable=True)  # list of fact UUIDs
     image_asset_id = Column(String(36), ForeignKey("assets.id", ondelete="SET NULL"), nullable=True)
+    visual_kind = Column(String(30), nullable=True)
+    visual_payload = Column(JSON, nullable=True)
     sort_order = Column(Integer, nullable=False, default=0)
     is_visible = Column(Boolean, nullable=False, default=True)
 

@@ -2,6 +2,10 @@
 
 import React, { useEffect } from "react";
 import { apiUrl } from "@/lib/api";
+import ImageSectionVisual from "@/components/detail-page/ImageSectionVisual";
+import HtmlGraphicVisual from "@/components/detail-page/HtmlGraphicVisual";
+import { validateSectionVisual } from "@/components/detail-page/types";
+import type { VisualKind, DetailPageSectionVisual } from "@/components/detail-page/types";
 
 export interface DetailPageImageCandidate {
   candidate_id: string;
@@ -20,6 +24,8 @@ export interface DetailPageSection {
   body?: string | null;
   body_copy?: string | null;
   image_asset_id?: string | null;
+  visual_kind?: VisualKind | null;
+  visual_payload?: Record<string, unknown> | null;
   sort_order: number;
   is_visible?: boolean;
   image_candidates?: DetailPageImageCandidate[];
@@ -160,6 +166,11 @@ export default function DetailPageDocument({ page, assets, exportMode = false }:
         const body = section.body_copy || section.body || "";
         const theme = sectionTheme(section.section_type, index);
 
+        const visualKind = section.visual_kind;
+        const isHtmlGraphic = visualKind === "html_graphic";
+        const isImage = visualKind === "image";
+        const visualIssues = validateSectionVisual(section as unknown as DetailPageSectionVisual);
+
         return (
           <section
             key={section.id || `${section.section_type}-${index}`}
@@ -176,20 +187,27 @@ export default function DetailPageDocument({ page, assets, exportMode = false }:
               {body}
             </p>
             {section.section_type !== "product_information" ? (
-              imageSrc ? (
-                <figure className={`relative mt-9 overflow-hidden ${theme.figure}`}>
-                  <img src={imageSrc} alt={title} className="aspect-[4/3] w-full object-cover" />
-                  {!exportMode ? (
-                    <figcaption className="absolute right-3 top-3 rounded-full bg-emerald-700 px-3 py-1 text-[10px] font-bold text-white">
-                      {sourceLabel(matchedAsset?.source_type || "ai-generated")}
-                    </figcaption>
-                  ) : null}
-                </figure>
-              ) : (
-                <div className="mt-8 flex aspect-[4/3] items-center justify-center border border-amber-200 bg-amber-50 text-sm font-bold text-amber-700">
-                  이 섹션은 이미지 확인이 필요합니다.
+              isHtmlGraphic ? (
+                <HtmlGraphicVisual section={section as unknown as DetailPageSectionVisual} />
+              ) : isImage || imageSrc ? (
+                <ImageSectionVisual
+                  section={section as unknown as DetailPageSectionVisual}
+                  imageSrc={imageSrc}
+                  matchedAssetLabel={
+                    matchedAsset
+                      ? sourceLabel(matchedAsset.source_type)
+                      : undefined
+                  }
+                  exportMode={exportMode}
+                />
+              ) : visualIssues.length > 0 ? (
+                <div
+                  className="mt-8 flex aspect-[4/3] items-center justify-center border border-amber-200 bg-amber-50 text-sm font-bold text-amber-700"
+                  data-section-visual="image"
+                >
+                  이미지 확인이 필요합니다
                 </div>
-              )
+              ) : null
             ) : null}
           </section>
         );

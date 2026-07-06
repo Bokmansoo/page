@@ -4,6 +4,8 @@ import React, { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { apiUrl } from "@/lib/api";
 import DetailPageDocument from "@/components/DetailPageDocument";
+import { validateSectionVisual } from "@/components/detail-page/types";
+import type { DetailPageSectionVisual } from "@/components/detail-page/types";
 
 interface GeneratedDetailPageResultProps {
   projectId: string;
@@ -428,8 +430,8 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
   const visibleSections = pageData.sections
     .filter((section) => section.is_visible)
     .sort((a, b) => a.sort_order - b.sort_order);
-  const missingVisualCount = visibleSections.filter(
-    (section) => section.section_type !== "product_information" && !section.image_asset_id
+  const invalidVisualCount = visibleSections.filter(
+    (section) => validateSectionVisual(section as unknown as DetailPageSectionVisual).length > 0
   ).length;
 
   return (
@@ -437,11 +439,11 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
       <header className="sticky top-0 z-40 flex items-center justify-between border-b border-slate-200 bg-white px-6 py-4">
         <div className="flex min-w-0 items-center gap-3">
           <span className={`rounded-full border px-3 py-1 text-xs font-bold ${
-            missingVisualCount
+            invalidVisualCount
               ? "border-amber-200 bg-amber-50 text-amber-700"
               : "border-emerald-200 bg-emerald-50 text-emerald-700"
           }`}>
-            {missingVisualCount ? `이미지 ${missingVisualCount}개 확인 필요` : "생성 완료"}
+            {invalidVisualCount ? `시각 요소 ${invalidVisualCount}개 확인 필요` : "생성 완료"}
           </span>
           <h1 className="text-lg font-extrabold text-slate-950">완성된 상세페이지</h1>
           <p className="max-w-[300px] truncate border-l border-slate-200 pl-3 text-xs font-medium text-slate-500">
@@ -615,7 +617,7 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
         <button
           type="button"
           onClick={() => handleDownloadImage(exportFormat)}
-          disabled={exporting || missingVisualCount > 0}
+          disabled={exporting || invalidVisualCount > 0}
           className="rounded-lg border border-slate-200 bg-white px-6 py-3 text-sm font-bold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
         >
           {exporting

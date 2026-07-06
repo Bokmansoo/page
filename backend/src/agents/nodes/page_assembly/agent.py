@@ -92,6 +92,14 @@ class PageAssemblyAgent(AgentNode):
                     "candidate_id": None,
                     "identity_check": {"status": "not_required"},
                 }
+                section["visual_kind"] = "html_graphic"
+                section["visual_payload"] = scene.get("visual_payload") or {
+                    "layout_variant": {
+                        "comparison": "comparison_cards",
+                        "detail_1": "benefit_cards",
+                        "guarantee": "spec_table",
+                    }.get(slot_id, "image_text")
+                }
                 section["image_asset_id"] = None
                 continue
 

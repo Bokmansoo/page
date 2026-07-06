@@ -81,3 +81,32 @@ def test_page_assembly_preserves_scene_plan_metadata():
     assert hero["visual_strategy"] == "cutout_composite"
     assert comparison["visual_strategy"] == "html_graphic"
     assert comparison["visual_slot"]["status"] == "html_rendered"
+
+
+def test_assembly_preserves_html_graphic_payload():
+    state = AgentRunState(
+        project_id="project-1",
+        outputs={
+            "visual_planning": {
+                "scene_plan": {
+                    "sections": [
+                        {
+                            "section_id": "pain_points",
+                            "target_slot_id": "comparison",
+                            "visual_strategy": "html_graphic",
+                            "visual_payload": {
+                                "layout_variant": "comparison_cards",
+                                "cards": [{"title": "이동", "body": "필요한 곳에서 사용"}],
+                            },
+                        }
+                    ]
+                }
+            },
+            "image_generation": {"candidates": {}},
+        },
+    )
+    output = PageAssemblyAgent().run(state).outputs["page_assembly"]
+    comparison = next(item for item in output["sections"] if item["id"] == "sec-2")
+    assert comparison["visual_kind"] == "html_graphic"
+    assert comparison["visual_payload"]["cards"][0]["title"] == "이동"
+    assert comparison["image_asset_id"] is None

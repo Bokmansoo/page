@@ -159,6 +159,8 @@ class AgentRunService:
                     title=title,
                     body_copy=body_copy,
                     image_asset_id=mapped_image_id,
+                    visual_kind=section.get("visual_kind"),
+                    visual_payload=section.get("visual_payload") or {},
                     sort_order=idx,
                     is_visible=True,
                 )
@@ -171,6 +173,8 @@ class AgentRunService:
                     "body": body_copy,
                     "body_copy": body_copy,
                     "image_asset_id": mapped_image_id,
+                    "visual_kind": section.get("visual_kind"),
+                    "visual_payload": section.get("visual_payload") or {},
                     "sort_order": idx,
                     "is_visible": True,
                 }

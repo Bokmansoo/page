@@ -76,6 +76,14 @@ def ensure_runtime_schema_compatibility() -> None:
                     text("ALTER TABLE figma_export_jobs ADD COLUMN auth_url TEXT")
                 )
 
+    if "page_sections" in table_names:
+        existing_section_columns = {column["name"] for column in inspector.get_columns("page_sections")}
+        with engine.begin() as connection:
+            if "visual_kind" not in existing_section_columns:
+                connection.execute(text("ALTER TABLE page_sections ADD COLUMN visual_kind VARCHAR(30)"))
+            if "visual_payload" not in existing_section_columns:
+                connection.execute(text("ALTER TABLE page_sections ADD COLUMN visual_payload JSON"))
+
     if "agent_runs" not in table_names or "agent_run_steps" not in table_names:
         Base.metadata.create_all(bind=engine)
 

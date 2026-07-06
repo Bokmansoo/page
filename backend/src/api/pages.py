@@ -51,6 +51,8 @@ class SectionUpdateSchema(BaseModel):
     title: Optional[str] = None
     body_copy: Optional[str] = None
     image_asset_id: Optional[str] = None
+    visual_kind: Optional[Literal["image", "html_graphic"]] = None
+    visual_payload: Optional[dict] = None
     sort_order: int
     is_visible: bool
 
@@ -60,6 +62,8 @@ class SectionCreateSchema(BaseModel):
     body_copy: Optional[str] = None
     associated_fact_ids: List[str] = []
     image_asset_id: Optional[str] = None
+    visual_kind: Optional[Literal["image", "html_graphic"]] = None
+    visual_payload: Optional[dict] = None
     sort_order: Optional[int] = None
 
 class UpdatePageRequest(BaseModel):
@@ -88,6 +92,8 @@ class SectionResponseSchema(BaseModel):
     body_copy: Optional[str]
     associated_fact_ids: Optional[List[str]]
     image_asset_id: Optional[str]
+    visual_kind: Optional[str] = None
+    visual_payload: Optional[dict] = None
     sort_order: int
     is_visible: bool
     warnings: List[str] = []
@@ -183,6 +189,8 @@ def create_page_snapshot(page: ProductPage, db: Optional[Session] = None) -> Dic
                     if db is None or sec.image_asset_id in eligible_asset_ids
                     else None
                 ),
+                "visual_kind": sec.visual_kind,
+                "visual_payload": sec.visual_payload or {},
                 "sort_order": sec.sort_order,
                 "is_visible": sec.is_visible
             }
@@ -297,6 +305,8 @@ def build_section_response(section: PageSection, db: Session) -> SectionResponse
         body_copy=section.body_copy,
         associated_fact_ids=section.associated_fact_ids,
         image_asset_id=section.image_asset_id,
+        visual_kind=section.visual_kind or ("image" if section.image_asset_id else None),
+        visual_payload=section.visual_payload or {},
         sort_order=section.sort_order,
         is_visible=section.is_visible,
         warnings=unconfirmed_warnings,
@@ -345,6 +355,8 @@ def build_page_response(page: ProductPage, db: Session) -> PageResponseSchema:
             body_copy=section.body_copy,
             associated_fact_ids=section.associated_fact_ids,
             image_asset_id=section.image_asset_id,
+            visual_kind=section.visual_kind or ("image" if section.image_asset_id else None),
+            visual_payload=section.visual_payload or {},
             sort_order=section.sort_order,
             is_visible=section.is_visible,
             warnings=unconfirmed_warnings,
@@ -706,6 +718,8 @@ def save_page_details(
                 detail="Image asset is not eligible for page rendering",
             )
 
+    from src.services.page_visual_contract import normalize_visual, validate_visual
+
     for sec_update in req.sections:
         sec = sections_dict[sec_update.id]
         if sec_update.title is not None:
@@ -714,6 +728,26 @@ def save_page_details(
             sec.body_copy = sec_update.body_copy
         if sec_update.image_asset_id is not None:
             sec.image_asset_id = sec_update.image_asset_id or None
+        if sec_update.visual_kind is not None:
+            sec.visual_kind = sec_update.visual_kind
+        if sec_update.visual_payload is not None:
+            sec.visual_payload = sec_update.visual_payload
+
+        # Validate visual contract if visual fields are provided
+        if sec_update.visual_kind is not None or sec_update.visual_payload is not None:
+            visual = normalize_visual(
+                section_type=sec.section_type,
+                image_asset_id=sec.image_asset_id,
+                visual_kind=sec.visual_kind,
+                visual_payload=sec.visual_payload or {},
+            )
+            issues = validate_visual(visual)
+            if issues:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"section_id": sec.id, "issues": issues},
+                )
+
         sec.sort_order = sec_update.sort_order
         sec.is_visible = sec_update.is_visible
 
@@ -784,6 +818,8 @@ def add_page_section(
         body_copy=req.body_copy,
         associated_fact_ids=req.associated_fact_ids,
         image_asset_id=req.image_asset_id,
+        visual_kind=req.visual_kind,
+        visual_payload=req.visual_payload,
         sort_order=sort_order,
         is_visible=True
     )
