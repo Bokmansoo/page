@@ -10,7 +10,9 @@ from sqlalchemy.orm import Session
 from src.api.auth import get_current_user_and_workspace
 from src.db.database import get_db, SessionLocal
 from src.db.models import ProductProject, ProductPage, ExportJob, Asset, User
+from src.schemas.export_history import ExportHistoryItem, ExportHistoryResponse
 from src.services.compliance_checker import PageComplianceChecker
+from src.services.page_readiness_service import inspect_page_readiness
 from src.services.renderer import PageRendererService
 from src.services.page_finalization_service import (
     FinalPageNotFoundError,
@@ -239,6 +241,17 @@ def request_page_export(
                 detail="The requested version is not the current finalized page.",
             )
 
+    # 0. Readiness check (visual contract, edit markers, etc.)
+    readiness = inspect_page_readiness(page, db)
+    if not readiness.ready:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "message": "Page is not ready for export. Resolve blockers first.",
+                "blockers": [b.model_dump() for b in readiness.blockers],
+            },
+        )
+
     # 1. 검수 룰 재확인 (Blocker 있으면 차단)
     compliance = PageComplianceChecker.inspect_page(db, page)
     if should_block_export(compliance, req.export_target):
@@ -336,7 +349,10 @@ def download_export_file(
     return FileResponse(
         path=asset.file_path,
         filename=asset.filename,
-        media_type=asset.mime_type
+        media_type=asset.mime_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{asset.filename}"',
+        },
     )
 
 
@@ -351,3 +367,40 @@ def get_sales_package(
     
     from src.services.sales_package_service import SalesPackageService
     return SalesPackageService.get_sales_package(project_id, db)
+
+
+def _to_export_history_item(job: ExportJob) -> ExportHistoryItem:
+    download_url = None
+    if job.output_images and len(job.output_images) > 0:
+        download_url = job.output_images[0]
+
+    return ExportHistoryItem(
+        id=job.id,
+        project_id=job.project_id,
+        project_name=job.project.name if job.project else "",
+        format=job.preset_name,
+        status=job.status,
+        filename=f"{job.project.name if job.project else 'export'}.{job.preset_name}" if job.preset_name in ("png", "jpg") else None,
+        content_type=f"image/{job.preset_name}" if job.preset_name in ("png", "jpg") else None,
+        download_url=download_url,
+        error_message=job.error_message,
+        created_at=job.created_at.isoformat() if job.created_at else "",
+        completed_at=job.completed_at.isoformat() if job.completed_at else None,
+    )
+
+
+@router.get("/page/exports", response_model=ExportHistoryResponse)
+def list_export_history(
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    workspace = auth_ctx["workspace"]
+    jobs = (
+        db.query(ExportJob)
+        .join(ProductProject, ExportJob.project_id == ProductProject.id)
+        .filter(ProductProject.workspace_id == workspace.id)
+        .order_by(ExportJob.created_at.desc())
+        .limit(100)
+        .all()
+    )
+    return ExportHistoryResponse(items=[_to_export_history_item(job) for job in jobs])

@@ -172,7 +172,8 @@ class VisualPackagePlanner:
         project: ProductProject,
         page: Any,
         assets: List[Any],
-        sales_strategy: Optional[Any] = None
+        sales_strategy: Optional[Any] = None,
+        scene_plan: Optional[dict[str, Any]] = None,
     ) -> List[ImageGenerationJob]:
         sales_strategy = resolve_sales_strategy(project, sales_strategy)
         plan_signature = build_visual_package_signature(
@@ -228,8 +229,19 @@ class VisualPackagePlanner:
         assignment_map = {a["section_id"]: a["asset_id"] for a in assignments}
         filename_map = {a["id"]: a["filename"] for a in assets_data}
         
+        # Build a set of section IDs that should use html_graphic instead of image generation
+        html_graphic_section_ids: set[str] = set()
+        if scene_plan:
+            for scene in scene_plan.get("sections") or []:
+                if scene.get("visual_strategy") == "html_graphic":
+                    html_graphic_section_ids.add(scene.get("target_slot_id", ""))
+
         jobs = []
         for cut in cuts:
+            # Skip html_graphic sections — they use visual contract, not image generation
+            if cut.section_id in html_graphic_section_ids:
+                continue
+
             # Check if there is an original photo mapped
             # Prefer the one explicitly set on the cut, otherwise check mapper assignment
             assigned_asset_id = cut.image_asset_id or assignment_map.get(cut.section_id)

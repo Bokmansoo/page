@@ -124,6 +124,11 @@ export default function PageEditor() {
   }
 
   const selectedSection = page.sections.find((section) => section.id === selectedSectionId) || null;
+  const isAdvancedMode = mode === "advanced";
+  const modeTitle = isAdvancedMode ? "고급 편집기" : "검수하며 다듬기";
+  const modeDescription = isAdvancedMode
+    ? "섹션 순서와 레이아웃을 더 세밀하게 조정합니다."
+    : "문구와 이미지 후보를 빠르게 확인하고 업로드 전 오류를 줄입니다.";
 
   const patchPage = async (nextPage: PageData) => {
     const res = await fetch(apiUrl(`/api/v1/projects/${projectId}/page`), {
@@ -166,7 +171,9 @@ export default function PageEditor() {
   return (
     <ReviewEditorLayout
       projectId={projectId}
-      projectName={project?.name || (mode === "advanced" ? "고급 편집기" : "상세페이지 검수")}
+      projectName={project?.name || "상세페이지 초안"}
+      modeTitle={modeTitle}
+      modeDescription={modeDescription}
       page={page}
       selectedSectionId={selectedSectionId}
       onSelectSection={setSelectedSectionId}
@@ -180,8 +187,8 @@ export default function PageEditor() {
               {selectedSection?.title || "섹션을 선택해 주세요"}
             </h3>
             <p className="mt-2 text-xs leading-relaxed text-slate-500">
-              {mode === "advanced"
-                ? "고급 편집 모드입니다. 결과 화면의 보조 버튼으로만 진입할 수 있습니다."
+              {isAdvancedMode
+                ? "고급 편집 모드입니다. 섹션 구성과 레이아웃 관점으로 더 세밀하게 다듬어 주세요."
                 : "초안을 검수하고 필요한 섹션만 AI 수정으로 다듬어 주세요."}
             </p>
           </div>
@@ -219,6 +226,19 @@ export default function PageEditor() {
             backendUrl={BACKEND_URL}
             headers={MOCK_HEADERS}
             onUpdateSuccess={loadData}
+            onApplyProposal={async (title, bodyCopy) => {
+              if (!page || !selectedSectionId) return;
+              const nextPage = {
+                ...page,
+                sections: page.sections.map((section) =>
+                  section.id === selectedSectionId
+                    ? { ...section, title, body_copy: bodyCopy }
+                    : section
+                ),
+              };
+              setPage(nextPage);
+              await patchPage(nextPage);
+            }}
           />
         </div>
       }

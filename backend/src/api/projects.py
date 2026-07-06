@@ -5,7 +5,8 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 from src.api.auth import get_current_user_and_workspace
 from src.db.database import get_db
-from src.db.models import ProductProject, AuditLog, JobStatus, Brand, Asset
+from src.db.models import ProductProject, AuditLog, JobStatus, Brand, Asset, ExportJob
+from src.schemas.project_worklist import ProjectWorklistItem, ProjectWorklistResponse
 from src.services.validation import validate_external_url
 from src.services.visual_background_service import VisualBackgroundService
 from src.services.product_intake_service import ProductIntakeInput, normalize_intake_input
@@ -98,6 +99,68 @@ def list_projects(
 ):
     workspace = auth_ctx["workspace"]
     return db.query(ProductProject).filter(ProductProject.workspace_id == workspace.id).all()
+
+
+def _normalize_worklist_status(project: ProductProject) -> str:
+    status = (project.status or "").lower()
+    if status in {"completed", "needs_review", "failed", "generating"}:
+        return status
+    if status in {"draft", "processing", "checking", "running", "pending"}:
+        return "generating"
+    if status in {"ready", "review", "reviewing"}:
+        return "needs_review"
+    if project.pages:
+        return "completed"
+    return "generating"
+
+
+def _thumbnail_url_from_job(job: ExportJob | None) -> str | None:
+    if not job or not job.output_images:
+        return None
+    first_image = job.output_images[0]
+    return first_image if isinstance(first_image, str) else None
+
+
+def _to_worklist_item(project: ProductProject, latest_export_job: ExportJob | None) -> ProjectWorklistItem:
+    project_id = str(project.id)
+    status_value = _normalize_worklist_status(project)
+    return ProjectWorklistItem(
+        project_id=project_id,
+        project_name=project.name,
+        status=status_value,
+        thumbnail_url=_thumbnail_url_from_job(latest_export_job),
+        result_url=f"/workspace/projects/{project_id}/result",
+        review_url=f"/workspace/projects/{project_id}/page-editor?mode=review",
+        export_history_url=f"/workspace/exports?project_id={project_id}",
+        last_export_status=latest_export_job.status if latest_export_job else None,
+        updated_at=project.updated_at.isoformat() if project.updated_at else "",
+    )
+
+
+@router.get("/worklist", response_model=ProjectWorklistResponse)
+def list_project_worklist(
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    workspace = auth_ctx["workspace"]
+    projects = (
+        db.query(ProductProject)
+        .filter(ProductProject.workspace_id == workspace.id)
+        .order_by(ProductProject.updated_at.desc())
+        .limit(100)
+        .all()
+    )
+
+    items = []
+    for project in projects:
+        latest_export_job = (
+            db.query(ExportJob)
+            .filter(ExportJob.project_id == project.id)
+            .order_by(ExportJob.created_at.desc())
+            .first()
+        )
+        items.append(_to_worklist_item(project, latest_export_job))
+    return ProjectWorklistResponse(items=items)
 
 
 @router.post("", response_model=ProjectResponseSchema, status_code=status.HTTP_201_CREATED)

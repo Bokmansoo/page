@@ -1,6 +1,8 @@
 ﻿"use client";
 
 import React, { useState } from "react";
+import CopyRewriteComparison from "./CopyRewriteComparison";
+import { apiUrl } from "@/lib/api";
 
 interface AiEditCommandPanelProps {
   projectId: string;
@@ -9,77 +11,113 @@ interface AiEditCommandPanelProps {
   headers?: Record<string, string>;
   onUpdateSuccess?: () => void;
   onApplyCommand?: (commandType: string, instruction: string, scope: string) => Promise<void>;
+  onApplyProposal?: (
+    title: string,
+    bodyCopy: string
+  ) => Promise<void>;
   isProcessing?: boolean;
 }
 
 const PRESET_COMMANDS = [
-  "제목을 더 강하게 바꿔줘",
-  "문구를 더 짧고 자연스럽게 정리해줘",
-  "과장 표현을 줄여줘",
-  "사용 장면이 떠오르게 설명을 보강해줘",
-  "초보 셀러가 쓰기 좋은 톤으로 다듬어줘",
-  "구매 전 불안을 줄이는 문장을 추가해줘",
-];
+  { label: "제목을 더 강하게 바꿔줘", command: "stronger_headline" },
+  { label: "문구를 더 짧고 자연스럽게 정리해줘", command: "shorter_natural" },
+  { label: "과장 표현을 줄여줘", command: "reduce_exaggeration" },
+  { label: "사용 장면이 떠오르게 설명을 보강해줘", command: "usage_context" },
+  { label: "초보 셀러가 쓰기 좋은 톤으로 다듬어줘", command: "beginner_seller_tone" },
+  { label: "구매 전 불안을 줄이는 문장을 추가해줘", command: "reduce_purchase_anxiety" },
+] as const;
+
+interface PreviewResult {
+  title: string;
+  body_copy: string;
+  change_summary: string;
+  grounding_warnings: string[];
+}
 
 export default function AiEditCommandPanel({
   projectId,
   sectionId,
-  backendUrl,
   headers,
   onUpdateSuccess,
-  onApplyCommand,
+  onApplyProposal,
   isProcessing = false,
 }: AiEditCommandPanelProps) {
   const [inputText, setInputText] = useState("");
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
+  const [preview, setPreview] = useState<{
+    command: string;
+    originalTitle: string;
+    originalBody: string;
+    result: PreviewResult;
+  } | null>(null);
 
-  const handleSendCommand = async (commandText: string) => {
+  const fetchPreview = async (commandValue: string, instruction: string) => {
     if (!sectionId) {
       setMessage({ type: "error", text: "먼저 수정할 섹션을 선택해 주세요." });
       return;
     }
-    if (!commandText.trim()) return;
 
-    if (onApplyCommand) {
-      try {
-        setLoading(true);
-        setMessage(null);
-        await onApplyCommand("custom", commandText, "section");
-        setMessage({ type: "success", text: "수정 요청이 반영되었습니다." });
-        setInputText("");
-      } catch {
-        setMessage({ type: "error", text: "수정 요청에 실패했습니다." });
-      } finally {
-        setLoading(false);
-      }
-      return;
-    }
-
+    setLoading(true);
+    setMessage(null);
     try {
-      setLoading(true);
-      setMessage(null);
-      const res = await fetch(`${backendUrl}/projects/${projectId}/pages/ai-edit`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...headers,
-        },
-        body: JSON.stringify({
-          section_id: sectionId,
-          command: commandText,
-        }),
-      });
+      const res = await fetch(
+        apiUrl(`/api/v1/projects/${projectId}/page/sections/${sectionId}/copy-rewrite/preview`),
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...headers,
+          },
+          body: JSON.stringify({
+            command: commandValue,
+            instruction,
+            scope: "section",
+          }),
+        }
+      );
 
-      if (!res.ok) throw new Error("AI 편집 요청에 실패했습니다.");
-      setMessage({ type: "success", text: "수정 요청이 반영되었습니다." });
-      setInputText("");
-      onUpdateSuccess?.();
+      if (!res.ok) {
+        const detail = await res.json().catch(() => null);
+        throw new Error(detail?.detail || "AI 수정 미리보기를 불러오지 못했습니다.");
+      }
+
+      const result = (await res.json()) as PreviewResult;
+      setPreview({
+        command: commandValue,
+        originalTitle: document.querySelector<HTMLInputElement>("#section-title-edit")?.value || "",
+        originalBody: document.querySelector<HTMLTextAreaElement>("#section-body-edit")?.value || "",
+        result,
+      });
     } catch (err) {
       console.error(err);
-      setMessage({ type: "error", text: "수정 처리 중 오류가 발생했습니다." });
+      setMessage({ type: "error", text: err instanceof Error ? err.message : "AI 수정 요청 중 오류가 발생했습니다." });
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handlePresetCommand = (commandValue: string) => {
+    fetchPreview(commandValue, "");
+  };
+
+  const handleCustomCommand = () => {
+    if (!inputText.trim()) return;
+    fetchPreview("custom_edit", inputText);
+    setInputText("");
+  };
+
+  const handleApplyProposal = async () => {
+    if (!preview) return;
+    if (onApplyProposal) {
+      try {
+        await onApplyProposal(preview.result.title, preview.result.body_copy);
+        setPreview(null);
+        setMessage({ type: "success", text: "수정안이 적용되었습니다." });
+        onUpdateSuccess?.();
+      } catch {
+        setMessage({ type: "error", text: "수정안 적용에 실패했습니다." });
+      }
     }
   };
 
@@ -99,15 +137,15 @@ export default function AiEditCommandPanel({
       </div>
 
       <div className="grid grid-cols-1 gap-2">
-        {PRESET_COMMANDS.map((command) => (
+        {PRESET_COMMANDS.map((preset) => (
           <button
-            key={command}
+            key={preset.command}
             type="button"
             disabled={loading || isProcessing || !sectionId}
-            onClick={() => handleSendCommand(command)}
+            onClick={() => handlePresetCommand(preset.command)}
             className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-left text-xs font-bold text-slate-700 transition-all hover:border-emerald-200 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            {command}
+            {preset.label}
           </button>
         ))}
       </div>
@@ -127,10 +165,10 @@ export default function AiEditCommandPanel({
         <button
           type="button"
           disabled={loading || isProcessing || !sectionId || !inputText.trim()}
-          onClick={() => handleSendCommand(inputText)}
+          onClick={handleCustomCommand}
           className="w-full rounded-2xl bg-emerald-600 px-4 py-3 text-sm font-extrabold text-white shadow-lg shadow-emerald-600/15 transition-all hover:bg-emerald-700 disabled:bg-slate-200 disabled:text-slate-400 disabled:shadow-none"
         >
-          {loading ? "수정 중..." : "AI 수정 반영"}
+          {loading ? "미리보기 생성 중..." : "AI 수정 미리보기"}
         </button>
       </div>
 
@@ -144,6 +182,19 @@ export default function AiEditCommandPanel({
         >
           {message.text}
         </div>
+      ) : null}
+
+      {preview ? (
+        <CopyRewriteComparison
+          originalTitle={preview.originalTitle}
+          originalBody={preview.originalBody}
+          proposedTitle={preview.result.title}
+          proposedBody={preview.result.body_copy}
+          changeSummary={preview.result.change_summary}
+          groundingWarnings={preview.result.grounding_warnings}
+          onApply={handleApplyProposal}
+          onCancel={() => setPreview(null)}
+        />
       ) : null}
     </div>
   );

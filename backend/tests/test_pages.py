@@ -1,9 +1,9 @@
 from types import SimpleNamespace
 
 import pytest
-from src.api.auth import DEFAULT_BRAND_ID
+from src.api.auth import DEFAULT_BRAND_ID, DEFAULT_USER_ID, DEFAULT_WORKSPACE_ID
 from src.api.pages import create_page_snapshot
-from src.db.models import Asset, DetailPageVersion, ProductProject, ProductFact, ProductPage, PageSection, PageVersion
+from src.db.models import Asset, Brand, DetailPageVersion, ProductProject, ProductFact, ProductPage, PageSection, PageVersion, User, Workspace
 from src.services.page_generator import PageGenerationService
 
 
@@ -36,6 +36,73 @@ def _create_project_with_page(client, db_session, headers=None):
     )
     assert page_res.status_code == 201
     return project_id, page_res.json()
+
+
+def test_get_page_backfills_incomplete_html_visual_payloads(client, db_session):
+    headers = {
+        "X-Mock-User-Id": DEFAULT_USER_ID,
+        "X-Mock-Workspace-Id": DEFAULT_WORKSPACE_ID,
+    }
+    user = User(id=DEFAULT_USER_ID, email="default@sellform.local", name="Default Seller")
+    workspace = Workspace(id=DEFAULT_WORKSPACE_ID, name="Default Workspace", owner_id=user.id)
+    brand = Brand(id=DEFAULT_BRAND_ID, workspace_id=workspace.id, name="Default Brand")
+    project = ProductProject(
+        id="visual-backfill-page-project",
+        workspace_id=workspace.id,
+        brand_id=brand.id,
+        name="루메나 휴대용 무선 냉각선풍기",
+        status="completed",
+    )
+    page = ProductPage(id="visual-backfill-page", project_id=project.id)
+    sections = [
+        PageSection(
+            id="comparison-incomplete",
+            page_id=page.id,
+            section_type="comparison",
+            title="더운데 선풍기만으로 부족할 때",
+            body_copy="콘센트 위치가 애매한 공간에서 사용하세요.",
+            image_asset_id=None,
+            visual_kind="html_graphic",
+            visual_payload={"layout_variant": "comparison_cards"},
+            sort_order=0,
+            is_visible=True,
+        ),
+        PageSection(
+            id="detail-incomplete",
+            page_id=page.id,
+            section_type="detail_1",
+            title="무선이라 꺼내 쓰기 편해요",
+            body_copy="필요한 순간에 바로 꺼내 사용하세요.",
+            image_asset_id=None,
+            visual_kind="html_graphic",
+            visual_payload={"layout_variant": "benefit_cards"},
+            sort_order=1,
+            is_visible=True,
+        ),
+        PageSection(
+            id="guarantee-incomplete",
+            page_id=page.id,
+            section_type="guarantee",
+            title="구매 전 꼭 확인하세요",
+            body_copy="충전 방식과 구성품을 확인하세요.",
+            image_asset_id=None,
+            visual_kind="html_graphic",
+            visual_payload={"layout_variant": "spec_table"},
+            sort_order=2,
+            is_visible=True,
+        ),
+    ]
+    db_session.add_all([user, workspace, brand, project, page, *sections])
+    db_session.commit()
+
+    response = client.get(f"/api/v1/projects/{project.id}/page", headers=headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    by_id = {section["id"]: section for section in payload["sections"]}
+    assert by_id["comparison-incomplete"]["visual_payload"]["cards"]
+    assert by_id["detail-incomplete"]["visual_payload"]["cards"]
+    assert by_id["guarantee-incomplete"]["visual_payload"]["table_rows"]
 
 # 기본적으로 conftest에서 제공하는 클라이언트 및 db_session fixture 활용
 

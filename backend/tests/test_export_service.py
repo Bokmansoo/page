@@ -1,7 +1,7 @@
 try:
-    from src.services.export_service import build_export_manifest, normalize_sections_snapshot, run_export, load_export_font
+    from src.services.export_service import build_export_manifest, build_export_render_path, normalize_sections_snapshot, run_export, load_export_font
 except ImportError:
-    from backend.src.services.export_service import build_export_manifest, normalize_sections_snapshot, run_export, load_export_font
+    from backend.src.services.export_service import build_export_manifest, build_export_render_path, normalize_sections_snapshot, run_export, load_export_font
 
 from src.db.models import Brand, ProductProject, User, Workspace
 
@@ -170,3 +170,12 @@ def test_run_export_supports_jpg_output():
 
     with zipfile.ZipFile(result["section_images_zip"]) as archive:
         assert archive.namelist() == ["01-hero.jpg"]
+
+
+def test_default_export_render_path_is_outside_workspace(monkeypatch):
+    monkeypatch.delenv("SELLFORM_EXPORT_RENDER_PATH", raising=False)
+
+    path = build_export_render_path(project_id="project-1")
+
+    assert path.startswith("/export-render/projects/project-1")
+    assert "/workspace/" not in path

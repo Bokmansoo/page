@@ -31,6 +31,8 @@ interface ReviewEditorLayoutProps {
   rightPanel: React.ReactNode;
   onBack: () => void;
   isFinalVersion?: boolean;
+  modeTitle?: string;
+  modeDescription?: string;
 }
 
 function sourceLabel(sourceType: string): string {
@@ -77,6 +79,8 @@ export default function ReviewEditorLayout({
   rightPanel,
   onBack,
   isFinalVersion = false,
+  modeTitle = "검수하며 다듬기",
+  modeDescription = "문구와 이미지 후보를 빠르게 확인하고 업로드 전 오류를 줄입니다.",
 }: ReviewEditorLayoutProps) {
   const visibleSections = page.sections.filter((section) => section.is_visible);
   
@@ -115,8 +119,12 @@ export default function ReviewEditorLayout({
               결과 화면으로
             </button>
             <div>
-              <p className="text-xs font-bold text-emerald-700">검수하며 다듬기</p>
-              <h1 className="text-xl font-extrabold text-slate-950">{projectName || "상세페이지 초안"}</h1>
+              <p className="text-xs font-bold text-emerald-700">{modeTitle}</p>
+              <h1 className="text-xl font-extrabold text-slate-950">{modeTitle}</h1>
+              <p className="mt-1 text-xs font-medium text-slate-500">{modeDescription}</p>
+              {projectName ? (
+                <p className="mt-1 text-xs font-semibold text-slate-400">{projectName}</p>
+              ) : null}
             </div>
           </div>
           

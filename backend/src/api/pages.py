@@ -16,7 +16,9 @@ from src.db.models import ProductProject, ProductPage, PageSection, PageVersion,
 from src.services.page_generator import PageGenerationService
 from src.services.style_strategy_service import generate_style_candidates, get_category_frame, is_valid_style_candidate_key
 from src.services.grounding_validator import detect_claim_risks, map_section_to_facts
+from src.services.copy_rewrite_service import CopyRewriteCommand, CopyRewriteService, CopyRewriteResult
 from src.services.detail_page_package_service import DetailPagePackageService, DetailPagePackage, AiEditCommandPayload
+from src.services.page_readiness_service import PageReadiness, inspect_page_readiness
 from src.services.page_finalization_service import (
     FinalPageNotFoundError,
     PageDraftNotFoundError,
@@ -28,6 +30,7 @@ from src.services.page_asset_policy import (
     get_page_eligible_asset,
     get_page_eligible_assets,
 )
+from src.services.visual_contract_backfill import backfill_page_visuals
 
 
 router = APIRouter(tags=["Page Editor"])
@@ -241,6 +244,15 @@ def get_page_or_404(db: Session, project_id: str, workspace_id: str) -> ProductP
     page = db.query(ProductPage).filter(ProductPage.project_id == project_id).first()
     if not page:
         raise HTTPException(status_code=404, detail="Page draft not found for this project")
+    return page
+
+
+def get_visual_ready_page_or_404(db: Session, project_id: str, workspace_id: str) -> ProductPage:
+    """Load page after idempotently repairing legacy/incomplete visual contracts."""
+    page = get_page_or_404(db, project_id, workspace_id)
+    report = backfill_page_visuals(db, project_id)
+    if report.updated:
+        page = get_page_or_404(db, project_id, workspace_id)
     return page
 
 
@@ -623,6 +635,9 @@ def create_page_draft(
     except Exception as e:
         logger.warning(f"상세페이지 초안 생성 후 이미지 자산 자동 매핑 실패: {e}", exc_info=True)
 
+    backfill_page_visuals(db, project_id)
+    db.refresh(new_page)
+
     from src.services.page_version_service import create_page_version
     create_page_version(
         project_id=project_id,
@@ -642,11 +657,22 @@ def get_page_details(
     auth_ctx: dict = Depends(get_current_user_and_workspace)
 ):
     workspace = auth_ctx["workspace"]
-    page = get_page_or_404(db, project_id, workspace.id)
+    page = get_visual_ready_page_or_404(db, project_id, workspace.id)
     if not page:
         raise HTTPException(status_code=404, detail="Page draft not found for this project")
 
     return build_page_response(page, db)
+
+
+@router.get("/projects/{project_id}/page/readiness", response_model=PageReadiness)
+def get_page_readiness(
+    project_id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace)
+):
+    workspace = auth_ctx["workspace"]
+    page = get_visual_ready_page_or_404(db, project_id, workspace.id)
+    return inspect_page_readiness(page, db)
 
 
 @router.post("/projects/{project_id}/page/finalize", response_model=FinalPageVersionResponseSchema)
@@ -657,6 +683,7 @@ def finalize_page_endpoint(
 ):
     workspace = auth_ctx["workspace"]
     get_project_or_404(db, project_id, workspace.id)
+    get_visual_ready_page_or_404(db, project_id, workspace.id)
 
     try:
         return finalize_page(db, project_id)
@@ -753,6 +780,8 @@ def save_page_details(
 
     db.commit()
     db.refresh(page)
+    backfill_page_visuals(db, project_id)
+    page = get_page_or_404(db, project_id, workspace.id)
 
     # 4. 수정 완료 후 새 버전 스냅샷 저장
     from src.services.page_version_service import create_page_version
@@ -827,6 +856,9 @@ def add_page_section(
     db.commit()
     db.refresh(section)
     db.refresh(page)
+    backfill_page_visuals(db, project_id)
+    section = db.query(PageSection).filter(PageSection.id == section.id).first()
+    page = get_page_or_404(db, project_id, workspace.id)
 
     from src.services.page_version_service import create_page_version
     create_page_version(
@@ -1704,14 +1736,66 @@ def process_ai_edit(
     db: Session = Depends(get_db),
     auth_ctx: dict = Depends(get_current_user_and_workspace)
 ):
-    workspace = auth_ctx["workspace"]
-    get_project_or_404(db, project_id, workspace.id)
-    return DetailPagePackageService.process_ai_edit(project_id, section_id, payload, db)
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail={
+            "message": "This endpoint is deprecated. Use copy-rewrite preview and apply through page PATCH instead.",
+            "new_endpoint": f"/api/v1/projects/{project_id}/page/sections/{section_id}/copy-rewrite/preview",
+        },
+    )
+
+
+class CopyRewritePreviewRequest(BaseModel):
+    command: CopyRewriteCommand
+    instruction: str = ""
+    scope: Literal["section"] = "section"
 
 
 class AiEditCommandRequest(BaseModel):
     section_id: str
     command: str
+
+
+@router.post(
+    "/projects/{project_id}/page/sections/{section_id}/copy-rewrite/preview",
+    response_model=CopyRewriteResult,
+)
+def preview_copy_rewrite(
+    project_id: str,
+    section_id: str,
+    req: CopyRewritePreviewRequest,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    workspace = auth_ctx["workspace"]
+    page = get_page_or_404(db, project_id, workspace.id)
+
+    section = db.query(PageSection).filter(
+        PageSection.id == section_id,
+        PageSection.page_id == page.id,
+    ).first()
+    if not section:
+        raise HTTPException(status_code=404, detail="Section not found")
+
+    confirmed_facts = [
+        f.fact_text
+        for f in db.query(ProductFact).filter(
+            ProductFact.project_id == project_id,
+            ProductFact.verification_status == "confirmed",
+        ).all()
+    ]
+
+    service = CopyRewriteService(mode="mock")
+    result = service.preview(
+        command=req.command,
+        title=section.title or "",
+        body_copy=section.body_copy or "",
+        instruction=req.instruction,
+        confirmed_facts=confirmed_facts,
+        forbidden_claims=[],
+        section_type=section.section_type,
+    )
+    return result
 
 
 @router.post("/projects/{project_id}/pages/ai-edit")
@@ -1721,39 +1805,11 @@ def process_ai_edit_command(
     db: Session = Depends(get_db),
     auth_ctx: dict = Depends(get_current_user_and_workspace)
 ):
-    workspace = auth_ctx["workspace"]
-    get_project_or_404(db, project_id, workspace.id)
-
-    page = db.query(ProductPage).filter(ProductPage.project_id == project_id).first()
-    if not page:
-        raise HTTPException(status_code=404, detail="Page not found")
-
-    edited = False
-    for sec in page.sections:
-        if sec.id == payload.section_id or sec.section_type == payload.section_id:
-            sec.body_copy = f"[AI 수정됨] {payload.command} : {sec.body_copy}"
-            db.commit()
-            db.refresh(sec)
-            edited = True
-
-    # If no section matched, update the first section as fallback
-    if not edited and page.sections:
-        sec = page.sections[0]
-        sec.body_copy = f"[AI 수정됨] {payload.command} : {sec.body_copy}"
-        db.commit()
-        db.refresh(sec)
-
-    # Create a new version snapshot
-    from src.services.page_version_service import create_page_version
-    version = create_page_version(
-        project_id=project_id,
-        name=f"AI 수정: {payload.command}",
-        sections=create_page_snapshot(page, db),
-        style_key=page.project.selected_style or "problem_solution",
-        db=db
+    # Deprecated: use /page/sections/{section_id}/copy-rewrite/preview instead
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail={
+            "message": "This endpoint is deprecated. Use POST /projects/{project_id}/page/sections/{section_id}/copy-rewrite/preview instead.",
+            "new_endpoint": f"/api/v1/projects/{project_id}/page/sections/{payload.section_id}/copy-rewrite/preview",
+        },
     )
-
-    return {
-        "version_id": version.id,
-        "status": "mock_applied"
-    }

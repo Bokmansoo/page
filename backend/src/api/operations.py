@@ -11,6 +11,7 @@ from src.db.models import (
     ProductPage, PageSection, ExportJob, PublishedPage, Brand, User, AuditLog
 )
 from src.services.compliance_checker import PageComplianceChecker
+from src.services.generation_status_service import GenerationStatusService
 
 router = APIRouter(prefix="/operations", tags=["Operations"])
 logger = logging.getLogger(__name__)
@@ -668,3 +669,25 @@ def seed_operations_data(
         "status": "seeded",
         "message": "Successfully seeded 12 realistic projects with job logs, compliance states, page drafts, and exports."
     }
+
+
+@router.get("/generation-status")
+def get_generation_status_dashboard(
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    workspace = auth_ctx["workspace"]
+    return GenerationStatusService(db).get_workspace_status(workspace.id)
+
+
+@router.get("/projects/{project_id}/generation-status")
+def get_project_generation_status(
+    project_id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    workspace = auth_ctx["workspace"]
+    try:
+        return GenerationStatusService(db).get_project_status(project_id, workspace.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))

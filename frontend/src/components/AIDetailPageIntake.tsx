@@ -3,6 +3,7 @@
 import React, { useEffect, useState } from "react";
 import GenerationProgressShell from "./GenerationProgressShell";
 import StructuredIntakeReview from "./StructuredIntakeReview";
+import GenerationDuplicateRunDialog, { DuplicateRunDetail } from "./GenerationDuplicateRunDialog";
 import { apiUrl, structureIntake, StructuredIntakeDraft } from "@/lib/api";
 import { useRouter, useSearchParams } from "next/navigation";
 
@@ -22,9 +23,17 @@ export default function AIDetailPageIntake() {
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [duplicateRunDetail, setDuplicateRunDetail] = useState<DuplicateRunDetail | null>(null);
   const runId = searchParams.get("runId");
 
   const presets = ["깔끔한", "감성적인", "프리미엄", "실용 강조", "선물용"];
+
+  const duplicateRunDialog = duplicateRunDetail ? (
+    <GenerationDuplicateRunDialog
+      detail={duplicateRunDetail}
+      onClose={() => setDuplicateRunDetail(null)}
+    />
+  ) : null;
 
   useEffect(() => {
     return () => {
@@ -130,6 +139,11 @@ export default function AIDetailPageIntake() {
       });
 
       if (!res.ok) {
+        const detail = await res.json().catch(() => null);
+        if (res.status === 409 && detail?.detail?.code === "generation_already_running") {
+          setDuplicateRunDetail(detail.detail);
+          return;
+        }
         throw new Error("상세페이지 생성 요청에 실패했습니다.");
       }
 
@@ -165,28 +179,38 @@ export default function AIDetailPageIntake() {
   };
 
   if (runId) {
-    return <GenerationProgressShell runId={runId} />;
+    return (
+      <>
+        {duplicateRunDialog}
+        <GenerationProgressShell runId={runId} />
+      </>
+    );
   }
 
   if (structuredDraft) {
     return (
-      <div className="flex min-h-screen w-full flex-col items-center justify-center bg-slate-50 p-6 text-slate-800">
-        {error && (
-          <div className="mb-4 w-full max-w-3xl rounded-lg border border-rose-100 bg-rose-50 px-4 py-3 text-sm text-rose-700">
-            {error}
-          </div>
-        )}
-        <StructuredIntakeReview
-          draft={structuredDraft}
-          onBack={() => setStructuredDraft(null)}
-          onConfirm={handleSubmitConfirmedDraft}
-        />
-      </div>
+      <>
+        {duplicateRunDialog}
+        <div className="flex min-h-screen w-full flex-col items-center justify-center bg-slate-50 p-6 text-slate-800">
+          {error && (
+            <div className="mb-4 w-full max-w-3xl rounded-lg border border-rose-100 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+              {error}
+            </div>
+          )}
+          <StructuredIntakeReview
+            draft={structuredDraft}
+            onBack={() => setStructuredDraft(null)}
+            onConfirm={handleSubmitConfirmedDraft}
+          />
+        </div>
+      </>
     );
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col items-center justify-center p-6 w-full">
+    <>
+      {duplicateRunDialog}
+      <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col items-center justify-center p-6 w-full">
       {/* Brand Context */}
       <div className="mb-6 flex items-center space-x-2">
         <span className="text-xl font-bold tracking-tight text-emerald-600">Sellform</span>
@@ -400,6 +424,7 @@ export default function AIDetailPageIntake() {
           ))}
         </div>
       </div>
-    </div>
+      </div>
+    </>
   );
 }

@@ -138,3 +138,51 @@ def test_visual_package_planning_flow():
     assert "출퇴근 길" in job2.prompt
     assert "Strictly do NOT include any text" in job2.prompt
     assert "text" in job2.negative_prompt
+
+
+def test_visual_package_reuses_scene_plan_strategy():
+    project = MockProject(id="project-1", name="무선 선풍기", selected_background="cooling-blue")
+    sections = [
+        MockSection(
+            id="comparison",
+            section_type="comparison",
+            title="전원 제약 없이",
+            body_copy="필요한 곳에서 사용",
+            image_asset_id=None,
+        ),
+        MockSection(
+            id="hero",
+            section_type="hero",
+            title="Hero",
+            body_copy="Test",
+            image_asset_id="asset-hero",
+        ),
+    ]
+    page = MockPage(sections=sections)
+    assets = [
+        MockAsset(id="asset-hero", filename="hero.png", mime_type="image/png"),
+    ]
+    scene_plan = {
+        "sections": [
+            {
+                "section_id": "pain_points",
+                "target_slot_id": "comparison",
+                "visual_strategy": "html_graphic",
+                "visual_payload": {
+                    "layout_variant": "comparison_cards",
+                    "cards": [{"title": "무선", "body": "간편한 이동"}],
+                },
+            }
+        ]
+    }
+    planner = VisualPackagePlanner()
+    jobs = planner.plan_visual_package(
+        project=project,
+        page=page,
+        assets=assets,
+        scene_plan=scene_plan,
+    )
+    # Only hero section should have a job (comparison is html_graphic)
+    assert all(job.section_id != "comparison" for job in jobs)
+    assert len(jobs) == 1
+    assert jobs[0].section_id == "hero"

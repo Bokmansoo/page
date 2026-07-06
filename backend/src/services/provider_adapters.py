@@ -23,6 +23,7 @@ from src.agents.mock_outputs import (
     build_mock_visual_plan,
     build_mock_qa_report,
 )
+from src.services.copy_rewrite_service import CopyRewriteResult
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ SCHEMA_MAP = {
     "copy_set": CopySetOutput,
     "visual_plan": VisualPlanOutput,
     "qa_report": QAReportOutput,
+    "copy_rewrite": CopyRewriteResult,
 }
 
 

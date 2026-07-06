@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
@@ -178,3 +179,23 @@ def get_text_provider_by_settings() -> Any:
 
     return FallbackTextProvider(chain)
 
+
+class CopyRewriteTextRouter:
+    """Expose the configured structured text provider through CopyRewriteService's interface."""
+
+    def __init__(self, provider: Any | None = None):
+        self.provider = provider or get_text_provider_by_settings()
+
+    def generate_text(self, system_prompt: str, user_prompt: str) -> str:
+        from src.services.provider_adapters import ProviderRequest
+
+        result = self.provider.generate_json(
+            ProviderRequest(
+                provider=settings.SELLFORM_TEXT_LLM_PRIMARY_PROVIDER,
+                model=settings.SELLFORM_TEXT_LLM_PRIMARY_MODEL,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                schema_name="copy_rewrite",
+            )
+        )
+        return json.dumps(result["content"], ensure_ascii=False)

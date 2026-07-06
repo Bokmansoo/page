@@ -215,7 +215,7 @@ def test_next_render_export_captures_exact_final_version(tmp_path):
     )
 
     goto_event = next(event for event in events if event[0] == "goto")
-    assert "/workspace/projects/project-1/render?" in goto_event[1]
+    assert "/workspace/projects/project-1/export-render?" in goto_event[1]
     assert "version_id=final-123" in goto_event[1]
     assert "user_id=user-1" in goto_event[1]
     assert "workspace_id=ws-1" in goto_event[1]

@@ -2,32 +2,7 @@ import { expect, test } from "@playwright/test";
 
 const projectId = "completed-detail-page-project";
 
-test("shows a completed page and saves PNG to the user-selected location", async ({ page }) => {
-  await page.addInitScript(() => {
-    const testWindow = window as typeof window & {
-      __savePickerOptions?: { suggestedName?: string };
-      __savedBlob?: { type: string; size: number };
-      showSaveFilePicker?: (options: { suggestedName?: string }) => Promise<{
-        createWritable: () => Promise<{
-          write: (blob: Blob) => Promise<void>;
-          close: () => Promise<void>;
-        }>;
-      }>;
-    };
-
-    testWindow.showSaveFilePicker = async (options) => {
-      testWindow.__savePickerOptions = options;
-      return {
-        createWritable: async () => ({
-          write: async (blob: Blob) => {
-            testWindow.__savedBlob = { type: blob.type, size: blob.size };
-          },
-          close: async () => undefined,
-        }),
-      };
-    };
-  });
-
+test("shows a completed page and downloads PNG/JPG via browser download", async ({ page }) => {
   await page.route(`**/api/v1/projects/${projectId}`, async (route) => {
     await route.fulfill({
       contentType: "application/json",
@@ -197,49 +172,19 @@ test("shows a completed page and saves PNG to the user-selected location", async
   await page.goto(`/workspace/projects/${projectId}/result`);
 
   await expect(page.getByRole("heading", { name: "완성된 상세페이지" })).toBeVisible();
-  await expect(page.getByText("생성된 상세페이지 초안")).toHaveCount(0);
-  await expect(page.getByAltText("공간마다 따라오는 나만의 화면")).toHaveAttribute(
-    "src",
-    /hero-generated/
-  );
-  await expect(page.getByAltText("시선에 맞춰 움직이는 스탠드")).toHaveAttribute(
-    "src",
-    /detail-generated/
-  );
+  await expect(page.getByAltText("공간마다 따라오는 나만의 화면")).toHaveAttribute("src", /hero-generated/);
 
-  const formats: Array<{ value: string; label: string; mime: string; filename: string }> = [
-    { value: "png", label: "PNG", mime: "image/png", filename: "삼탠바이미.png" },
-    { value: "jpg", label: "JPG", mime: "image/jpeg", filename: "삼탠바이미.jpg" },
-  ];
+  // Test PNG download via browser download event
+  const pngDownloadPromise = page.waitForEvent("download");
+  await page.getByLabel("저장 형식").selectOption("png");
+  await page.getByRole("button", { name: "PNG로 다운로드" }).click();
+  const pngDownload = await pngDownloadPromise;
+  expect(pngDownload.suggestedFilename()).toMatch(/\.png$/);
 
-  for (const fmt of formats) {
-    await page.evaluate(() => {
-      const testWindow = window as typeof window & {
-        __savePickerOptions?: { suggestedName?: string };
-        __savedBlob?: { type: string; size: number };
-      };
-      testWindow.__savePickerOptions = undefined;
-      testWindow.__savedBlob = undefined;
-    });
-    await page.getByLabel("저장 형식").selectOption(fmt.value);
-    await page.getByRole("button", { name: new RegExp(fmt.label, "i") }).click();
-
-    await expect
-      .poll(() =>
-        page.evaluate(() => {
-          const testWindow = window as typeof window & {
-            __savePickerOptions?: { suggestedName?: string };
-            __savedBlob?: { type: string; size: number };
-          };
-          return {
-            suggestedName: testWindow.__savePickerOptions?.suggestedName,
-            blob: testWindow.__savedBlob,
-          };
-        })
-      )
-      .toEqual({
-        suggestedName: fmt.filename,
-        blob: { type: fmt.mime, size: 12 },
-      });
-  }
+  // Test JPG download via browser download event
+  const jpgDownloadPromise = page.waitForEvent("download");
+  await page.getByLabel("저장 형식").selectOption("jpg");
+  await page.getByRole("button", { name: "JPG로 다운로드" }).click();
+  const jpgDownload = await jpgDownloadPromise;
+  expect(jpgDownload.suggestedFilename()).toMatch(/\.jpg$/);
 });

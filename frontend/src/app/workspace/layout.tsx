@@ -130,13 +130,18 @@ export default function WorkspaceLayout({
             <Link href="/workspace" className="text-emerald-700 font-semibold hover:text-emerald-800">
               AI 상세페이지 생성
             </Link>
-            <button
-              type="button"
-              onClick={() => alert("출력 이력 관리는 다음 단계에서 연결됩니다.")}
-              className="hover:text-slate-800 transition-colors cursor-pointer"
+            <Link
+              href="/workspace/projects"
+              className="hover:text-slate-800 transition-colors"
+            >
+              작업 목록
+            </Link>
+            <Link
+              href="/workspace/exports"
+              className="hover:text-slate-800 transition-colors"
             >
               출력 이력
-            </button>
+            </Link>
           </nav>
         </div>
 
@@ -183,12 +188,18 @@ export default function WorkspaceLayout({
             {/* Low-emphasis nav links */}
             <nav className="flex items-center space-x-6 text-sm font-medium text-slate-500">
               <span className="text-emerald-600 font-semibold">AI 상세페이지 생성</span>
-              <button 
-                onClick={() => alert("출력 이력 및 관리 기능은 후속 스프린트에서 구현됩니다.")}
-                className="hover:text-slate-800 transition-colors cursor-pointer"
+              <Link
+                href="/workspace/projects"
+                className="hover:text-slate-800 transition-colors"
+              >
+                작업 목록
+              </Link>
+              <Link
+                href="/workspace/exports"
+                className="hover:text-slate-800 transition-colors"
               >
                 출력 이력
-              </button>
+              </Link>
             </nav>
           </div>
 
@@ -306,15 +317,29 @@ export default function WorkspaceLayout({
               <span>워크스페이스 설정</span>
             </Link>
             
-            <button
-              onClick={() => alert("출력 이력 및 관리 기능은 후속 스프린트에서 구현됩니다.")}
-              className="w-full flex items-center space-x-3 px-4 py-3 rounded-xl text-slate-400 hover:text-white hover:bg-slate-900/40 border border-transparent transition-all duration-200 text-sm text-left cursor-pointer"
+            <Link
+              href="/workspace/exports"
+              className="w-full flex items-center space-x-3 px-4 py-3 rounded-xl text-slate-400 hover:text-white hover:bg-slate-900/40 border border-transparent transition-all duration-200 text-sm text-left"
             >
               <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 4H6a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2V6a2 2 0 00-2-2h-2m-4-1v8m0 0l3-3m-3 3L9 8m-5 5h2.586a1 1 0 01.707.293l2.414 2.414a1 1 0 00.707.293h3.172a1 1 0 00.707-.293l2.414-2.414a1 1 0 01.707-.293H20" />
               </svg>
               <span>출력 이력</span>
-            </button>
+            </Link>
+            
+            <Link
+              href="/workspace/projects"
+              className={`flex items-center space-x-3 px-4 py-3 rounded-xl transition-all duration-200 text-sm font-medium ${
+                pathname === "/workspace/projects"
+                  ? "bg-indigo-500/10 border border-indigo-500/20 text-indigo-400"
+                  : "text-slate-400 hover:text-white hover:bg-slate-900/40 border border-transparent"
+              }`}
+            >
+              <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7a2 2 0 012-2h12a2 2 0 012 2v2H4V7zm0 4h16v6a2 2 0 01-2 2H6a2 2 0 01-2-2v-6zm4 3h4" />
+              </svg>
+              <span>작업 목록</span>
+            </Link>
           </nav>
         </div>
 

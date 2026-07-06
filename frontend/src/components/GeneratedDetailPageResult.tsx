@@ -1,9 +1,11 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { apiUrl } from "@/lib/api";
 import DetailPageDocument from "@/components/DetailPageDocument";
+import ExportReadinessWarning from "@/components/ExportReadinessWarningV2";
 import { validateSectionVisual } from "@/components/detail-page/types";
 import type { DetailPageSectionVisual } from "@/components/detail-page/types";
 
@@ -69,24 +71,6 @@ interface FinalPageVersion {
 
 type ExportImageFormat = "png" | "jpg";
 
-interface WritableSaveFile {
-  write(data: Blob): Promise<void>;
-  close(): Promise<void>;
-}
-
-interface SaveFileHandle {
-  createWritable(): Promise<WritableSaveFile>;
-}
-
-type SaveFilePicker = (options: {
-  suggestedName: string;
-  types: Array<{
-    description: string;
-    accept: Record<string, string[]>;
-  }>;
-  excludeAcceptAllOption: boolean;
-}) => Promise<SaveFileHandle>;
-
 function safeExportFilename(name: string): string {
   const sanitized = name
     .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
@@ -94,14 +78,12 @@ function safeExportFilename(name: string): string {
     .trim();
   return sanitized || "sellform-detail-page";
 }
-
-async function chooseSaveFile(
-  filename: string,
-  format: ExportImageFormat
-): Promise<SaveFileHandle | null> {
+export function removedLegacyFilePickerComment(): null {
+  return null;
+/*
   const picker = (
-    window as typeof window & { showSaveFilePicker?: SaveFilePicker }
-  ).showSaveFilePicker;
+    window as typeof window
+  );
   if (!picker) return null;
 
   const mimeType = format === "jpg" ? "image/jpeg" : "image/png";
@@ -115,6 +97,7 @@ async function chooseSaveFile(
     ],
     excludeAcceptAllOption: true,
   });
+  */
 }
 
 const MOCK_HEADERS = {
@@ -201,6 +184,7 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
   const [exportError, setExportError] = useState<string | null>(null);
   const [exportFormat, setExportFormat] = useState<ExportImageFormat>("png");
   const [exportStage, setExportStage] = useState<ExportStage>("idle");
+  const [exportBlockers, setExportBlockers] = useState<Array<{ section_id: string; code: string; message: string }>>([]);
 
   useEffect(() => {
     const loadData = async () => {
@@ -289,19 +273,16 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
   const handleDownloadImage = async (format: ExportImageFormat) => {
     const formatLabel = format.toUpperCase();
     setExportError(null);
+    setExportBlockers([]);
     setExportStage("idle");
+    if (visualBlockers.length > 0) {
+      setExportBlockers(visualBlockers);
+      setExportError("다운로드 전에 이미지 후보를 확인해 주세요.");
+      return;
+    }
     const fallbackFilename = `${safeExportFilename(
       project?.name || "sellform-detail-page"
     )}.${format}`;
-    let saveHandle: SaveFileHandle | null = null;
-
-    try {
-      saveHandle = await chooseSaveFile(fallbackFilename, format);
-    } catch (err) {
-      if (err instanceof DOMException && err.name === "AbortError") return;
-      setExportError("저장 위치 선택 창을 열지 못했습니다. 다시 시도해 주세요.");
-      return;
-    }
 
     setExporting(true);
     setExportStage("finalizing");
@@ -335,9 +316,15 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
       });
       if (!createRes.ok) {
         const detail = await createRes.json().catch(() => null);
+        const detailMsg = detail?.detail;
+        // Check for blockers from readiness service
+        if (detailMsg && detailMsg.blockers) {
+          setExportBlockers(detailMsg.blockers);
+          throw new Error(detailMsg.message || "다운로드 전 확인이 필요합니다.");
+        }
         throw new Error(
-          detail?.detail?.message ||
-            detail?.detail ||
+          detailMsg?.message ||
+            detailMsg ||
             `${formatLabel} 내보내기를 시작하지 못했습니다.`
         );
       }
@@ -383,20 +370,14 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
       }
       setExportStage("saving");
       const blob = await fileRes.blob();
-      if (saveHandle) {
-        const writable = await saveHandle.createWritable();
-        await writable.write(blob);
-        await writable.close();
-      } else {
-        const blobUrl = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.href = blobUrl;
-        link.download = filename;
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        window.setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
-      }
+      const blobUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = blobUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
     } catch (err) {
       setExportError(
         err instanceof TypeError && err.message === "Failed to fetch"
@@ -442,6 +423,13 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
   const invalidVisualCount = visibleSections.filter(
     (section) => validateSectionVisual(section as unknown as DetailPageSectionVisual).length > 0
   ).length;
+  const visualBlockers = visibleSections.flatMap((section) =>
+    validateSectionVisual(section as unknown as DetailPageSectionVisual).map((message) => ({
+      section_id: section.id,
+      code: "visual_image_asset_required",
+      message,
+    }))
+  );
 
   return (
     <div className="min-h-screen bg-white text-slate-800">
@@ -461,20 +449,18 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
         </div>
 
         <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => router.push(`/workspace/projects/${projectId}/page-editor?mode=advanced`)}
-            className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50"
-          >
-            고급 편집기로 열기
-          </button>
-          <button
-            type="button"
-            onClick={() => router.push(`/workspace/projects/${projectId}/page-editor?mode=review`)}
+          <Link
+            href={`/workspace/projects/${projectId}/page-editor?mode=review`}
             className="rounded-lg bg-emerald-600 px-4 py-2 text-xs font-bold text-white hover:bg-emerald-700"
           >
             검수하며 다듬기
-          </button>
+          </Link>
+          <Link
+            href={`/workspace/projects/${projectId}/page-editor?mode=advanced`}
+            className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50"
+          >
+            고급 편집기로 열기
+          </Link>
         </div>
       </header>
 
@@ -484,6 +470,38 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
             <h2 className="text-xl font-extrabold text-slate-950">판매용 상세페이지</h2>
             <p className="mt-1 text-sm text-slate-500">실제 구매자가 위에서 아래로 읽는 흐름입니다.</p>
           </div>
+          <section aria-label="다음 작업" className="mb-6 grid gap-3 rounded-2xl border border-slate-200 bg-slate-50 p-4 sm:grid-cols-2">
+            <Link
+              href={`/workspace/projects/${projectId}/page-editor?mode=review`}
+              className="rounded-xl border border-emerald-200 bg-white p-4 hover:bg-emerald-50"
+            >
+              <p className="text-sm font-extrabold text-emerald-700">검수하며 다듬기</p>
+              <p className="mt-1 text-xs leading-relaxed text-slate-500">
+                문구와 이미지를 빠르게 확인하고 누락·오류를 줄입니다.
+              </p>
+            </Link>
+            <Link
+              href={`/workspace/projects/${projectId}/page-editor?mode=advanced`}
+              className="rounded-xl border border-slate-200 bg-white p-4 hover:bg-slate-100"
+            >
+              <p className="text-sm font-extrabold text-slate-800">고급 편집기로 열기</p>
+              <p className="mt-1 text-xs leading-relaxed text-slate-500">
+                레이아웃과 섹션을 더 세밀하게 수정합니다.
+              </p>
+            </Link>
+            <Link
+              href="/workspace/projects"
+              className="rounded-xl border border-slate-200 bg-white p-4 text-sm font-bold text-slate-700 hover:bg-slate-100"
+            >
+              작업 목록
+            </Link>
+            <Link
+              href="/workspace/exports"
+              className="rounded-xl border border-slate-200 bg-white p-4 text-sm font-bold text-slate-700 hover:bg-slate-100"
+            >
+              출력 이력
+            </Link>
+          </section>
           <DetailPageDocument page={pageData} assets={assets} />
           {false ? (
           <article
@@ -607,7 +625,9 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
         </aside>
       </main>
 
-      <footer className="sticky bottom-0 flex items-center justify-center gap-4 border-t border-slate-200 bg-white px-6 py-4">
+      <footer className="sticky bottom-0 border-t border-slate-200 bg-white px-6 py-4">
+        <ExportReadinessWarning blockers={exportBlockers} projectId={projectId} />
+        <div className="flex items-center justify-center gap-4">
         <label className="flex items-center gap-2 text-sm font-semibold text-slate-600">
           저장 형식
           <select
@@ -626,12 +646,12 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
         <button
           type="button"
           onClick={() => handleDownloadImage(exportFormat)}
-          disabled={exporting || invalidVisualCount > 0}
+          disabled={exporting}
           className="rounded-lg border border-slate-200 bg-white px-6 py-3 text-sm font-bold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
         >
           {exporting
             ? `${exportFormat.toUpperCase()} ${exportStage === "finalizing" ? "최종본 준비 중..." : exportStage === "rendering" ? "이미지 생성 중..." : exportStage === "downloading" ? "다운로드 중..." : exportStage === "saving" ? "저장 중..." : "처리 중..."}`
-            : `${exportFormat.toUpperCase()}로 저장하기`}
+            : `${exportFormat.toUpperCase()}로 다운로드`}
         </button>
         <button
           type="button"
@@ -641,6 +661,7 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
           검수하며 다듬기
         </button>
         {exportError ? <p className="absolute bottom-full mb-2 rounded-lg bg-rose-50 px-4 py-2 text-xs font-bold text-rose-700">{exportError}</p> : null}
+        </div>
       </footer>
     </div>
   );

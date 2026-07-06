@@ -10,6 +10,7 @@ from src.db.database import get_db
 from src.db.models import AgentRun, AgentRunStep, Brand, ProductProject
 from src.services.intake_structuring_service import structure_intake
 from src.services.url_evidence_collector import collect_url_evidence
+from src.services.generation_status_service import GenerationStatusService
 
 
 router = APIRouter(prefix="/agent-runs", tags=["agent-runs"])
@@ -156,6 +157,28 @@ def get_agent_run_status(
 
 
 
+def _normalize_product_name(value: str | None) -> str:
+    return " ".join((value or "").strip().lower().split())
+
+
+def _find_active_project_by_name(db: Session, workspace_id: str, product_name: str) -> ProductProject | None:
+    normalized = _normalize_product_name(product_name)
+    if not normalized:
+        return None
+    projects = (
+        db.query(ProductProject)
+        .filter(ProductProject.workspace_id == workspace_id)
+        .order_by(ProductProject.updated_at.desc())
+        .all()
+    )
+    for project in projects:
+        if _normalize_product_name(project.name) == normalized:
+            status_payload = GenerationStatusService(db).get_project_status(project.id, workspace_id)
+            if status_payload["state"] in {"created", "running", "waiting_for_cost_approval", "needs_review"}:
+                return project
+    return None
+
+
 @router.post("", response_model=AgentRunResponseSchema, status_code=201)
 def create_agent_run(
     req: AgentRunCreateRequest,
@@ -205,6 +228,24 @@ def create_agent_run(
             collection_warnings.append(f"{source_url}: {exc}")
 
     resolved_product_name = req.product_name or collected_product_name
+
+    # Duplicate run guard: block if same product name has an active project
+    active_project = _find_active_project_by_name(db, workspace.id, resolved_product_name)
+    if active_project is not None:
+        status_payload = GenerationStatusService(db).get_project_status(active_project.id, workspace.id)
+        active_run = status_payload.get("active_run") or {}
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "generation_already_running",
+                "message": "이미 이 상품의 상세페이지 생성이 진행 중입니다.",
+                "project_id": active_project.id,
+                "run_id": active_run.get("id"),
+                "state": status_payload["state"],
+                "status_url": f"/workspace/operations?projectId={active_project.id}",
+                "result_url": status_payload.get("result_url"),
+            },
+        )
 
     # 1. Fetch or create a default Brand for project creation
     brand = db.query(Brand).filter(Brand.workspace_id == workspace.id).first()

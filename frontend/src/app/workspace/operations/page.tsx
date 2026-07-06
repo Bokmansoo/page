@@ -1,6 +1,8 @@
 "use client";
 
 import React, { useState, useEffect } from "react";
+import GenerationStatusPanel from "@/components/GenerationStatusPanel";
+import { fetchGenerationStatusDashboard, GenerationStatusDashboard } from "@/lib/generationStatus";
 
 interface SummaryStats {
   total_projects: number;
@@ -70,6 +72,7 @@ export default function OperationsPage() {
   const [loading, setLoading] = useState(true);
   const [seeding, setSeeding] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [generationStatus, setGenerationStatus] = useState<GenerationStatusDashboard | null>(null);
 
   const fetchStats = async () => {
     try {
@@ -95,6 +98,15 @@ export default function OperationsPage() {
       setError(err instanceof Error ? err.message : "연결 오류");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const fetchGenerationStatus = async () => {
+    try {
+      const data = await fetchGenerationStatusDashboard();
+      setGenerationStatus(data);
+    } catch {
+      setGenerationStatus(null);
     }
   };
 
@@ -131,6 +143,7 @@ export default function OperationsPage() {
 
   useEffect(() => {
     fetchStats();
+    fetchGenerationStatus();
   }, []);
 
   const getStatusBadge = (status: ProjectStats["status"]) => {
@@ -191,6 +204,10 @@ export default function OperationsPage() {
           </button>
         </div>
       )}
+
+      {generationStatus ? (
+        <GenerationStatusPanel data={generationStatus} onRefresh={fetchGenerationStatus} />
+      ) : null}
 
       {loading && !stats ? (
         <div className="py-20 text-center text-slate-400 flex flex-col items-center space-y-3">

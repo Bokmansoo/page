@@ -11,6 +11,19 @@ from src.db.models import ExportArtifact
 from src.services.page_asset_policy import get_page_eligible_assets
 
 
+def build_export_render_path(project_id: str) -> str:
+    """Build the export render URL path for a given project.
+
+    The default path is outside /workspace/ to avoid capturing the app chrome
+    (header, sidebar, etc.) in screenshots. Override via SELLFORM_EXPORT_RENDER_PATH.
+    """
+    render_path_template = os.getenv(
+        "SELLFORM_EXPORT_RENDER_PATH",
+        "/export-render/projects/{project_id}",
+    )
+    return render_path_template.format(project_id=project_id)
+
+
 class ExportRenderNotReadyError(RuntimeError):
     """Raised when the render page reports asset loading failure."""
 
@@ -49,7 +62,7 @@ def capture_next_render_export(
             "workspace_id": auth_headers.get("X-Mock-Workspace-Id", ""),
         }
     )
-    render_url = f"{render_base_url}/workspace/projects/{project_id}/render?{query}"
+    render_url = f"{render_base_url}{build_export_render_path(project_id)}?{query}"
     image_path = os.path.join(
         output_dir,
         f"{project_id}_{version_id}_long.{normalized_format}",
