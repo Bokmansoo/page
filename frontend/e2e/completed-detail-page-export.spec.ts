@@ -118,17 +118,35 @@ test("shows a completed page and saves PNG to the user-selected location", async
     await route.fulfill({ contentType: "image/png", body: Buffer.from("detail-image") });
   });
 
+  await page.route(`**/api/v1/projects/${projectId}/page/finalize`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "final-v1",
+        project_id: projectId,
+        name: "Final",
+        style_key: "minimal",
+        sections_json: {},
+        is_final: true,
+        created_at: "2026-07-04T00:00:00",
+      }),
+    });
+  });
+
   await page.route(`**/api/v1/projects/${projectId}/page/export`, async (route) => {
+    const requestedFormat = route.request().postDataJSON().output_format as "png" | "jpg";
     expect(route.request().postDataJSON()).toMatchObject({
       preset_name: "smartstore",
-      output_format: "png",
+      output_format: requestedFormat,
       export_target: "local_download",
     });
+    expect(["png", "jpg"]).toContain(requestedFormat);
     await route.fulfill({
       status: 202,
       contentType: "application/json",
       body: JSON.stringify({
-        id: "export-1",
+        id: `export-${requestedFormat}`,
         project_id: projectId,
         preset_name: "smartstore",
         status: "pending",
@@ -141,18 +159,20 @@ test("shows a completed page and saves PNG to the user-selected location", async
     });
   });
 
-  await page.route(`**/api/v1/projects/${projectId}/page/export/jobs/export-1`, async (route) => {
+  await page.route(`**/api/v1/projects/${projectId}/page/export/jobs/**`, async (route) => {
+    const jobId = route.request().url().split("/").pop() || "export-png";
+    const requestedFormat = jobId.endsWith("jpg") ? "jpg" : "png";
     await route.fulfill({
       contentType: "application/json",
       body: JSON.stringify({
-        id: "export-1",
+        id: jobId,
         project_id: projectId,
         preset_name: "smartstore",
         status: "completed",
         error_message: null,
         zip_asset_id: "zip-1",
         output_images: [
-          `/api/v1/projects/${projectId}/page/export/download/export-image-1`,
+          `/api/v1/projects/${projectId}/page/export/download/export-image-${requestedFormat}`,
         ],
         created_at: "2026-07-04T00:00:00",
         completed_at: "2026-07-04T00:00:01",
@@ -161,13 +181,16 @@ test("shows a completed page and saves PNG to the user-selected location", async
   });
 
   await page.route(
-    `**/api/v1/projects/${projectId}/page/export/download/export-image-1`,
+    `**/api/v1/projects/${projectId}/page/export/download/**`,
     async (route) => {
-    await route.fulfill({
-      contentType: "image/png",
-      headers: { "Content-Disposition": 'attachment; filename="sellform-long.png"' },
-      body: Buffer.from("png-download"),
-    });
+      const requestedFormat = route.request().url().endsWith("jpg") ? "jpg" : "png";
+      await route.fulfill({
+        contentType: requestedFormat === "jpg" ? "image/jpeg" : "image/png",
+        headers: {
+          "Content-Disposition": `attachment; filename="sellform-long.${requestedFormat}"`,
+        },
+        body: Buffer.from(`${requestedFormat}-download`),
+      });
     }
   );
 
@@ -184,22 +207,39 @@ test("shows a completed page and saves PNG to the user-selected location", async
     /detail-generated/
   );
 
-  await page.getByRole("button", { name: "PNG로 저장하기" }).click();
-  await expect
-    .poll(() =>
-      page.evaluate(() => {
-        const testWindow = window as typeof window & {
-          __savePickerOptions?: { suggestedName?: string };
-          __savedBlob?: { type: string; size: number };
-        };
-        return {
-          suggestedName: testWindow.__savePickerOptions?.suggestedName,
-          blob: testWindow.__savedBlob,
-        };
-      })
-    )
-    .toEqual({
-      suggestedName: "삼탠바이미.png",
-      blob: { type: "image/png", size: 12 },
+  const formats: Array<{ value: string; label: string; mime: string; filename: string }> = [
+    { value: "png", label: "PNG", mime: "image/png", filename: "삼탠바이미.png" },
+    { value: "jpg", label: "JPG", mime: "image/jpeg", filename: "삼탠바이미.jpg" },
+  ];
+
+  for (const fmt of formats) {
+    await page.evaluate(() => {
+      const testWindow = window as typeof window & {
+        __savePickerOptions?: { suggestedName?: string };
+        __savedBlob?: { type: string; size: number };
+      };
+      testWindow.__savePickerOptions = undefined;
+      testWindow.__savedBlob = undefined;
     });
+    await page.getByLabel("저장 형식").selectOption(fmt.value);
+    await page.getByRole("button", { name: new RegExp(fmt.label, "i") }).click();
+
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const testWindow = window as typeof window & {
+            __savePickerOptions?: { suggestedName?: string };
+            __savedBlob?: { type: string; size: number };
+          };
+          return {
+            suggestedName: testWindow.__savePickerOptions?.suggestedName,
+            blob: testWindow.__savedBlob,
+          };
+        })
+      )
+      .toEqual({
+        suggestedName: fmt.filename,
+        blob: { type: fmt.mime, size: 12 },
+      });
+  }
 });

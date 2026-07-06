@@ -7,6 +7,8 @@ import DetailPageDocument from "@/components/DetailPageDocument";
 import { validateSectionVisual } from "@/components/detail-page/types";
 import type { DetailPageSectionVisual } from "@/components/detail-page/types";
 
+type ExportStage = "idle" | "finalizing" | "rendering" | "downloading" | "saving";
+
 interface GeneratedDetailPageResultProps {
   projectId: string;
 }
@@ -198,6 +200,7 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const [exportFormat, setExportFormat] = useState<ExportImageFormat>("png");
+  const [exportStage, setExportStage] = useState<ExportStage>("idle");
 
   useEffect(() => {
     const loadData = async () => {
@@ -286,6 +289,7 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
   const handleDownloadImage = async (format: ExportImageFormat) => {
     const formatLabel = format.toUpperCase();
     setExportError(null);
+    setExportStage("idle");
     const fallbackFilename = `${safeExportFilename(
       project?.name || "sellform-detail-page"
     )}.${format}`;
@@ -300,6 +304,7 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
     }
 
     setExporting(true);
+    setExportStage("finalizing");
     try {
       const finalRes = await fetch(apiUrl(`/api/v1/projects/${projectId}/page/finalize`), {
         method: "POST",
@@ -313,6 +318,7 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
       }
       const finalVersion = (await finalRes.json()) as FinalPageVersion;
 
+      setExportStage("rendering");
       const createRes = await fetch(apiUrl(`/api/v1/projects/${projectId}/page/export`), {
         method: "POST",
         headers: {
@@ -336,6 +342,7 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
         );
       }
 
+      setExportStage("downloading");
       let job = (await createRes.json()) as ExportJob;
       for (let attempt = 0; attempt < 120 && job.status !== "completed"; attempt += 1) {
         if (job.status === "failed") {
@@ -374,6 +381,7 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
           filename = encodedFilename;
         }
       }
+      setExportStage("saving");
       const blob = await fileRes.blob();
       if (saveHandle) {
         const writable = await saveHandle.createWritable();
@@ -399,6 +407,7 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
       );
     } finally {
       setExporting(false);
+      setExportStage("idle");
     }
   };
 
@@ -621,7 +630,7 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
           className="rounded-lg border border-slate-200 bg-white px-6 py-3 text-sm font-bold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
         >
           {exporting
-            ? `${exportFormat.toUpperCase()} 만드는 중...`
+            ? `${exportFormat.toUpperCase()} ${exportStage === "finalizing" ? "최종본 준비 중..." : exportStage === "rendering" ? "이미지 생성 중..." : exportStage === "downloading" ? "다운로드 중..." : exportStage === "saving" ? "저장 중..." : "처리 중..."}`
             : `${exportFormat.toUpperCase()}로 저장하기`}
         </button>
         <button

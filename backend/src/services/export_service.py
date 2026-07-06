@@ -11,6 +11,10 @@ from src.db.models import ExportArtifact
 from src.services.page_asset_policy import get_page_eligible_assets
 
 
+class ExportRenderNotReadyError(RuntimeError):
+    """Raised when the render page reports asset loading failure."""
+
+
 def capture_next_render_export(
     *,
     project_id: str,
@@ -71,11 +75,16 @@ def capture_next_render_export(
             extra_http_headers=auth_headers,
         )
         page.goto(render_url, wait_until="networkidle", timeout=30000)
-        page.wait_for_selector(
-            "html[data-export-ready='true']",
-            state="attached",
+        page.wait_for_function(
+            "() => ['true', 'error'].includes(document.documentElement.dataset.exportReady)",
             timeout=30000,
         )
+        ready = page.locator("html").get_attribute("data-export-ready")
+        if ready == "error":
+            errors = page.locator("html").get_attribute("data-export-errors") or "[]"
+            raise ExportRenderNotReadyError(
+                f"required visual assets failed: {errors}"
+            )
 
         screenshot_type = "jpeg" if normalized_format == "jpg" else "png"
         screenshot_options = {

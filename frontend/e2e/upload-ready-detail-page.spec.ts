@@ -193,3 +193,95 @@ test("result page renders image overlays and html graphics as export-ready visua
 
   await expect(page.getByRole("button", { name: /PNG로 저장하기/ })).toBeEnabled();
 });
+
+test("blocks export readiness when a required image fails", async ({ page }) => {
+  const projectId = "export-block-test";
+
+  await page.route(`**/api/v1/projects/${projectId}`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ id: projectId, name: "Export Block", status: "completed" }),
+    });
+  });
+
+  await page.route(`**/api/v1/projects/${projectId}/assets`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify([
+        { id: "broken", filename: "broken.png", file_path: "", mime_type: "image/png", source_type: "uploaded" },
+      ]),
+    });
+  });
+
+  await page.route(`**/api/v1/projects/${projectId}/page`, async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          id: "page-1",
+          project_id: projectId,
+          theme_color: "#2FAE73",
+          font_family: "sans-serif",
+          sections: [
+            {
+              id: "sec-hero",
+              section_type: "hero",
+              title: "Broken Image Test",
+              body_copy: "Testing",
+              image_asset_id: "broken",
+              visual_kind: "image",
+              visual_payload: { layout_variant: "hero_overlay" },
+              sort_order: 0,
+              is_visible: true,
+            },
+          ],
+        }),
+      });
+    } else {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({}) });
+    }
+  });
+
+  await page.route(`**/api/v1/projects/${projectId}/page/final**`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "final-v1",
+        sections_json: {
+          theme_color: "#2FAE73",
+          font_family: "sans-serif",
+          sections: [
+            {
+              id: "sec-hero",
+              section_type: "hero",
+              title: "Broken Image Test",
+              body_copy: "Testing",
+              image_asset_id: "broken",
+              visual_kind: "image",
+              visual_payload: { layout_variant: "hero_overlay" },
+              sort_order: 0,
+              is_visible: true,
+            },
+          ],
+        },
+      }),
+    });
+  });
+
+  // Abort the image request to simulate failure
+  await page.route("**/api/v1/files/assets/broken", (route) => route.abort());
+
+  // Navigate to render route
+  await page.goto(`/workspace/projects/${projectId}/render?version_id=version-1`);
+
+  // Wait for the render page to load and export readiness to be set
+  await page.waitForSelector("[data-detail-page-document='true']", { timeout: 10000 });
+
+  // After rendering, check the export readiness state
+  await expect(page.locator("html")).toHaveAttribute("data-export-ready", "error");
+  await expect(page.getByText("필수 이미지를 불러오지 못했습니다")).toBeVisible();
+});

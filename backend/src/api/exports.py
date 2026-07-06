@@ -97,11 +97,11 @@ def run_export_task(
 ):
     db = SessionLocal()
     try:
-        # 1. 작업 상태를 running으로 업데이트
+        # 1. 작업 상태를 rendering으로 업데이트
         job = db.query(ExportJob).filter(ExportJob.id == job_id).first()
         if not job:
             return
-        job.status = "running"
+        job.status = "rendering"
         db.commit()
 
         # 2. 최종본 지정된 버전 가져오기 (없으면 최신 버전 폴백)

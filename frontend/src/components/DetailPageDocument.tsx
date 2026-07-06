@@ -1,7 +1,8 @@
 "use client";
 
-import React, { useEffect } from "react";
+import React, { useEffect, useState } from "react";
 import { apiUrl } from "@/lib/api";
+import { waitForExportAssets } from "@/lib/exportReadiness";
 import ImageSectionVisual from "@/components/detail-page/ImageSectionVisual";
 import HtmlGraphicVisual from "@/components/detail-page/HtmlGraphicVisual";
 import { validateSectionVisual } from "@/components/detail-page/types";
@@ -117,6 +118,7 @@ function sectionTheme(sectionType: string, index: number) {
 }
 
 export default function DetailPageDocument({ page, assets, exportMode = false }: DetailPageDocumentProps) {
+  const [exportErrors, setExportErrors] = useState<string[]>([]);
   const visibleSections = page.sections
     .filter((section) => section.is_visible !== false)
     .sort((a, b) => a.sort_order - b.sort_order);
@@ -126,26 +128,20 @@ export default function DetailPageDocument({ page, assets, exportMode = false }:
 
     let cancelled = false;
     const markReady = async () => {
-      await document.fonts.ready;
-      const images = Array.from(document.images);
-      await Promise.all(
-        images.map((image) => {
-          if (image.complete) return Promise.resolve();
-          return new Promise<void>((resolve) => {
-            image.addEventListener("load", () => resolve(), { once: true });
-            image.addEventListener("error", () => resolve(), { once: true });
-          });
-        })
-      );
+      const result = await waitForExportAssets();
       if (!cancelled) {
-        document.documentElement.dataset.exportReady = "true";
+        document.documentElement.dataset.exportReady = result.ok ? "true" : "error";
+        document.documentElement.dataset.exportErrors = JSON.stringify(result.errors);
+        setExportErrors(result.ok ? [] : result.errors);
       }
     };
 
     markReady();
     return () => {
       cancelled = true;
+      setExportErrors([]);
       delete document.documentElement.dataset.exportReady;
+      delete document.documentElement.dataset.exportErrors;
     };
   }, [exportMode]);
 
@@ -155,6 +151,14 @@ export default function DetailPageDocument({ page, assets, exportMode = false }:
       style={{ fontFamily: page.font_family }}
       data-detail-page-document="true"
     >
+      {exportMode && exportErrors.length > 0 ? (
+        <div
+          role="alert"
+          className="border-b border-rose-200 bg-rose-50 px-6 py-4 text-sm font-bold text-rose-700"
+        >
+          필수 이미지를 불러오지 못했습니다. 이미지를 확인한 뒤 다시 다운로드해 주세요.
+        </div>
+      ) : null}
       {visibleSections.map((section, index) => {
         const matchedAsset = assets.find((asset) => asset.id === section.image_asset_id);
         const imageSrc = matchedAsset
