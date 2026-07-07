@@ -1927,6 +1927,29 @@ def approve_planning_draft(
 
     version_sections = []
     image_job_ids: list[str] = []
+    project_assets = db.query(Asset).filter(Asset.project_id == project_id).all()
+    cutout_asset_ids = [
+        asset.id
+        for asset in project_assets
+        if asset.background_removed
+        or asset.cutout_status == "completed"
+        or asset.source_type == "ai_corrected"
+    ]
+    uploaded_product_asset_ids = [
+        asset.id
+        for asset in project_assets
+        if asset.source_type in {"self_shot", "uploaded", "url-extracted", "url-imported", "sourced"}
+    ]
+    product_reference_asset_ids = cutout_asset_ids or uploaded_product_asset_ids
+    identity_preserving_card_types = {
+        "hero",
+        "lifestyle_scene",
+        "lifestyle",
+        "detail_1",
+        "detail_2",
+        "features",
+        "cta",
+    }
 
     for idx, card in enumerate(enabled_cards):
         visual_strategy = card.get("visual_strategy") or "text_only"
@@ -1956,12 +1979,30 @@ def approve_planning_draft(
 
         if needs_image:
             job_id = f"planning-{project_id}-{section.id}"
+            job_source_asset_ids = (
+                product_reference_asset_ids if card_type in identity_preserving_card_types else []
+            )
+            preserve_product_identity = bool(job_source_asset_ids)
+            reference_instruction = (
+                "Use the provided product cutout/reference as the fixed product identity. "
+                "Preserve the product shape, color, proportions, logo/display details, and key visible features. "
+                "Only compose the background, lighting, shadow, and scene around that product."
+                if preserve_product_identity
+                else "No product reference asset is available. Generate a conservative commerce scene and avoid inventing unverifiable product details."
+            )
+            job_prompt = (
+                f"Product: {project.name}. Section: {section.title}. "
+                f"{reference_instruction} "
+                "Create a clean commerce image suitable for a product detail page. "
+                "Do not put text, logo overlays, watermark, badges, or captions inside the image; "
+                "all copy will be rendered separately with HTML/CSS."
+            )
             job_record = ImageGenerationJobRecord(
                 project_id=project_id,
                 job_id=job_id,
                 section_id=section.id,
                 role=card.get("type") or section.section_type,
-                source_asset_ids=[],
+                source_asset_ids=job_source_asset_ids,
                 prompt=(
                     f"상품명: {project.name}. 섹션 주제: {section.title}. "
                     "상세페이지에 어울리는 깔끔한 상품/라이프스타일 이미지를 생성하세요. "
@@ -1969,11 +2010,12 @@ def approve_planning_draft(
                     "문구는 HTML/CSS 레이어에서 별도로 렌더링됩니다."
                 ),
                 negative_prompt="text, letters, logo, watermark, badge, distorted product",
-                preserve_product_identity=False,
+                preserve_product_identity=preserve_product_identity,
                 output_size="1024x1024",
                 cost_tier="premium",
                 status="needs_generation",
             )
+            job_record.prompt = job_prompt
             db.add(job_record)
             image_job_ids.append(job_id)
 

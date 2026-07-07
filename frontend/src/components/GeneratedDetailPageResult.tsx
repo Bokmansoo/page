@@ -23,6 +23,11 @@ interface ImageCandidate {
   label: string;
   is_recommended: boolean;
   needs_identity_review: boolean;
+  status?: string | null;
+  source_asset_id?: string | null;
+  cutout_status?: string | null;
+  background_removed?: boolean | null;
+  product_identity_preserved?: boolean | null;
 }
 
 interface PageSection {
@@ -50,6 +55,10 @@ interface ProjectAsset {
   file_path: string;
   mime_type: string;
   source_type: string;
+  source_asset_id?: string | null;
+  cutout_status?: string | null;
+  background_removed?: boolean | null;
+  product_identity_preserved?: boolean | null;
 }
 
 interface ProjectData {
@@ -98,6 +107,7 @@ const MOCK_HEADERS = {
   "X-Mock-Workspace-Id": "00000000-0000-0000-0000-000000000002",
 };
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function sourceLabel(sourceType: string): string {
   switch (sourceType) {
     case "uploaded":
@@ -120,6 +130,67 @@ function sourceLabel(sourceType: string): string {
     default:
       return sourceType || "출처 없음";
   }
+}
+
+function readableSourceLabel(sourceType: string): string {
+  switch (sourceType) {
+    case "self_shot":
+    case "uploaded":
+      return "직접 업로드";
+    case "url-extracted":
+    case "url-imported":
+      return "URL 추출";
+    case "ai_corrected":
+      return "실제 상품 누끼 사용";
+    case "mock-generated":
+      return "AI 모의 생성";
+    case "real-generated":
+      return "AI 생성 이미지";
+    case "ai-generated":
+      return "AI 생성";
+    case "generation-skipped":
+      return "HTML 그래픽";
+    case "blocked_cost_approval":
+      return "이미지 생성 승인 필요";
+    case "needs_review":
+      return "상품 정체성 검수 필요";
+    default:
+      return sourceType || "출처 없음";
+  }
+}
+
+function assetSourceLabel(asset?: ProjectAsset | null): string {
+  if (!asset) return readableSourceLabel("ai-generated");
+  if (asset.background_removed || asset.cutout_status === "completed" || asset.source_type === "ai_corrected") {
+    return "실제 상품 누끼 사용";
+  }
+  if (asset.source_asset_id) {
+    return "AI 배경 합성";
+  }
+  if (asset.product_identity_preserved === false) {
+    return "AI 보정 후보 - 검수 필요";
+  }
+  return readableSourceLabel(asset.source_type);
+}
+
+function candidateSourceLabel(candidate: ImageCandidate): string {
+  if (candidate.background_removed || candidate.cutout_status === "completed" || candidate.source_type === "ai_corrected") {
+    return "실제 상품 누끼 사용";
+  }
+  if (candidate.source_asset_id) {
+    return "AI 배경 합성";
+  }
+  if (candidate.needs_identity_review || candidate.product_identity_preserved === false) {
+    return "AI 보정 후보 - 검수 필요";
+  }
+  return readableSourceLabel(candidate.source_type);
+}
+
+function candidateWarningLabel(candidate: ImageCandidate): string | null {
+  if (candidate.needs_identity_review || candidate.product_identity_preserved === false) {
+    return "상품 형태 변경 가능성 있음";
+  }
+  return null;
 }
 
 function assetUrl(asset: ProjectAsset | { id: string; file_path?: string }): string {
@@ -546,7 +617,6 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
                 : fallbackAssetId
                   ? assetUrl({ id: fallbackAssetId })
                   : null;
-              const sourceType = matchedAsset?.source_type || "ai-generated";
               const theme = sectionTheme(section.section_type, index);
               return (
                 <section key={section.id} className={theme.section}>
@@ -568,7 +638,7 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
                           className="aspect-[4/3] w-full object-cover"
                         />
                         <figcaption className="absolute right-3 top-3 rounded-full bg-emerald-700 px-3 py-1 text-[10px] font-bold text-white">
-                          {sourceLabel(sourceType)}
+                          {assetSourceLabel(matchedAsset)}
                         </figcaption>
                       </figure>
                     ) : (
@@ -627,10 +697,15 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
                                   </span>
                                 )}
                                 <span className="absolute right-1.5 top-1.5 rounded-full bg-slate-900/80 px-1.5 py-0.5 text-[8px] font-bold text-white">
-                                  {sourceLabel(cand.source_type)}
+                                  {candidateSourceLabel(cand)}
                                 </span>
                               </div>
                               <p className="mt-2 truncate text-[10px] font-bold text-slate-700">{cand.label}</p>
+                              {candidateWarningLabel(cand) ? (
+                                <p className="mt-1 text-[10px] font-bold text-amber-700">
+                                  {candidateWarningLabel(cand)}
+                                </p>
+                              ) : null}
                               <button
                                 type="button"
                                 disabled={isSelected || !cand.asset_id}
