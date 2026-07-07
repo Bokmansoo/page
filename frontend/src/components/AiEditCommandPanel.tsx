@@ -1,7 +1,7 @@
-﻿"use client";
+"use client";
 
 import React, { useState } from "react";
-import CopyRewriteComparison from "./CopyRewriteComparison";
+import AiCopyRewriteCompareModal from "./AiCopyRewriteCompareModal";
 import { apiUrl } from "@/lib/api";
 
 interface AiEditCommandPanelProps {
@@ -19,12 +19,14 @@ interface AiEditCommandPanelProps {
 }
 
 const PRESET_COMMANDS = [
-  { label: "제목을 더 강하게 바꿔줘", command: "stronger_headline" },
-  { label: "문구를 더 짧고 자연스럽게 정리해줘", command: "shorter_natural" },
-  { label: "과장 표현을 줄여줘", command: "reduce_exaggeration" },
-  { label: "사용 장면이 떠오르게 설명을 보강해줘", command: "usage_context" },
-  { label: "초보 셀러가 쓰기 좋은 톤으로 다듬어줘", command: "beginner_seller_tone" },
-  { label: "구매 전 불안을 줄이는 문장을 추가해줘", command: "reduce_purchase_anxiety" },
+  { label: "강한 구매 설득 버전", command: "stronger_persuasion" },
+  { label: "짧고 임팩트 있는 버전", command: "shorter_impact" },
+  { label: "초보 셀러 자연스러운 버전", command: "beginner_seller_tone" },
+  { label: "프리미엄 브랜드 톤", command: "premium_brand_tone" },
+  { label: "쿠팡/스마트스토어 최적화 버전", command: "marketplace_optimized" },
+  { label: "과장 줄인 신뢰형 버전", command: "trust_oriented" },
+  { label: "감성 라이프스타일 버전", command: "emotional_lifestyle" },
+  { label: "구매 불안 감소 버전", command: "reduce_purchase_anxiety" },
 ] as const;
 
 interface PreviewResult {
@@ -47,6 +49,7 @@ export default function AiEditCommandPanel({
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
   const [preview, setPreview] = useState<{
     command: string;
+    instruction: string;
     originalTitle: string;
     originalBody: string;
     result: PreviewResult;
@@ -57,6 +60,9 @@ export default function AiEditCommandPanel({
       setMessage({ type: "error", text: "먼저 수정할 섹션을 선택해 주세요." });
       return;
     }
+
+    const titleVal = document.querySelector<HTMLInputElement>("#section-title-edit")?.value || "";
+    const bodyVal = document.querySelector<HTMLTextAreaElement>("#section-body-edit")?.value || "";
 
     setLoading(true);
     setMessage(null);
@@ -71,6 +77,8 @@ export default function AiEditCommandPanel({
           },
           body: JSON.stringify({
             command: commandValue,
+            title: titleVal,
+            body_copy: bodyVal,
             instruction,
             scope: "section",
           }),
@@ -85,8 +93,9 @@ export default function AiEditCommandPanel({
       const result = (await res.json()) as PreviewResult;
       setPreview({
         command: commandValue,
-        originalTitle: document.querySelector<HTMLInputElement>("#section-title-edit")?.value || "",
-        originalBody: document.querySelector<HTMLTextAreaElement>("#section-body-edit")?.value || "",
+        instruction,
+        originalTitle: titleVal,
+        originalBody: bodyVal,
         result,
       });
     } catch (err) {
@@ -184,18 +193,22 @@ export default function AiEditCommandPanel({
         </div>
       ) : null}
 
-      {preview ? (
-        <CopyRewriteComparison
-          originalTitle={preview.originalTitle}
-          originalBody={preview.originalBody}
-          proposedTitle={preview.result.title}
-          proposedBody={preview.result.body_copy}
-          changeSummary={preview.result.change_summary}
-          groundingWarnings={preview.result.grounding_warnings}
-          onApply={handleApplyProposal}
-          onCancel={() => setPreview(null)}
-        />
-      ) : null}
+      <AiCopyRewriteCompareModal
+        isOpen={!!preview}
+        originalTitle={preview?.originalTitle || ""}
+        originalBody={preview?.originalBody || ""}
+        proposedTitle={preview?.result.title || ""}
+        proposedBody={preview?.result.body_copy || ""}
+        changeSummary={preview?.result.change_summary || ""}
+        groundingWarnings={preview?.result.grounding_warnings || []}
+        onApply={handleApplyProposal}
+        onRetry={() => {
+          if (preview) {
+            fetchPreview(preview.command, preview.instruction);
+          }
+        }}
+        onCancel={() => setPreview(null)}
+      />
     </div>
   );
 }

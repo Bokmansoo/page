@@ -1785,6 +1785,8 @@ def process_ai_edit(
 
 class CopyRewritePreviewRequest(BaseModel):
     command: CopyRewriteCommand
+    title: str | None = None
+    body_copy: str | None = None
     instruction: str = ""
     scope: Literal["section"] = "section"
 
@@ -1823,11 +1825,14 @@ def preview_copy_rewrite(
         ).all()
     ]
 
+    source_title = req.title if req.title is not None else (section.title or "")
+    source_body = req.body_copy if req.body_copy is not None else (section.body_copy or "")
+
     service = CopyRewriteService(mode="mock")
     result = service.preview(
         command=req.command,
-        title=section.title or "",
-        body_copy=section.body_copy or "",
+        title=source_title,
+        body_copy=source_body,
         instruction=req.instruction,
         confirmed_facts=confirmed_facts,
         forbidden_claims=[],

@@ -53,11 +53,20 @@ def sanitize_rewrite_result(result: CopyRewriteResult) -> CopyRewriteResult:
 
 
 class CopyRewriteCommand(str, Enum):
+    # Legacy commands
     STRONGER_HEADLINE = "stronger_headline"
     SHORTER_NATURAL = "shorter_natural"
     REDUCE_EXAGGERATION = "reduce_exaggeration"
     USAGE_CONTEXT = "usage_context"
+
+    # Sprint 77 new/updated commands
+    STRONGER_PERSUASION = "stronger_persuasion"
+    SHORTER_IMPACT = "shorter_impact"
     BEGINNER_SELLER_TONE = "beginner_seller_tone"
+    PREMIUM_BRAND_TONE = "premium_brand_tone"
+    MARKETPLACE_OPTIMIZED = "marketplace_optimized"
+    TRUST_ORIENTED = "trust_oriented"
+    EMOTIONAL_LIFESTYLE = "emotional_lifestyle"
     REDUCE_PURCHASE_ANXIETY = "reduce_purchase_anxiety"
     CUSTOM_EDIT = "custom_edit"
 
@@ -67,6 +76,11 @@ class CopyRewriteResult(BaseModel):
     body_copy: str
     change_summary: str
     grounding_warnings: list[str] = Field(default_factory=list)
+    # Sprint 77 preview fields
+    before: dict[str, str] | None = None
+    after: dict[str, str] | None = None
+    rationale: str | None = None
+    safety_notes: list[str] | None = None
 
 
 _COMMAND_MUTATION = {
@@ -75,8 +89,14 @@ _COMMAND_MUTATION = {
     CopyRewriteCommand.REDUCE_EXAGGERATION: {"title": False, "body": True},
     CopyRewriteCommand.USAGE_CONTEXT: {"title": False, "body": True},
     CopyRewriteCommand.BEGINNER_SELLER_TONE: {"title": True, "body": True},
-    CopyRewriteCommand.REDUCE_PURCHASE_ANXIETY: {"title": False, "body": True},
-    CopyRewriteCommand.CUSTOM_EDIT: {"title": False, "body": True},
+    CopyRewriteCommand.REDUCE_PURCHASE_ANXIETY: {"title": True, "body": True},
+    CopyRewriteCommand.CUSTOM_EDIT: {"title": True, "body": True},
+    CopyRewriteCommand.STRONGER_PERSUASION: {"title": True, "body": True},
+    CopyRewriteCommand.SHORTER_IMPACT: {"title": True, "body": True},
+    CopyRewriteCommand.PREMIUM_BRAND_TONE: {"title": True, "body": True},
+    CopyRewriteCommand.MARKETPLACE_OPTIMIZED: {"title": True, "body": True},
+    CopyRewriteCommand.TRUST_ORIENTED: {"title": True, "body": True},
+    CopyRewriteCommand.EMOTIONAL_LIFESTYLE: {"title": True, "body": True},
 }
 
 _MOCK_RESULTS: dict[CopyRewriteCommand, dict[str, str]] = {
@@ -101,19 +121,49 @@ _MOCK_RESULTS: dict[CopyRewriteCommand, dict[str, str]] = {
         "change_summary": "구체적인 사용 장면을 추가해 구매자가 상황을 떠올리게 했습니다.",
     },
     CopyRewriteCommand.BEGINNER_SELLER_TONE: {
-        "title": "처음 쓰는 무선 선풍기, 간편하게",
-        "body_copy": "버튼 하나로 간단하게 켜고 끌 수 있어 누구나 부담 없이 사용할 수 있어요.",
-        "change_summary": "초보 셀러도 쉽게 읽을 수 있도록 쉬운 단어와 짧은 문장으로 변경했습니다.",
+        "title": "처음 쓰는 무선 선풍기, 참 편해요",
+        "body_copy": "버튼 하나만 누르면 바로 시원해지니까 복잡한 설정 없이 누구나 쉽게 쓸 수 있어요.",
+        "change_summary": "쉬운 단어와 짧은 문장으로 자연스럽게 고쳤습니다.",
     },
     CopyRewriteCommand.REDUCE_PURCHASE_ANXIETY: {
-        "title": "구매 전 확인하세요, 무선 선풍기",
-        "body_copy": "USB-C 충전 방식으로 언제든 간편하게 사용할 수 있습니다. 구성품과 사용 시간을 꼭 확인해 주세요.",
-        "change_summary": "구매 전 확인할 정보를 추가해 불안감을 줄였습니다.",
+        "title": "오래 쓰는 배터리, 안심하고 구매하세요",
+        "body_copy": "대용량 배터리로 야외에서도 방전 걱정 없이 시원하며, 무상 A/S 기간 정보를 함께 제공합니다.",
+        "change_summary": "구매 전 불안 요소를 해소할 수 있는 상세 정보를 보강했습니다.",
     },
     CopyRewriteCommand.CUSTOM_EDIT: {
         "title": "원하는 대로 다듬은 무선 선풍기",
         "body_copy": "차량이나 캠핑장에서도 편리하게 사용하세요. 어디서나 시원함을 누릴 수 있습니다.",
         "change_summary": "사용자 요청을 반영해 문구를 다듬었습니다.",
+    },
+    CopyRewriteCommand.STRONGER_PERSUASION: {
+        "title": "책상·차량·야외까지, 더운 순간 바로 꺼내 쓰는 무선 냉각 선풍기",
+        "body_copy": "무더운 여름철 야외 활동이나 사무실 책상에서도 콘센트 없이 시원한 바람을 제공합니다.",
+        "change_summary": "문제와 해결을 더 선명하게 연결하여 구매 설득력을 높였습니다.",
+    },
+    CopyRewriteCommand.SHORTER_IMPACT: {
+        "title": "언제 어디서나 간편하게",
+        "body_copy": "전원 연결 없이 편리하게 사용하세요.",
+        "change_summary": "제목과 본문을 압축하여 임팩트 있게 정리했습니다.",
+    },
+    CopyRewriteCommand.PREMIUM_BRAND_TONE: {
+        "title": "공간에 스며드는 시원함, 프리미엄 무선 팬",
+        "body_copy": "정제된 디자인과 저소음 모터로 일상의 격조를 높여주는 바람을 전합니다.",
+        "change_summary": "차분하고 고급스러운 톤앤매너로 문장을 재구성했습니다.",
+    },
+    CopyRewriteCommand.MARKETPLACE_OPTIMIZED: {
+        "title": "[무료배송] 1초 무선 냉각 선풍기 (USB-C 충전)",
+        "body_copy": "가볍고 시원한 무선 팬! 사무실/캠핑/차량 어디서나 끊김 없이 바로 시원합니다.",
+        "change_summary": "쿠팡 및 스마트스토어 검색 및 장점 부각에 최적화된 문구로 수정했습니다.",
+    },
+    CopyRewriteCommand.TRUST_ORIENTED: {
+        "title": "검증된 사양의 안전한 무선 선풍기",
+        "body_copy": "안전 인증을 완료한 배터리를 탑재하였으며, 완충 시 최대 사용 시간 정보를 투명하게 전달합니다.",
+        "change_summary": "체크사항과 실증 데이터 중심의 신뢰할 수 있는 표현으로 다듬었습니다.",
+    },
+    CopyRewriteCommand.EMOTIONAL_LIFESTYLE: {
+        "title": "여름날 캠핑의 온도를 낮추다",
+        "body_copy": "해질녘 텐트 안, 은은한 바람과 함께하는 오롯이 나만의 휴식을 느껴보세요.",
+        "change_summary": "감성적인 묘사와 사용 분위기를 극대화한 카피로 바꿨습니다.",
     },
 }
 
@@ -124,9 +174,17 @@ class CopyRewriteService:
         self.router = router
 
     def preview(self, **kwargs: Any) -> CopyRewriteResult:
+        title = kwargs.get("title", "")
+        body_copy = kwargs.get("body_copy", "")
         if self.mode == "mock":
-            return self._mock_preview(**kwargs)
-        return self._real_preview(**kwargs)
+            result = self._mock_preview(**kwargs)
+        else:
+            result = self._real_preview(**kwargs)
+        result.before = {"title": title, "body_copy": body_copy}
+        result.after = {"title": result.title, "body_copy": result.body_copy}
+        result.rationale = result.change_summary
+        result.safety_notes = result.grounding_warnings
+        return result
 
     def _mock_preview(
         self,
@@ -279,12 +337,18 @@ class CopyRewriteService:
         section_type: str,
     ) -> str:
         cmd_descriptions = {
-            CopyRewriteCommand.STRONGER_HEADLINE: "Make the headline more specific and show the purchase reason clearly. The new title should describe a concrete situation or benefit.",
-            CopyRewriteCommand.SHORTER_NATURAL: "Remove redundant words and make both title and body shorter and more natural. Keep the core message.",
-            CopyRewriteCommand.REDUCE_EXAGGERATION: "Remove unsupported strong claims like best, perfect, 100%. Replace with trustworthy and moderate expressions.",
-            CopyRewriteCommand.USAGE_CONTEXT: "Add concrete usage context (room, car, camping, outdoor, etc.) to help buyers imagine using the product.",
-            CopyRewriteCommand.BEGINNER_SELLER_TONE: "Rewrite in beginner-friendly tone: easy words, short sentences, warm and approachable.",
-            CopyRewriteCommand.REDUCE_PURCHASE_ANXIETY: "Add pre-purchase details that reduce anxiety: charging method, included items, usage time, etc.",
+            CopyRewriteCommand.STRONGER_HEADLINE: "Make the headline more specific and show the purchase reason clearly.",
+            CopyRewriteCommand.SHORTER_NATURAL: "Remove redundant words and make both title and body shorter and more natural.",
+            CopyRewriteCommand.REDUCE_EXAGGERATION: "Remove unsupported strong claims. Replace with trustworthy and moderate expressions.",
+            CopyRewriteCommand.USAGE_CONTEXT: "Add concrete usage context.",
+            CopyRewriteCommand.STRONGER_PERSUASION: "Connect problem and solution more clearly to make a strong persuasion version.",
+            CopyRewriteCommand.SHORTER_IMPACT: "Compress title and body text into a shorter, high-impact version.",
+            CopyRewriteCommand.BEGINNER_SELLER_TONE: "Rewrite in a beginner-friendly tone using simple vocabulary and short sentences.",
+            CopyRewriteCommand.PREMIUM_BRAND_TONE: "Rewrite in a premium brand tone: calm, elegant, and sophisticated sentences.",
+            CopyRewriteCommand.MARKETPLACE_OPTIMIZED: "Optimize structure for marketplaces like Coupang/Smartstore to highlight product benefits quickly.",
+            CopyRewriteCommand.TRUST_ORIENTED: "Produce a trust-oriented version focusing on verified factual information and checklists without exaggeration.",
+            CopyRewriteCommand.EMOTIONAL_LIFESTYLE: "Rewrite focusing on emotional lifestyle scenes, usage scenarios, and cozy atmosphere.",
+            CopyRewriteCommand.REDUCE_PURCHASE_ANXIETY: "Strengthen pre-purchase details and warranty info to reduce buyer hesitation.",
             CopyRewriteCommand.CUSTOM_EDIT: instruction,
         }
         desc = cmd_descriptions.get(command, instruction)
