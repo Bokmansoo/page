@@ -89,7 +89,7 @@ export default function HtmlGraphicVisual({ section }: HtmlGraphicVisualProps) {
       {layoutVariant === "spec_table" && payload.table_rows ? (
         <SpecTable rows={payload.table_rows as VisualTableRow[]} />
       ) : null}
-      {layoutVariant === "hero_overlay" || layoutVariant === "image_text" ? (
+      {layoutVariant === "hero_overlay" || layoutVariant === "image_text" || layoutVariant === "text_only" || (!payload.cards && !payload.table_rows) ? (
         <div className="mt-8 text-sm text-slate-500">
           <p>{section.body_copy || section.body || ""}</p>
         </div>

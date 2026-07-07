@@ -235,6 +235,51 @@ class PageSection(Base):
     page = relationship("ProductPage", back_populates="sections")
     image_asset = relationship("Asset")
 
+    @property
+    def role(self):
+        role_map = {
+            "problem": "문제 제기",
+            "hero": "메인 소구점 강조",
+            "benefit_a": "소구점 A",
+            "benefit_b": "소구점 B",
+            "hero_reemphasize": "소구점 A 재강조",
+            "benefits_summary": "소구점 B~D 정리",
+            "overall_summary": "전체 요약",
+            "product_info": "상품 정보",
+            "target_customer": "타깃 고객",
+            "features": "소구점 정리",
+            "caution": "주의사항",
+            "cta": "최종 CTA",
+            "lifestyle_scene": "사용 장면",
+            "comparison": "비교 포인트",
+            "specifications": "구성품/스펙",
+            "pre_purchase": "구매 전 확인사항",
+            "product_information": "상품 정보",
+        }
+        return role_map.get(self.section_type, self.section_type)
+
+    @property
+    def headline(self):
+        return self.title
+
+    @property
+    def body(self):
+        return self.body_copy
+
+    @property
+    def evidence_fact_ids(self):
+        return self.associated_fact_ids or []
+
+    @property
+    def visual_strategy(self):
+        if self.visual_payload:
+            return self.visual_payload.get("strategy")
+        return None
+
+    @property
+    def editable(self):
+        return True
+
 
 class PageVersion(Base):
     __tablename__ = "page_versions"

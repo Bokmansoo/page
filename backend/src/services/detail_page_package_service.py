@@ -126,7 +126,13 @@ class DetailPagePackageService:
                 "associated_fact_ids": sec.associated_fact_ids or [],
                 "image_asset_id": sec.image_asset_id,
                 "sort_order": sec.sort_order,
-                "is_visible": sec.is_visible
+                "is_visible": sec.is_visible,
+                "role": sec.role,
+                "headline": sec.headline,
+                "body": sec.body,
+                "evidence_fact_ids": sec.evidence_fact_ids,
+                "visual_strategy": sec.visual_strategy,
+                "editable": sec.editable,
             })
 
         # 4. Resolve Approved Assets

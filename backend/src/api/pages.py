@@ -106,6 +106,14 @@ class SectionResponseSchema(BaseModel):
     matched_facts: List[str] = []
     image_candidates: List[dict] = []
 
+    # Sprint 78 Section Component Contract
+    role: Optional[str] = None
+    headline: Optional[str] = None
+    body: Optional[str] = None
+    evidence_fact_ids: Optional[List[str]] = None
+    visual_strategy: Optional[str] = None
+    editable: bool = True
+
     class Config:
         from_attributes = True
 

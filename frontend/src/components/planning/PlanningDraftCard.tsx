@@ -28,6 +28,7 @@ const visualStrategyLabels: Record<string, string> = {
   lifestyle_image: "라이프스타일 이미지",
   graphic_chart: "비교/그래픽",
   text_only: "텍스트 중심",
+  html_graphic: "HTML 그래픽",
 };
 
 export default function PlanningDraftCard({

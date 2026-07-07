@@ -38,18 +38,28 @@
 - **[AiEditCommandPanel.tsx](file:///c:/page/frontend/src/components/AiEditCommandPanel.tsx)**
   - Preset 버튼 및 직접 요청 버튼 클릭 시 DOM으로부터 현재 입력된 `#section-title-edit` 및 `#section-body-edit` 값을 긁어와 API Body로 전달하도록 연동했습니다.
   - 모달의 "다시 생성(onRetry)" 핸들러를 바인딩하여, 사용자가 프리뷰 화면에서 즉시 재생성을 요청할 수 있는 흐름을 구현하였습니다.
+- **[DetailPagePackageEditor.tsx](file:///c:/page/frontend/src/components/DetailPagePackageEditor.tsx)**
+  - 보완 리뷰에서 발견된 구형 `ai-edit` 직접 실행 경로를 제거하고, 비교 모달의 `이 수정안 적용` 버튼이 눌렸을 때만 `/page` PATCH로 섹션 제목/본문을 저장하도록 연결했습니다.
+  - 이로써 신형 검수 페이지뿐 아니라 패키지 에디터 재사용 경로에서도 Sprint 77의 “미리보기는 읽기 전용, 적용 버튼에서만 저장” 계약을 동일하게 지킵니다.
 
 ---
 
 ## 3. 검증 결과 및 자동화 테스트 (Verification & E2E)
 - **백엔드 유닛 테스트**:
-  - `backend/tests/test_copy_rewrite_preview.py` [NEW]를 신규 추가하여 8종의 프리셋 응답 유효성, `[AI 수정됨]` 마커 정제 여부 및 수동 수정 전달 기능의 동작을 성공적으로 검증했습니다. (`pytest` 통과)
+  - `uv run pytest tests/test_copy_rewrite_preview.py -q`
+  - 결과: `2 passed, 18 warnings`
+  - 8종의 프리셋 응답 유효성, `[AI 수정됨]` 마커 정제 여부 및 수동 수정 전달 기능을 검증했습니다.
 - **Playwright E2E 검증**:
-  - `frontend/e2e/review-editor-reframe.spec.ts` 파일을 갱신하여, React state와 비동기 PATCH 간의 경쟁 상태(Race Condition)를 `blur()` 및 `waitForResponse()`를 사용해 해소하고, "이 수정안 적용" 버튼 클릭 시에만 서버에 최종 PATCH가 가해지는 전체 라이프사이클을 통과시켰습니다. (`playwright` 통과)
-- **프런트엔드 프로덕션 컴파일**:
-  - Next.js 빌드 (`npm run build`) 결과가 성공적으로 마무리되었음을 확인하였습니다.
+  - `npx.cmd playwright test e2e/review-editor-reframe.spec.ts --project=chromium --reporter=line --output=.pw-results-sprint77`
+  - 결과: `1 passed`
+  - React state와 비동기 PATCH 간의 경쟁 상태를 `blur()` 및 `waitForResponse()`로 제어하고, "이 수정안 적용" 버튼 클릭 시에만 서버에 최종 PATCH가 가해지는 전체 라이프사이클을 검증했습니다.
+- **프런트엔드 정적 검증**:
+  - `npm.cmd run lint`
+  - 결과: 통과. 기존 `<img>` 사용 및 hook dependency 관련 warning만 남아 있으며 Sprint 77 차단 에러는 없습니다.
+- **빌드 검증 상태**:
+  - 이번 보완 리뷰에서는 `npm run build`를 완료 검증으로 사용하지 않았습니다. 이전 세션에서 Next build가 장시간 멈춘 이력이 있어 별도 빌드 안정화 이슈로 분리합니다.
 
 ---
 
 ## 4. 종합 평가 (Conclusion)
-사용자가 직접 수정한 귀중한 입력본을 Rewrite Source로 원격 인지하는 기획 요건을 안전하게 구현 완료하였습니다. 모달을 통한 명시적 확인 단계 및 3가지 버튼의 상호작용은 문구 수정 부작용을 줄이고 서비스 사용 경험을 극대화할 것입니다.
+사용자가 직접 수정한 입력본을 Rewrite Source로 인지하고, 비교 모달에서 확인한 뒤에만 저장하는 Sprint 77 핵심 계약은 보완 후 충족되었습니다. 다만 실제 프로덕션 빌드 안정성은 이번 스프린트의 승인 조건에서 제외하고 별도 이슈로 관리하는 것이 안전합니다.

@@ -156,35 +156,43 @@ export default function DetailPagePackageEditor({
     }
   };
 
-  // 3. AI edit execution
-  const handleApplyAiCommand = async (commandType: string, instruction: string, scope: string) => {
-    if (!selectedSectionId) return;
+  // 3. Apply AI preview proposal after user confirms the compare modal.
+  // Sprint 77 contract: preview is read-only; only this apply action persists via PATCH.
+  const handleApplyAiProposal = async (title: string, bodyCopy: string) => {
+    if (!selectedSectionId || !pkg) return;
     try {
       setIsProcessing(true);
-      const res = await fetch(
-        `${backendUrl}/projects/${projectId}/page/sections/${selectedSectionId}/ai-edit`,
-        {
-          method: 'POST',
-          headers: {
-            ...headers,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            section_id: selectedSectionId,
-            command_type: commandType,
-            freeform_instruction: instruction,
-            scope,
-          }),
-        }
+      const sectionsUpdated = pkg.copy_sections.map((section: CopySection) =>
+        section.id === selectedSectionId
+          ? { ...section, title, body_copy: bodyCopy }
+          : section
       );
-      if (res.ok) {
-        const updatedPkg = await res.json();
-        setPkg(updatedPkg);
-      } else {
-        alert('AI 편집 명령 실행에 실패했습니다.');
+      const response = await fetch(`${backendUrl}/projects/${projectId}/page`, {
+        method: 'PATCH',
+        headers: {
+          ...headers,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          sections: sectionsUpdated.map((section: CopySection) => ({
+            id: section.id,
+            title: section.title,
+            body_copy: section.body_copy,
+            sort_order: section.sort_order,
+            is_visible: section.is_visible,
+            image_asset_id: section.image_asset_id || '',
+          })),
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(`Failed to apply AI proposal: ${response.status}`);
       }
+      setPkg({ ...pkg, copy_sections: sectionsUpdated });
+      setDirectTitle(title);
+      setDirectBody(bodyCopy);
     } catch (err) {
-      console.error('Failed to apply AI command:', err);
+      console.error('Failed to apply AI proposal:', err);
+      throw err;
     } finally {
       setIsProcessing(false);
     }
@@ -382,7 +390,10 @@ export default function DetailPagePackageEditor({
               <AiEditCommandPanel
                 projectId={projectId}
                 sectionId={selectedSection.id}
-                onApplyCommand={handleApplyAiCommand}
+                backendUrl={backendUrl}
+                headers={headers}
+                onApplyProposal={handleApplyAiProposal}
+                onUpdateSuccess={loadPackage}
                 isProcessing={isProcessing}
               />
             </>
