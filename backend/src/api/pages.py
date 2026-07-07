@@ -12,7 +12,9 @@ from sqlalchemy.orm import Session
 from src.api.auth import get_current_user_and_workspace
 from src.config import settings
 from src.db.database import get_db
-from src.db.models import ProductProject, ProductPage, PageSection, PageVersion, ProductFact, Asset, User, AgentRun
+from src.db.models import ProductProject, ProductPage, PageSection, PageVersion, ProductFact, Asset, User, AgentRun, ImageGenerationJobRecord
+from src.schemas.planning_draft import PlanningDraftSchema
+
 from src.services.page_generator import PageGenerationService
 from src.services.style_strategy_service import generate_style_candidates, get_category_frame, is_valid_style_candidate_key
 from src.services.grounding_validator import detect_claim_risks, map_section_to_facts
@@ -269,30 +271,66 @@ def get_image_candidates_for_section(
     db: Session,
     project_id: str,
 ) -> list:
-    recent_run = (
-        db.query(AgentRun)
+    job_records = (
+        db.query(ImageGenerationJobRecord)
         .filter(
-            AgentRun.project_id == project_id,
-            AgentRun.status == "completed",
+            ImageGenerationJobRecord.project_id == project_id,
+            ImageGenerationJobRecord.section_id == section.id,
         )
-        .order_by(AgentRun.completed_at.desc())
-        .first()
+        .order_by(ImageGenerationJobRecord.updated_at.desc())
+        .all()
     )
-    if not recent_run or not recent_run.outputs_json:
-        return []
+    
+    candidates = []
+    if job_records:
+        candidates = [
+            {
+                "candidate_id": job.job_id,
+                "asset_id": job.output_asset_id,
+                "label": "생성 이미지" if job.output_asset_id else "이미지 생성 대기",
+                "source_type": "ai_generated",
+                "status": job.status,
+                "prompt": job.prompt,
+            }
+            for job in job_records
+        ]
+    else:
+        recent_run = (
+            db.query(AgentRun)
+            .filter(
+                AgentRun.project_id == project_id,
+                AgentRun.status == "completed",
+            )
+            .order_by(AgentRun.completed_at.desc())
+            .first()
+        )
+        if recent_run and recent_run.outputs_json:
+            image_generation = recent_run.outputs_json.get("image_generation") or {}
+            candidates_by_slot = image_generation.get("candidates") or {}
+            slot_id = section.section_type
+            if slot_id.startswith("sec-"):
+                slot_id = {
+                    "sec-1": "hero",
+                    "sec-2": "comparison",
+                    "sec-3": "detail_1",
+                    "sec-4": "detail_2",
+                    "sec-5": "guarantee",
+                }.get(slot_id, "hero")
+            candidates = candidates_by_slot.get(slot_id) or []
 
-    image_generation = recent_run.outputs_json.get("image_generation") or {}
-    candidates_by_slot = image_generation.get("candidates") or {}
-    slot_id = section.section_type
-    if slot_id.startswith("sec-"):
-        slot_id = {
-            "sec-1": "hero",
-            "sec-2": "comparison",
-            "sec-3": "detail_1",
-            "sec-4": "detail_2",
-            "sec-5": "guarantee",
-        }.get(slot_id, "hero")
-    return candidates_by_slot.get(slot_id) or []
+    enriched_candidates = []
+    for cand in candidates:
+        cand_dict = dict(cand)
+        asset_id = cand_dict.get("asset_id")
+        if asset_id:
+            asset = db.query(Asset).filter(Asset.id == asset_id).first()
+            if asset:
+                cand_dict["source_asset_id"] = asset.source_asset_id
+                cand_dict["cutout_status"] = asset.cutout_status
+                cand_dict["background_removed"] = asset.background_removed
+                cand_dict["product_identity_preserved"] = asset.product_identity_preserved
+        enriched_candidates.append(cand_dict)
+    return enriched_candidates
 
 
 def build_section_response(section: PageSection, db: Session) -> SectionResponseSchema:
@@ -1813,3 +1851,224 @@ def process_ai_edit_command(
             "new_endpoint": f"/api/v1/projects/{project_id}/page/sections/{payload.section_id}/copy-rewrite/preview",
         },
     )
+
+
+
+@router.get("/projects/{project_id}/planning-draft", response_model=PlanningDraftSchema)
+def get_planning_draft(
+    project_id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace)
+):
+    workspace = auth_ctx["workspace"]
+    project = get_project_or_404(db, project_id, workspace.id)
+
+    if not project.planning_draft:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Planning draft not found for this project"
+        )
+
+    return PlanningDraftSchema(**project.planning_draft)
+
+
+@router.patch("/projects/{project_id}/planning-draft", response_model=PlanningDraftSchema)
+def update_planning_draft(
+    project_id: str,
+    payload: PlanningDraftSchema,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace)
+):
+    workspace = auth_ctx["workspace"]
+    project = get_project_or_404(db, project_id, workspace.id)
+
+    project.planning_draft = payload.model_dump()
+    db.commit()
+    db.refresh(project)
+
+    return PlanningDraftSchema(**project.planning_draft)
+
+
+@router.post("/projects/{project_id}/planning-draft/approve")
+def approve_planning_draft(
+    project_id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    import datetime
+    from src.db.models import DetailPageVersion, ImageGenerationJobRecord
+    from src.services.image_generation_service import execute_image_generation, sync_job_to_project_json
+
+    workspace = auth_ctx["workspace"]
+    project = get_project_or_404(db, project_id, workspace.id)
+
+    if not project.planning_draft:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="승인할 상세페이지 기획안이 없습니다.",
+        )
+
+    cards = project.planning_draft.get("cards") or []
+    enabled_cards = [card for card in cards if card.get("is_enabled", True)]
+    enabled_cards.sort(key=lambda card: card.get("sort_order", 0))
+
+    # 기존 상세페이지와 이미지 생성 job을 교체해 중복 생성을 막는다.
+    db.query(ProductPage).filter(ProductPage.project_id == project_id).delete()
+    db.query(ImageGenerationJobRecord).filter(ImageGenerationJobRecord.project_id == project_id).delete()
+    db.flush()
+
+    page = ProductPage(
+        project_id=project_id,
+        theme_color="#3B82F6",
+        font_family="sans-serif",
+    )
+    db.add(page)
+    db.flush()
+
+    version_sections = []
+    image_job_ids: list[str] = []
+
+    for idx, card in enumerate(enabled_cards):
+        visual_strategy = card.get("visual_strategy") or "text_only"
+        card_type = card.get("type") or ""
+        if card_type in {"specifications", "comparison", "pre_purchase", "product_information"}:
+            needs_image = False
+            visual_kind = "html_graphic"
+        else:
+            needs_image = visual_strategy in {"image_overlay", "lifestyle_image", "graphic_chart"}
+            visual_kind = "image" if needs_image else "html_graphic"
+        body_copy = "\n".join(card.get("bullets") or [])
+
+        section = PageSection(
+            page_id=page.id,
+            section_type=card_type or f"section_{idx + 1}",
+            title=card.get("title") or "",
+            body_copy=body_copy,
+            associated_fact_ids=card.get("source_fact_ids") or [],
+            image_asset_id=None,
+            visual_kind=visual_kind,
+            visual_payload={"strategy": visual_strategy},
+            sort_order=idx,
+            is_visible=True,
+        )
+        db.add(section)
+        db.flush()
+
+        if needs_image:
+            job_id = f"planning-{project_id}-{section.id}"
+            job_record = ImageGenerationJobRecord(
+                project_id=project_id,
+                job_id=job_id,
+                section_id=section.id,
+                role=card.get("type") or section.section_type,
+                source_asset_ids=[],
+                prompt=(
+                    f"상품명: {project.name}. 섹션 주제: {section.title}. "
+                    "상세페이지에 어울리는 깔끔한 상품/라이프스타일 이미지를 생성하세요. "
+                    "이미지 안에는 글자, 로고, 워터마크, 배지를 넣지 마세요. "
+                    "문구는 HTML/CSS 레이어에서 별도로 렌더링됩니다."
+                ),
+                negative_prompt="text, letters, logo, watermark, badge, distorted product",
+                preserve_product_identity=False,
+                output_size="1024x1024",
+                cost_tier="premium",
+                status="needs_generation",
+            )
+            db.add(job_record)
+            image_job_ids.append(job_id)
+
+        version_sections.append({
+            "id": section.id,
+            "key": section.section_type,
+            "section_type": section.section_type,
+            "title": section.title,
+            "body": body_copy,
+            "body_copy": body_copy,
+            "associated_fact_ids": section.associated_fact_ids or [],
+            "image_asset_id": None,
+            "visual_kind": visual_kind,
+            "visual_payload": section.visual_payload or {},
+            "sort_order": idx,
+            "is_visible": True,
+        })
+
+    db.flush()
+
+    generated_candidates: dict[str, list[dict[str, Any]]] = {}
+    for job_id in image_job_ids:
+        try:
+            result = execute_image_generation(project_id, job_id, db, cost_approved=True)
+            if result.output_asset_id:
+                section = (
+                    db.query(PageSection)
+                    .filter(PageSection.page_id == page.id, PageSection.id == result.section_id)
+                    .first()
+                )
+                if section:
+                    section.image_asset_id = result.output_asset_id
+                    result.status = "approved"
+                    for version_section in version_sections:
+                        if version_section["id"] == section.id:
+                            version_section["image_asset_id"] = result.output_asset_id
+                            break
+            sync_job_to_project_json(project_id, job_id, db)
+            generated_candidates.setdefault(result.role, []).append({
+                "candidate_id": result.job_id,
+                "asset_id": result.output_asset_id,
+                "label": "생성 이미지" if result.output_asset_id else "이미지 생성 대기",
+                "source_type": "ai_generated",
+                "status": result.status,
+            })
+        except Exception as exc:
+            logger.warning("Planning draft image generation failed for %s: %s", job_id, exc)
+
+    run = (
+        db.query(AgentRun)
+        .filter(AgentRun.project_id == project_id)
+        .order_by(AgentRun.created_at.desc())
+        .first()
+    )
+    if run:
+        run.status = "completed"
+        run.current_stage = "review_editor"
+        run.outputs_json = {
+            "sales_strategy": {
+                "hook_headline": enabled_cards[0].get("title") if enabled_cards else "상세페이지 초안",
+                "tone_and_manner": "쉽고 신뢰감 있는 판매 톤",
+            },
+            "visual_plan": {"color_palette": ["#3B82F6", "#FFFFFF"]},
+            "image_generation": {"candidates": generated_candidates},
+            "page_assembly": {
+                "sections": [
+                    {
+                        "id": section["id"],
+                        "title": section["title"],
+                        "body": section["body_copy"],
+                        "visual_role": section["section_type"],
+                        "image_id": None,
+                    }
+                    for section in version_sections
+                ]
+            },
+        }
+        run.completed_at = datetime.datetime.utcnow()
+        db.add(run)
+
+    db.add(
+        DetailPageVersion(
+            project_id=project_id,
+            name="AI 생성 상세페이지",
+            style_key="problem_solution",
+            sections_json=version_sections,
+            is_final=True,
+        )
+    )
+
+    project.status = "ready"
+    db.commit()
+
+    return {
+        "status": "success",
+        "message": "상세페이지 기획안을 승인하고 이미지 생성을 시작했습니다.",
+        "image_job_count": len(image_job_ids),
+    }

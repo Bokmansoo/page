@@ -1,5 +1,6 @@
 import os
 import uuid
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
@@ -21,6 +22,10 @@ class AssetResponseSchema(BaseModel):
     file_path: str
     mime_type: str
     file_size: int
+    source_asset_id: Optional[str] = None
+    cutout_status: Optional[str] = None
+    background_removed: bool = False
+    product_identity_preserved: bool = True
 
     model_config = ConfigDict(from_attributes=True)
 

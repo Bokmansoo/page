@@ -111,6 +111,22 @@ export default function ReviewEditorLayout({
       <header className="sticky top-0 z-30 border-b border-slate-200 bg-white/95 backdrop-blur px-8 py-4">
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-4">
           <div className="flex items-center gap-4">
+            <div aria-label="page history navigation" className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => window.history.back()}
+                className="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-bold text-slate-600 hover:border-emerald-200 hover:text-emerald-700"
+              >
+                ← 이전
+              </button>
+              <button
+                type="button"
+                onClick={() => window.history.forward()}
+                className="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-bold text-slate-600 hover:border-emerald-200 hover:text-emerald-700"
+              >
+                다음 →
+              </button>
+            </div>
             <button
               type="button"
               onClick={onBack}

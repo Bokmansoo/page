@@ -6,11 +6,13 @@ import StructuredIntakeReview from "./StructuredIntakeReview";
 import GenerationDuplicateRunDialog, { DuplicateRunDetail } from "./GenerationDuplicateRunDialog";
 import { apiUrl, structureIntake, StructuredIntakeDraft } from "@/lib/api";
 import { useRouter, useSearchParams } from "next/navigation";
+import PlanningModeSelector from "./planning/PlanningModeSelector";
 
 export default function AIDetailPageIntake() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const [productName, setProductName] = useState("");
+  const [planningMode, setPlanningMode] = useState<"quality" | "quick">("quality");
   const [description, setDescription] = useState("");
   const [productUrl, setProductUrl] = useState("");
   const [referenceUrlsText, setReferenceUrlsText] = useState("");
@@ -135,6 +137,7 @@ export default function AIDetailPageIntake() {
           price: confirmedDraft?.price?.value || "",
           shipping: confirmedDraft?.shipping?.value || "",
           desired_mood: confirmedDraft?.desired_mood || [selectedPreset],
+          planning_mode: planningMode,
         }),
       });
 
@@ -170,7 +173,11 @@ export default function AIDetailPageIntake() {
       if (typeof window !== "undefined") {
         sessionStorage.setItem("sellform:lastGenerationRunId", data.id);
       }
-      router.push(`/workspace?runId=${data.id}`);
+      if (planningMode === "quality") {
+        router.push(`/workspace/projects/${data.project_id}/planning`);
+      } else {
+        router.push(`/workspace?runId=${data.id}`);
+      }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "연결 오류가 발생했습니다.");
     } finally {
@@ -382,6 +389,9 @@ export default function AIDetailPageIntake() {
             ))}
           </div>
         </div>
+
+        {/* Planning Mode Selection */}
+        <PlanningModeSelector mode={planningMode} onChange={setPlanningMode} />
 
         {/* CTA Button */}
         <button

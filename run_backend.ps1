@@ -42,6 +42,8 @@ try {
 }
 
 $env:DATABASE_URL = $DatabaseUrl
+# Avoid Windows permission errors from stale/locked __pycache__ files during local dev.
+$env:PYTHONDONTWRITEBYTECODE = "1"
 
 Write-Host "Starting Sellform backend" -ForegroundColor Green
 Write-Host "  URL:      http://$HostName`:$Port"

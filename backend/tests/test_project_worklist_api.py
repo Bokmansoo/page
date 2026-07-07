@@ -17,7 +17,7 @@ def test_project_worklist_returns_generated_pages(client):
     item = body["items"][0]
     assert item["project_id"]
     assert item["project_name"]
-    assert item["status"] in ["generating", "needs_review", "completed", "failed"]
+    assert item["status"] == "completed"
     assert item["result_url"].startswith(f"/workspace/projects/{item['project_id']}")
     assert item["review_url"].startswith(f"/workspace/projects/{item['project_id']}")
     assert item["export_history_url"].startswith("/workspace/exports")

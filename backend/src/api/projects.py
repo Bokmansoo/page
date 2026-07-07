@@ -49,6 +49,10 @@ class AssetResponseSchema(BaseModel):
     file_path: str
     mime_type: str
     file_size: int
+    source_asset_id: Optional[str] = None
+    cutout_status: Optional[str] = None
+    background_removed: bool = False
+    product_identity_preserved: bool = True
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -105,12 +109,12 @@ def _normalize_worklist_status(project: ProductProject) -> str:
     status = (project.status or "").lower()
     if status in {"completed", "needs_review", "failed", "generating"}:
         return status
+    if project.pages:
+        return "completed"
     if status in {"draft", "processing", "checking", "running", "pending"}:
         return "generating"
     if status in {"ready", "review", "reviewing"}:
         return "needs_review"
-    if project.pages:
-        return "completed"
     return "generating"
 
 
@@ -418,6 +422,10 @@ class ProjectAssetResponse(BaseModel):
     file_path: str
     mime_type: str
     file_size: int
+    source_asset_id: Optional[str] = None
+    cutout_status: Optional[str] = None
+    background_removed: bool = False
+    product_identity_preserved: bool = True
 
     model_config = ConfigDict(from_attributes=True)
 

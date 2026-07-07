@@ -171,7 +171,7 @@ def execute_image_generation(
 
     provider = provider_override
     if not provider:
-        if settings.SELLFORM_GENERATION_MODE == "real":
+        if settings.SELLFORM_IMAGE_GENERATION_MODE == "real":
             provider = OpenAIImageProvider(model=record.model)
         else:
             from src.services.image_generation_provider import MockImageGenerationProvider

@@ -2,7 +2,7 @@
 
 import React, { useEffect, useState } from "react";
 import ProjectWorklist from "@/components/ProjectWorklist";
-import { fetchProjectWorklist, ProjectWorklistItem } from "@/lib/projectWorklist";
+import { fetchProjectWorklist, ProjectWorklistItem } from "@/lib/projectWorklistCompat";
 
 export default function WorkspaceProjectsPage() {
   const [items, setItems] = useState<ProjectWorklistItem[]>([]);
@@ -17,6 +17,7 @@ export default function WorkspaceProjectsPage() {
       setItems(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : "작업 목록을 불러오지 못했습니다.");
+      setItems([]);
     } finally {
       setLoading(false);
     }

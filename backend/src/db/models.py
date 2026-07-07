@@ -80,6 +80,8 @@ class ProductProject(Base):
     style_candidates_snapshot = Column(JSON, nullable=True)  # list of style candidate dicts from last generation
     style_generation = Column(Integer, nullable=False, default=0)  # increments on each regeneration
     visual_package_jobs = Column(JSON, nullable=True)  # visual package planned/needs_generation image jobs
+    planning_mode = Column(String(20), nullable=False, default="quality")
+    planning_draft = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
@@ -105,6 +107,11 @@ class Asset(Base):
     mime_type = Column(String(100), nullable=False)
     file_size = Column(Integer, nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    source_asset_id = Column(String(36), ForeignKey("assets.id"), nullable=True)
+    cutout_status = Column(String(50), nullable=True)
+    background_removed = Column(Boolean, default=False)
+    product_identity_preserved = Column(Boolean, default=True)
 
     project = relationship("ProductProject", back_populates="assets")
 

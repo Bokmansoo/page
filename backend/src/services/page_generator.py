@@ -61,7 +61,23 @@ class PageGenerationService:
         # API Key가 없는 경우 또는 Mock 동작 조건 시 Mock 응답 제공 (안전장치)
         if not self.client or settings.FACTORY_RAG_RUNTIME_MOCK:
             logger.info("Mocking Claude 3.5 Sonnet page generation response.")
-            return self._get_mock_page(category, confirmed_facts, primary_color, narrative_template, sales_strategy)
+            page = self._get_mock_page(category, confirmed_facts, primary_color, narrative_template, sales_strategy)
+
+            from src.services.copy_quality_guard import CopyQualityGuard
+
+            guard = CopyQualityGuard()
+            for section in page.sections:
+                section.title = guard.clean_text(section.title)
+                section.body_copy = guard.clean_text(section.body_copy)
+
+                is_valid_title, _title_reason = guard.validate_title(section.title)
+                if not is_valid_title:
+                    section.title = guard.get_default_copy(section.section_type, category)["title"]
+
+                is_valid_body, _body_reason = guard.validate_text(section.body_copy)
+                if not is_valid_body:
+                    section.body_copy = guard.get_default_copy(section.section_type, category)["bullets"][0]
+            return page
 
 
         narrative_instruction = self._get_narrative_template_instruction(narrative_template, category)
@@ -73,7 +89,9 @@ class PageGenerationService:
             "규칙:\n"
             "1. 본문 카피는 절대로 지어내거나 입증되지 않은 정보를 포함해서는 안 됩니다. 오직 제공된 확정 사실들(confirmed facts)만을 근거로 작성하십시오.\n"
             "2. 각 섹션마다 카피 작성에 사용된 사실들의 ID(UUID)를 associated_fact_ids 필드에 매핑하여 출력하십시오. 사실을 임의로 왜곡하여 매핑해서는 안 됩니다.\n"
-            "3. 한국어로만 작성하고, 문체는 친근하면서도 신뢰감을 주는 서술형 및 설득형 문장을 구사하십시오."
+            "3. 한국어로만 작성하고, 문체는 친근하면서도 신뢰감을 주는 서술형 및 설득형 문장을 구사하십시오.\n"
+            "4. 소비자가 읽는 최종 상세페이지 문구이므로 AI 내부 지시문이나 기획 안내 문장을 노출하지 마십시오.\n"
+            "5. 과장된 최상급 표현, 이색 마커(+, -, [AI 수정됨])를 사용하지 마십시오."
         )
 
         # 팩트 데이터를 텍스트로 가공
@@ -312,7 +330,9 @@ class PageGenerationService:
 
         color = primary_color or "#3B82F6"
         fact_ids = [f["id"] for f in confirmed_facts]
-        fact_summary = self._short_fact_summary(confirmed_facts) if confirmed_facts else "확인된 상품 정보를 기준으로 구성했습니다."
+        fact_summary = self._short_fact_summary(confirmed_facts) if confirmed_facts else f"{category}의 확인된 정보를 소개합니다."
+        all_fact_text = " ".join([f.get("fact_text", "") for f in confirmed_facts]).strip()
+        product_phrase = fact_summary.rstrip(".") or category
         category_key = category.lower()
 
         # Get the category frame sections
@@ -329,37 +349,37 @@ class PageGenerationService:
         for idx, sec_frame in enumerate(frame.sections):
             # Default text based on section type
             title = sec_frame.label
-            body_copy = f"{sec_frame.description} {fact_summary}"
+            body_copy = f"{product_phrase}의 특징을 구매자가 이해하기 쉽게 설명합니다."
             
             # If it's the first section, customize its title
             if idx == 0:
                 problem_title_by_category = {
-                    "fashion": "매일 입을 옷, 예쁘기만 하면 충분할까요?",
+                    "fashion": "매일 입을 옷, 편안함까지 챙기고 싶다면",
                     "beauty": "피부 고민, 아무 제품이나 고르기 어려우니까",
-                    "food": "매일 먹는 것일수록 원재료 and 편의성이 중요합니다",
-                    "living": "작은 불편이 쌓이면 일상이 번거로워집니다",
+                    "food": "매일 먹는 것일수록 원재료와 편의성이 중요합니다",
+                    "living": "더운 순간, 콘센트를 찾느라 시간을 쓰고 싶지 않다면",
                 }
-                title = problem_title_by_category.get(category_key, "이 상품이 필요한 이유부터 짚어볼게요")
-                body_copy = buyer_problem or "고객이 실제로 느끼는 불편과 구매 전 고민을 먼저 짚어줍니다."
+                title = problem_title_by_category.get(category_key, "이 상품이 필요한 이유부터 확인해보세요")
+                body_copy = buyer_problem or f"{product_phrase}라면 필요한 순간 바로 꺼내 쓰는 선택지가 됩니다."
 
             elif idx == 1:
-                title = main_selling_point or "핵심 문제를 줄여주는 선택"
-                body_copy = f"이 상품은 확인된 상품 정보를 바탕으로 핵심 구매 이유를 제안합니다. {fact_summary}"
+                title = main_selling_point or f"{product_phrase}로 바로 체감하는 사용 편의"
+                body_copy = f"{product_phrase}라는 점이 구매자가 가장 먼저 이해해야 할 핵심 이유입니다."
             elif idx == 2:
-                title = "함께 챙길 수 있는 추가 장점"
-                body_copy = "메인 소구점 외에도 사용자가 체감할 수 있는 보조 장점을 정리합니다."
+                title = "책상, 차량, 야외까지 쓰임새가 넓어집니다"
+                body_copy = f"{all_fact_text or product_phrase} 상황에 맞춰 이동하며 쓰기 좋은 구성을 강조합니다."
             elif idx == 3:
-                title = "왜 이 상품이어야 할까요?"
-                body_copy = "핵심 메시지를 다시 한 번 근거 중심으로 보강합니다."
+                title = "손에 들고 바로 쓰는 간편함"
+                body_copy = f"{product_phrase}의 사용 맥락을 실제 생활 장면과 연결해 구매 이해를 돕습니다."
             elif idx == 4:
-                title = "구매 전 확인할 장점들"
-                body_copy = "나머지 장점을 보기 쉽게 정리해 구매 판단을 돕습니다."
+                title = "비교할 때 먼저 보게 되는 차이를 분명하게"
+                body_copy = f"{product_phrase}의 장점을 사용 장소와 사용 방식 중심으로 쉽게 비교할 수 있습니다."
             elif idx == 5:
-                title = "한 문장으로 정리하면"
-                body_copy = "필요한 이유와 기대할 수 있는 장점을 한 문장으로 요약합니다."
+                title = "구매 이유를 한 문장으로 다시 확인하세요"
+                body_copy = f"{product_phrase}는 필요한 순간 바로 쓰기 위한 실용적인 선택입니다."
             elif idx == 6:
-                title = "상품 정보"
-                body_copy = "최종 구매 판단에 필요한 정보입니다. " + " ".join([f["fact_text"] for f in confirmed_facts])
+                title = "구매 전 스펙과 사용 조건을 꼭 확인하세요"
+                body_copy = all_fact_text or f"{product_phrase}의 구성과 사용 조건을 구매 전 확인하세요."
 
             sections.append(GeneratedSectionSchema(
                 section_type=sec_frame.key,
@@ -376,28 +396,28 @@ class PageGenerationService:
 
         category_copy = {
             "fashion": (
-                "코디와 착용 부담을 덜어주는 선택",
-                "착용감과 활용도에 대한 고민을 확인된 상품 정보로 풀어봅니다.",
+                f"{product_phrase}로 코디와 착용 부담을 줄이세요",
+                f"{product_phrase}의 착용감과 활용도를 중심으로 선택 이유를 보여줍니다.",
                 "스타일에 더하는 실용적인 장점",
             ),
             "beauty": (
-                "성분과 사용 정보를 보고 고르는 선택",
-                "사용 전 확인하고 싶은 정보를 확인된 상품 사실로 정리합니다.",
+                f"{product_phrase}로 루틴을 더 간편하게",
+                f"{product_phrase}의 사용감과 확인 가능한 정보를 중심으로 구매 이유를 설명합니다.",
                 "루틴에 더하는 사용 편의",
             ),
             "food": (
-                "원재료와 구성 정보를 보고 고르는 선택",
-                "식품을 고를 때 필요한 정보를 확인된 상품 사실로 정리합니다.",
+                f"{product_phrase}로 식탁 준비를 더 쉽게",
+                f"{product_phrase}의 원재료와 구성 정보를 중심으로 선택 이유를 설명합니다.",
                 "식탁에 더하는 선택의 이유",
             ),
             "living": (
-                "일상의 불편을 덜어주는 실용적인 선택",
-                "사용 환경에서 확인할 정보를 확인된 상품 사실로 정리합니다.",
-                "공간과 사용 경험에 더하는 장점",
+                f"{product_phrase}로 더운 순간을 가볍게 넘기세요",
+                f"{product_phrase}의 사용 장면과 장점을 바로 이해할 수 있게 보여줍니다.",
+                "공간을 옮겨도 이어지는 시원함",
             ),
         }.get(category_key, (
-            "확인된 정보로 고르는 선택",
-            "구매 전에 확인할 정보를 상품 사실로 정리합니다.",
+            f"{product_phrase}로 필요한 순간을 준비하세요",
+            f"{product_phrase}의 구매 이유를 사실 중심으로 보여줍니다.",
             "함께 확인할 추가 장점",
         ))
         page.sections[1].title = category_copy[0]

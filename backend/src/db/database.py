@@ -65,6 +65,10 @@ def ensure_runtime_schema_compatibility() -> None:
                 connection.execute(text("ALTER TABLE product_projects ADD COLUMN style_generation INTEGER NOT NULL DEFAULT 0"))
             if "visual_package_jobs" not in existing_project_columns:
                 connection.execute(text("ALTER TABLE product_projects ADD COLUMN visual_package_jobs JSON"))
+            if "planning_mode" not in existing_project_columns:
+                connection.execute(text("ALTER TABLE product_projects ADD COLUMN planning_mode VARCHAR(20) NOT NULL DEFAULT 'quality'"))
+            if "planning_draft" not in existing_project_columns:
+                connection.execute(text("ALTER TABLE product_projects ADD COLUMN planning_draft JSON"))
 
     if "figma_export_jobs" in table_names:
         existing_figma_columns = {
@@ -83,6 +87,18 @@ def ensure_runtime_schema_compatibility() -> None:
                 connection.execute(text("ALTER TABLE page_sections ADD COLUMN visual_kind VARCHAR(30)"))
             if "visual_payload" not in existing_section_columns:
                 connection.execute(text("ALTER TABLE page_sections ADD COLUMN visual_payload JSON"))
+
+    if "assets" in table_names:
+        existing_assets_columns = {column["name"] for column in inspector.get_columns("assets")}
+        with engine.begin() as connection:
+            if "source_asset_id" not in existing_assets_columns:
+                connection.execute(text("ALTER TABLE assets ADD COLUMN source_asset_id VARCHAR(36)"))
+            if "cutout_status" not in existing_assets_columns:
+                connection.execute(text("ALTER TABLE assets ADD COLUMN cutout_status VARCHAR(50)"))
+            if "background_removed" not in existing_assets_columns:
+                connection.execute(text("ALTER TABLE assets ADD COLUMN background_removed BOOLEAN DEFAULT FALSE"))
+            if "product_identity_preserved" not in existing_assets_columns:
+                connection.execute(text("ALTER TABLE assets ADD COLUMN product_identity_preserved BOOLEAN DEFAULT TRUE"))
 
     if "agent_runs" not in table_names or "agent_run_steps" not in table_names:
         Base.metadata.create_all(bind=engine)

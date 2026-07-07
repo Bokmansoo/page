@@ -71,33 +71,26 @@ interface FinalPageVersion {
 
 type ExportImageFormat = "png" | "jpg";
 
-function safeExportFilename(name: string): string {
-  const sanitized = name
-    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
-    .replace(/[. ]+$/g, "")
-    .trim();
-  return sanitized || "sellform-detail-page";
+function slugify(text: string): string {
+  return text
+    .toString()
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^\wㄱ-ㅎㅏ-ㅣ가-힣\-]+/g, "")
+    .replace(/\-\-+/g, "-")
+    .replace(/^-+/, "")
+    .replace(/-+$/, "");
 }
-export function removedLegacyFilePickerComment(): null {
-  return null;
-/*
-  const picker = (
-    window as typeof window
-  );
-  if (!picker) return null;
 
-  const mimeType = format === "jpg" ? "image/jpeg" : "image/png";
-  return picker.call(window, {
-    suggestedName: filename,
-    types: [
-      {
-        description: `${format.toUpperCase()} 이미지`,
-        accept: { [mimeType]: [`.${format}`] },
-      },
-    ],
-    excludeAcceptAllOption: true,
-  });
-  */
+function downloadBlob(blob: Blob, filename: string) {
+  const blobUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = blobUrl;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
 }
 
 const MOCK_HEADERS = {
@@ -280,9 +273,8 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
       setExportError("다운로드 전에 이미지 후보를 확인해 주세요.");
       return;
     }
-    const fallbackFilename = `${safeExportFilename(
-      project?.name || "sellform-detail-page"
-    )}.${format}`;
+    const nameSlug = slugify(project?.name || "sellform-detail-page");
+    const fallbackFilename = `${nameSlug}-상세페이지.${format}`;
 
     setExporting(true);
     setExportStage("finalizing");
@@ -312,6 +304,7 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
           output_format: format,
           export_target: "local_download",
           final_version_id: finalVersion.id,
+          render_base_url: window.location.origin,
         }),
       });
       if (!createRes.ok) {
@@ -370,14 +363,7 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
       }
       setExportStage("saving");
       const blob = await fileRes.blob();
-      const blobUrl = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = blobUrl;
-      link.download = filename;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+      downloadBlob(blob, filename);
     } catch (err) {
       setExportError(
         err instanceof TypeError && err.message === "Failed to fetch"
@@ -430,6 +416,22 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
       message,
     }))
   );
+  const worklistHref = "/workspace/projects";
+  const planningHref = `/workspace/projects/${projectId}/planning`;
+  const reviewHref = `/workspace/projects/${projectId}/page-editor?mode=review`;
+  const advancedHref = `/workspace/projects/${projectId}/page-editor?mode=advanced`;
+  const handleHistoryBack = () => {
+    if (typeof window !== "undefined" && window.history.length > 1) {
+      router.back();
+      return;
+    }
+    router.push(worklistHref);
+  };
+  const handleHistoryForward = () => {
+    if (typeof window !== "undefined") {
+      window.history.forward();
+    }
+  };
 
   return (
     <div className="min-h-screen bg-white text-slate-800">
@@ -448,15 +450,43 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <div aria-label="page history navigation" className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={handleHistoryBack}
+              className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-bold text-slate-600 hover:bg-slate-50"
+            >
+              ← 이전
+            </button>
+            <button
+              type="button"
+              onClick={handleHistoryForward}
+              className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-bold text-slate-600 hover:bg-slate-50"
+            >
+              다음 →
+            </button>
+          </div>
           <Link
-            href={`/workspace/projects/${projectId}/page-editor?mode=review`}
-            className="rounded-lg bg-emerald-600 px-4 py-2 text-xs font-bold text-white hover:bg-emerald-700"
+            href={worklistHref}
+            className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-xs font-bold text-slate-600 hover:bg-slate-50"
           >
-            검수하며 다듬기
+            작업 목록
           </Link>
           <Link
-            href={`/workspace/projects/${projectId}/page-editor?mode=advanced`}
+            href={planningHref}
+            className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50"
+          >
+            ← 이전 단계
+          </Link>
+          <Link
+            href={reviewHref}
+            className="rounded-lg bg-emerald-600 px-4 py-2 text-xs font-bold text-white hover:bg-emerald-700"
+          >
+            다음: 검수하며 다듬기 →
+          </Link>
+          <Link
+            href={advancedHref}
             className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50"
           >
             고급 편집기로 열기

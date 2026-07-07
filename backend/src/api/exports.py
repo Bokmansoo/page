@@ -64,6 +64,63 @@ class ExportJobResponse(BaseModel):
 # Helper functions
 # =====================================================================
 
+def slugify(text: str) -> str:
+    import re
+    text = text.strip()
+    text = re.sub(r'\s+', '-', text)
+    text = re.sub(r'[^\wㄱ-ㅎㅏ-ㅣ가-힣\-]', '', text)
+    text = re.sub(r'\-+', '-', text)
+    return text.strip("-").lower()
+
+
+def _image_format_from_asset(asset: Optional[Asset]) -> Optional[str]:
+    if not asset:
+        return None
+    filename = asset.filename.lower()
+    if asset.mime_type == "image/png" or filename.endswith(".png"):
+        return "png"
+    if asset.mime_type == "image/jpeg" or filename.endswith(".jpg") or filename.endswith(".jpeg"):
+        return "jpg"
+    return None
+
+
+def _asset_id_from_download_url(url: str) -> Optional[str]:
+    marker = "/page/export/download/"
+    if marker not in url:
+        return None
+    return url.rstrip("/").split(marker, 1)[1].split("?", 1)[0]
+
+
+def _exported_image_asset_for_job(db: Session, job: ExportJob) -> Optional[Asset]:
+    output_asset_ids = [
+        asset_id
+        for asset_id in (_asset_id_from_download_url(url) for url in (job.output_images or []))
+        if asset_id
+    ]
+    if output_asset_ids:
+        asset = (
+            db.query(Asset)
+            .filter(
+                Asset.project_id == job.project_id,
+                Asset.source_type == "exported_image",
+                Asset.id.in_(output_asset_ids),
+            )
+            .first()
+        )
+        if asset:
+            return asset
+
+    return (
+        db.query(Asset)
+        .filter(
+            Asset.project_id == job.project_id,
+            Asset.source_type == "exported_image",
+        )
+        .order_by(Asset.created_at.desc())
+        .first()
+    )
+
+
 def should_block_export(compliance: Dict[str, Any], export_target: str) -> bool:
     return not compliance["can_export"] and export_target != "local_download"
 
@@ -153,12 +210,14 @@ def run_export_task(
 
         # 5. 긴 세로 이미지도 Asset 모델로 영구 등록 및 output_images 지정
         long_size = os.path.getsize(long_image_path)
-        long_filename = os.path.basename(long_image_path)
+        project_name = project.name if project and project.name else "sellform-detail-page"
+        project_slug = slugify(project_name)
+        export_filename = f"{project_slug}-상세페이지.{output_format}"
         
         long_asset = Asset(
             project_id=project_id,
             source_type="exported_image",
-            filename=long_filename,
+            filename=export_filename,
             file_path=long_image_path,
             mime_type="image/jpeg" if output_format in {"jpg", "jpeg"} else "image/png",
             file_size=long_size
@@ -346,12 +405,15 @@ def download_export_file(
     if not os.path.exists(asset.file_path):
         raise HTTPException(status_code=404, detail="File has been deleted or not ready on disk")
 
+    from urllib.parse import quote
+    encoded_filename = quote(asset.filename)
+    _, ext = os.path.splitext(asset.filename)
+    fallback_ascii = f"detail-page{ext}"
     return FileResponse(
         path=asset.file_path,
-        filename=asset.filename,
         media_type=asset.mime_type,
         headers={
-            "Content-Disposition": f'attachment; filename="{asset.filename}"',
+            "Content-Disposition": f"attachment; filename=\"{fallback_ascii}\"; filename*=UTF-8''{encoded_filename}",
         },
     )
 
@@ -369,19 +431,24 @@ def get_sales_package(
     return SalesPackageService.get_sales_package(project_id, db)
 
 
-def _to_export_history_item(job: ExportJob) -> ExportHistoryItem:
+def _to_export_history_item(job: ExportJob, db: Session) -> ExportHistoryItem:
     download_url = None
     if job.output_images and len(job.output_images) > 0:
         download_url = job.output_images[0]
+
+    image_asset = _exported_image_asset_for_job(db, job)
+    image_format = _image_format_from_asset(image_asset)
+    if image_asset:
+        download_url = f"/api/v1/projects/{job.project_id}/page/export/download/{image_asset.id}"
 
     return ExportHistoryItem(
         id=job.id,
         project_id=job.project_id,
         project_name=job.project.name if job.project else "",
-        format=job.preset_name,
+        format=image_format or job.preset_name,
         status=job.status,
-        filename=f"{job.project.name if job.project else 'export'}.{job.preset_name}" if job.preset_name in ("png", "jpg") else None,
-        content_type=f"image/{job.preset_name}" if job.preset_name in ("png", "jpg") else None,
+        filename=image_asset.filename if image_asset else None,
+        content_type=image_asset.mime_type if image_asset else None,
         download_url=download_url,
         error_message=job.error_message,
         created_at=job.created_at.isoformat() if job.created_at else "",
@@ -403,4 +470,4 @@ def list_export_history(
         .limit(100)
         .all()
     )
-    return ExportHistoryResponse(items=[_to_export_history_item(job) for job in jobs])
+    return ExportHistoryResponse(items=[_to_export_history_item(job, db) for job in jobs])

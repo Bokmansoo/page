@@ -1,7 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import type { ProjectWorklistItem, ProjectWorklistStatus } from "@/lib/projectWorklist";
+import { useMemo, useState } from "react";
+import { apiUrl } from "@/lib/api";
+import type { ProjectWorklistItem, ProjectWorklistStatus } from "@/lib/projectWorklistCompat";
 
 const statusLabels: Record<ProjectWorklistStatus, { label: string; className: string }> = {
   generating: {
@@ -38,6 +40,37 @@ function statusBadge(status: ProjectWorklistStatus) {
   );
 }
 
+function resolveThumbnailUrl(url: string | null): string | null {
+  if (!url) return null;
+  if (/^(https?:|data:|blob:)/i.test(url)) return url;
+  return apiUrl(url);
+}
+
+function ProjectThumbnail({ src, name }: { src: string | null; name: string }) {
+  const [failed, setFailed] = useState(false);
+  const thumbnailUrl = useMemo(() => resolveThumbnailUrl(src), [src]);
+
+  if (!thumbnailUrl || failed) {
+    return (
+      <div className="flex h-20 w-20 shrink-0 items-center justify-center rounded-2xl bg-slate-100 text-xs font-extrabold text-slate-400">
+        NO IMG
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-20 w-20 shrink-0 items-center justify-center overflow-hidden rounded-2xl border border-slate-100 bg-slate-100">
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={thumbnailUrl}
+        alt={`${name} 썸네일`}
+        className="h-full w-full object-cover"
+        onError={() => setFailed(true)}
+      />
+    </div>
+  );
+}
+
 export default function ProjectWorklist({ items }: { items: ProjectWorklistItem[] }) {
   if (items.length === 0) {
     return (
@@ -68,16 +101,9 @@ export default function ProjectWorklist({ items }: { items: ProjectWorklistItem[
           key={item.project_id}
           className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm transition hover:border-emerald-200 hover:shadow-md"
         >
-          <div className="flex flex-col gap-5 md:flex-row md:items-center md:justify-between">
-            <div className="flex min-w-0 items-start gap-4">
-              <div className="flex h-16 w-16 shrink-0 items-center justify-center overflow-hidden rounded-2xl bg-slate-100">
-                {item.thumbnail_url ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={item.thumbnail_url} alt="" className="h-full w-full object-cover" />
-                ) : (
-                  <span className="text-xs font-bold text-slate-400">NO IMG</span>
-                )}
-              </div>
+          <div className="grid gap-5 lg:grid-cols-[80px_minmax(0,1fr)_auto] lg:items-center">
+            <div className="flex min-w-0 items-start gap-4 lg:contents">
+              <ProjectThumbnail src={item.thumbnail_url} name={item.project_name} />
               <div className="min-w-0">
                 <div className="mb-2 flex flex-wrap items-center gap-2">
                   {statusBadge(item.status)}
@@ -92,11 +118,11 @@ export default function ProjectWorklist({ items }: { items: ProjectWorklistItem[
               </div>
             </div>
 
-            <div className="flex flex-wrap gap-2 md:justify-end">
+            <div className="grid gap-2 sm:grid-cols-3 lg:w-[420px]">
               {item.result_url && (
                 <Link
                   href={item.result_url}
-                  className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-bold text-slate-700 hover:bg-slate-50"
+                  className="flex h-12 items-center justify-center whitespace-nowrap rounded-xl border border-slate-200 px-4 text-sm font-bold text-slate-700 hover:bg-slate-50"
                 >
                   결과 보기
                 </Link>
@@ -104,14 +130,14 @@ export default function ProjectWorklist({ items }: { items: ProjectWorklistItem[
               {item.review_url && (
                 <Link
                   href={item.review_url}
-                  className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm font-bold text-emerald-700 hover:bg-emerald-100"
+                  className="flex h-12 items-center justify-center whitespace-nowrap rounded-xl border border-emerald-200 bg-emerald-50 px-4 text-sm font-bold text-emerald-700 hover:bg-emerald-100"
                 >
                   검수하며 다듬기
                 </Link>
               )}
               <Link
                 href={item.export_history_url}
-                className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-bold text-white hover:bg-slate-800"
+                className="flex h-12 items-center justify-center whitespace-nowrap rounded-xl bg-slate-900 px-4 text-sm font-bold text-white hover:bg-slate-800"
               >
                 출력 이력
               </Link>

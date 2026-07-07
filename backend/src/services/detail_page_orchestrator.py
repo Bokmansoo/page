@@ -318,6 +318,21 @@ class DetailPageOrchestrator:
         if not project.raw_input_text and not project.raw_input_url and not DetailPageOrchestrator._has_manual_input_or_photos(project, db):
             return DetailPageOrchestrator._set_status(project, db, "failed_needs_input")
 
+        # Auto-generate cutout assets for self_shot assets uploaded to the project
+        from src.services.product_cutout_service import ProductCutoutService
+        assets = db.query(Asset).filter(
+            Asset.project_id == project.id,
+            Asset.source_type == "self_shot"
+        ).all()
+        cutout_service = ProductCutoutService(db)
+        for asset in assets:
+            exists = db.query(Asset).filter(Asset.source_asset_id == asset.id).first()
+            if not exists:
+                try:
+                    cutout_service.generate_cutout(asset.id)
+                except Exception as e:
+                    logger.error(f"Auto-generating cutout failed for asset {asset.id}: {e}")
+
         if project.raw_input_url and "fail" in project.raw_input_url and not DetailPageOrchestrator._has_manual_input_or_photos(project, db):
             return DetailPageOrchestrator._set_status(project, db, "failed_needs_input")
 

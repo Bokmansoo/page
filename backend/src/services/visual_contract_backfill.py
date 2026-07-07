@@ -13,6 +13,9 @@ LAYOUT_BY_SECTION: dict[str, str] = {
     "detail_1": "benefit_cards",
     "guarantee": "spec_table",
     "hero": "hero_overlay",
+    "specifications": "spec_table",
+    "pre_purchase": "benefit_cards",
+    "product_information": "spec_table",
 }
 
 

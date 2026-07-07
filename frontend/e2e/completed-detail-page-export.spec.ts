@@ -159,10 +159,12 @@ test("shows a completed page and downloads PNG/JPG via browser download", async 
     `**/api/v1/projects/${projectId}/page/export/download/**`,
     async (route) => {
       const requestedFormat = route.request().url().endsWith("jpg") ? "jpg" : "png";
+      const filename = `삼탠바이미-상세페이지.${requestedFormat}`;
+      const encodedFilename = encodeURIComponent(filename);
       await route.fulfill({
         contentType: requestedFormat === "jpg" ? "image/jpeg" : "image/png",
         headers: {
-          "Content-Disposition": `attachment; filename="sellform-long.${requestedFormat}"`,
+          "Content-Disposition": `attachment; filename="${filename}"; filename*=UTF-8''${encodedFilename}`,
         },
         body: Buffer.from(`${requestedFormat}-download`),
       });
@@ -179,12 +181,12 @@ test("shows a completed page and downloads PNG/JPG via browser download", async 
   await page.getByLabel("저장 형식").selectOption("png");
   await page.getByRole("button", { name: "PNG로 다운로드" }).click();
   const pngDownload = await pngDownloadPromise;
-  expect(pngDownload.suggestedFilename()).toMatch(/\.png$/);
+  expect(pngDownload.suggestedFilename()).toBe("삼탠바이미-상세페이지.png");
 
   // Test JPG download via browser download event
   const jpgDownloadPromise = page.waitForEvent("download");
   await page.getByLabel("저장 형식").selectOption("jpg");
   await page.getByRole("button", { name: "JPG로 다운로드" }).click();
   const jpgDownload = await jpgDownloadPromise;
-  expect(jpgDownload.suggestedFilename()).toMatch(/\.jpg$/);
+  expect(jpgDownload.suggestedFilename()).toBe("삼탠바이미-상세페이지.jpg");
 });

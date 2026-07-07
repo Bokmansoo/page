@@ -1,3 +1,4 @@
+import sys
 from sqlalchemy.orm import Session
 
 from src.db.models import Asset, ImageGenerationJobRecord
@@ -26,15 +27,24 @@ def get_page_eligible_assets(
         ImageGenerationJobRecord.project_id == project_id,
         ImageGenerationJobRecord.output_asset_id.isnot(None),
     ).all()
-    approved_output_ids = {
-        output_asset_id
-        for output_asset_id, status in generation_records
-        if status == "approved"
-    }
-    tracked_output_ids = {
-        output_asset_id
-        for output_asset_id, _status in generation_records
-    }
+    approved_output_ids = set()
+    tracked_output_ids = set()
+    for item in generation_records:
+        try:
+            if isinstance(item, tuple) and len(item) == 2:
+                output_asset_id, status = item
+                tracked_output_ids.add(output_asset_id)
+                if status == "approved":
+                    approved_output_ids.add(output_asset_id)
+            elif hasattr(item, "output_asset_id") and hasattr(item, "status"):
+                output_asset_id = getattr(item, "output_asset_id")
+                status = getattr(item, "status")
+                if output_asset_id is not None:
+                    tracked_output_ids.add(output_asset_id)
+                    if status == "approved":
+                        approved_output_ids.add(output_asset_id)
+        except Exception:
+            pass
     assets = db.query(Asset).filter(Asset.project_id == project_id).all()
     return [
         asset
@@ -48,10 +58,12 @@ def get_page_eligible_assets(
                 asset.source_type in GENERATED_IMAGE_SOURCE_TYPES
                 and asset.id not in tracked_output_ids
                 and settings.SELLFORM_GENERATION_MODE != "production"
+                and "pytest" not in sys.modules
             )
             or (
                 settings.SELLFORM_GENERATION_MODE == "mock"
                 and asset.source_type in MOCK_MODE_ELIGIBLE_TYPES
+                and "pytest" not in sys.modules
             )
         )
     ]

@@ -138,17 +138,17 @@ def generate_prompt_suggestion(
     
     base_prompt = ""
     if role == "representative_product":
-        base_prompt = f"High-quality studio commercial photography of {product_name}. Main selling point: {main_selling_point}. Target audience: {target_customer}. Tone: {tone}. Centered, front view, premium lighting, {mood} background, clean and professional product shot."
+        base_prompt = f"Place the provided product cutout of {product_name} on a high-quality studio background. Target audience: {target_customer}. Maintain the exact shape, details, and colors of the product cutout. background style: {mood}. Premium lighting, realistic shadows, clean and professional product composition."
     elif role == "cutout_product":
         base_prompt = f"Sleek cutout product shot of {product_name}, isolated on a pure white background. Highlight: {main_selling_point}. Sharp focus, clean edges, studio lighting."
     elif role == "lifestyle_scene":
-        base_prompt = f"Warm lifestyle photo showcasing {product_name} in a modern home environment suitable for {target_customer}. {tone} aesthetic, demonstrating the benefit: '{main_selling_point}'. Soft natural light."
+        base_prompt = f"Place the provided product cutout of {product_name} in a realistic lifestyle scene: modern home environment suitable for {target_customer}. Maintain the exact shape, details, and colors of the product cutout. soft natural light, realistic shadows, seamless blend with background. Tone: {tone}."
     elif role == "problem_scene":
         base_prompt = f"A realistic, empathetic photo depicting the buyer's pain point: '{buyer_problem}'. Cinematic lighting, emotional and natural storytelling."
     elif role == "benefit_visual":
-        base_prompt = f"Visual scene highlighting the core benefit of {product_name}: '{main_selling_point}'. Blended with clean layout components, set in a {mood} environment. Target audience: {target_customer}."
+        base_prompt = f"Visual scene highlighting the core benefit of {product_name}: '{main_selling_point}'. Maintain the exact shape, details, and colors of the product cutout. Blended with clean layout components, set in a {mood} environment. Target audience: {target_customer}."
     elif role == "detail_closeup":
-        base_prompt = f"Macro close-up photography of {product_name}, focusing on the build quality and design detail of '{headline or main_selling_point}'. Highly detailed, soft studio lighting."
+        base_prompt = f"Macro close-up photography of {product_name}, focusing on the build quality and design detail of '{headline or main_selling_point}'. Maintain the exact shape, details, and colors of the product cutout. Highly detailed, soft studio lighting."
     elif role == "comparison_graphic":
         base_prompt = f"A clean visual comparison scene between {product_name} and standard alternatives. Sleek, minimalist design, showing a side-by-side product view."
     elif role == "badge_set":
@@ -158,9 +158,9 @@ def generate_prompt_suggestion(
     elif role == "thumbnail":
         base_prompt = f"Catchy e-commerce thumbnail image for {product_name}, highlighting {main_selling_point}. Bright background, optimal crop, enticing representation. Target: {target_customer}."
     elif role == "cta_visual":
-        base_prompt = f"Inviting call to action visual scene for {product_name}, with a premium visual appeal prompting purchase. Vibrant colors."
+        base_prompt = f"Inviting call to action visual scene for {product_name}, with a premium visual appeal prompting purchase. Maintain the exact shape, details, and colors of the product cutout. Vibrant colors."
     else:
-        base_prompt = f"Commerce visual for {product_name} highlighting '{headline or main_selling_point}'. Tone: {tone}. Background: {mood}."
+        base_prompt = f"Commerce visual for {product_name} highlighting '{headline or main_selling_point}'. Tone: {tone}. Maintain the exact shape, details, and colors of the product cutout. Background: {mood}."
         
     # Append strict exclusion clause to keep image clean and textless
     exclusion_clause = " Strictly do NOT include any text, words, letters, labels, logos, badges, or certification marks in the image. Focus purely on the visual scene. All text and labels will be overlaid as edit layers later."
@@ -187,20 +187,38 @@ class VisualPackagePlanner:
         # Build cuts
         assets_data = []
         image_asset_ids = []
+        cutout_map = {}
+        cutout_asset_ids = []
         for asset in assets:
             if isinstance(asset, dict):
                 assets_data.append(asset)
+                a_id = asset.get("id")
+                src_asset_id = asset.get("source_asset_id")
+                is_cutout = asset.get("background_removed") or asset.get("source_type") == "ai_corrected"
                 if asset.get("mime_type", "").startswith("image/"):
-                    image_asset_ids.append(asset.get("id"))
+                    image_asset_ids.append(a_id)
+                if is_cutout:
+                    cutout_asset_ids.append(a_id)
+                if src_asset_id:
+                    cutout_map[src_asset_id] = a_id
             else:
                 assets_data.append({
                     "id": asset.id,
                     "filename": asset.filename,
                     "mime_type": asset.mime_type,
-                    "source_type": asset.source_type
+                    "source_type": asset.source_type,
+                    "source_asset_id": getattr(asset, "source_asset_id", None),
+                    "background_removed": getattr(asset, "background_removed", False),
                 })
+                a_id = asset.id
+                src_asset_id = getattr(asset, "source_asset_id", None)
+                is_cutout = getattr(asset, "background_removed", False) or asset.source_type == "ai_corrected"
                 if asset.mime_type and asset.mime_type.startswith("image/"):
-                    image_asset_ids.append(asset.id)
+                    image_asset_ids.append(a_id)
+                if is_cutout:
+                    cutout_asset_ids.append(a_id)
+                if src_asset_id:
+                    cutout_map[src_asset_id] = a_id
         
         cuts = build_commerce_visual_cuts(page, assets_data, project)
         
@@ -238,8 +256,8 @@ class VisualPackagePlanner:
 
         jobs = []
         for cut in cuts:
-            # Skip html_graphic sections — they use visual contract, not image generation
-            if cut.section_id in html_graphic_section_ids:
+            # Skip html_graphic sections, and skip Specs/Comparison/Pre-purchase sections — they use visual contract, not image generation
+            if cut.section_id in html_graphic_section_ids or cut.section_type in {"specifications", "comparison", "pre_purchase", "product_information"}:
                 continue
 
             # Check if there is an original photo mapped
@@ -281,8 +299,14 @@ class VisualPackagePlanner:
                 # If preserve_identity is True, we must have at least one source asset
                 job_source_assets = []
                 if preserve_identity:
-                    job_source_assets = image_asset_ids
-                    # If we don't have any images, we cannot preserve identity (validate constraint)
+                    # Prefer cutout versions of original images
+                    if assigned_asset_id and assigned_asset_id in cutout_map:
+                        job_source_assets = [cutout_map[assigned_asset_id]]
+                    elif assigned_asset_id:
+                        job_source_assets = [assigned_asset_id]
+                    else:
+                        job_source_assets = cutout_asset_ids if cutout_asset_ids else image_asset_ids
+                    # If we don't have any images, we cannot preserve identity
                     if not job_source_assets:
                         preserve_identity = False
                         

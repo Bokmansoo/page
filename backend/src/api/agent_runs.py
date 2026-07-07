@@ -58,6 +58,7 @@ class AgentRunCreateRequest(BaseModel):
     price: Optional[str] = None
     shipping: Optional[str] = None
     desired_mood: List[str] = Field(default_factory=list)
+    planning_mode: Optional[str] = "quality"
 
 
 class AgentRunResponseSchema(BaseModel):
@@ -68,6 +69,7 @@ class AgentRunResponseSchema(BaseModel):
     current_stage: str
     product_input: ProductInputSchema
     outputs: Dict[str, Any] = {}
+    planning_mode: Optional[str] = "quality"
 
 
 class AgentRunProgressStepSchema(BaseModel):
@@ -268,6 +270,7 @@ def create_agent_run(
         raw_input_url=req.product_url,
         status="draft",
         current_step="raw_input",
+        planning_mode=req.planning_mode or "quality",
     )
     db.add(project)
     db.commit()
@@ -324,6 +327,7 @@ def create_agent_run(
             shipping=req.shipping,
             desired_mood=req.desired_mood,
         ),
+        planning_mode=project.planning_mode,
     )
 
 
@@ -356,6 +360,7 @@ def run_mock(
             reference_urls=run.input_snapshot.get("reference_urls") or [],
         ),
         outputs=run.outputs_json,
+        planning_mode=run.project.planning_mode if run.project else "quality",
     )
 
 
@@ -388,4 +393,5 @@ def run_real(
             reference_urls=run.input_snapshot.get("reference_urls") or [],
         ),
         outputs=run.outputs_json,
+        planning_mode=run.project.planning_mode if run.project else "quality",
     )

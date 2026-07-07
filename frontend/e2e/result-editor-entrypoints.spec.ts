@@ -76,6 +76,8 @@ test("result page shows distinct review, advanced, worklist and export history a
 
   await page.goto(`/workspace/projects/${projectId}/result`);
 
+  await expect(page.getByLabel("page history navigation").getByRole("button", { name: "← 이전" })).toBeVisible();
+  await expect(page.getByLabel("page history navigation").getByRole("button", { name: "다음 →" })).toBeVisible();
   await expect(page.getByRole("link", { name: "검수하며 다듬기" }).first()).toBeVisible();
   await expect(page.getByRole("link", { name: "고급 편집기로 열기" }).first()).toBeVisible();
   await expect(page.getByText("문구와 이미지를 빠르게 확인하고 누락·오류를 줄입니다.")).toBeVisible();
@@ -89,6 +91,8 @@ test("page editor separates review and advanced mode headers", async ({ page }) 
   await mockProjectApis(page, projectId);
 
   await page.goto(`/workspace/projects/${projectId}/page-editor?mode=review`);
+  await expect(page.getByLabel("page history navigation").getByRole("button", { name: "← 이전" })).toBeVisible();
+  await expect(page.getByLabel("page history navigation").getByRole("button", { name: "다음 →" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "검수하며 다듬기" })).toBeVisible();
   await expect(page.getByText("문구와 이미지 후보를 빠르게 확인하고 업로드 전 오류를 줄입니다.")).toBeVisible();
 

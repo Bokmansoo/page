@@ -2,6 +2,7 @@
 
 import React from "react";
 import type { ExportHistoryItem } from "@/lib/exportHistory";
+import { apiUrl } from "@/lib/api";
 
 function statusBadge(status: ExportHistoryItem["status"]) {
   switch (status) {
@@ -14,6 +15,10 @@ function statusBadge(status: ExportHistoryItem["status"]) {
     default:
       return <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-xs font-bold text-slate-600">대기 중</span>;
   }
+}
+
+function downloadHref(url: string): string {
+  return /^https?:\/\//i.test(url) ? url : apiUrl(url);
 }
 
 export default function ExportHistoryTable({ items }: { items: ExportHistoryItem[] }) {
@@ -57,7 +62,8 @@ export default function ExportHistoryTable({ items }: { items: ExportHistoryItem
               <td className="p-4">
                 {item.status === "completed" && item.download_url ? (
                   <a
-                    href={item.download_url}
+                    href={downloadHref(item.download_url)}
+                    download={item.filename ?? undefined}
                     className="inline-flex items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-bold text-emerald-700 hover:bg-emerald-100"
                   >
                     <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
