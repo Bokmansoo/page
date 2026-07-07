@@ -51,3 +51,44 @@
 
 ## 4. 종합 평가 (Conclusion)
 기존 데이터나 스키마 수정 없이 템플릿 특화 흐름과 Section Component Contract를 dynamic properties 기법으로 안전하게 해결하였습니다. 기획서에서 명시된 6가지 타입의 목적 중심 기획 및 UI 검수, 최종 HTML 렌더링 연동이 정상적으로 작동하고 있음을 유닛/E2E 테스트를 통해 최종 확인 및 승인 완료하였습니다.
+
+---
+
+## 5. 재검증 기록 (2026-07-07)
+
+요청에 따라 Sprint 78 계획 대비 구현 상태를 다시 확인했습니다.
+
+- `backend/src/services/detail_page_template_service.py`
+  - 6종 템플릿(`general_sales`, `problem_solving`, `lifestyle`, `comparison_focused`, `beginner_seller`, `premium`) 정의 확인
+  - 상품군/판매 목적 기반 템플릿 선택 규칙 확인
+- `backend/src/db/models.py`
+  - `PageSection.role`, `headline`, `body`, `evidence_fact_ids`, `visual_strategy`, `editable` 계약 필드 확인
+- `backend/src/services/detail_page_package_service.py`
+  - `copy_sections` 응답에 Section Component Contract 필드 포함 확인
+- `frontend/e2e/planning-template-flow.spec.ts`
+  - 기획 카드 노출, 숨김, 순서 변경, 임시 저장, 상세페이지 조립 API 호출 흐름 확인
+
+실행한 검증:
+
+```bash
+cd C:\page\backend
+uv run pytest tests/test_detail_page_template_service.py -q
+```
+
+결과: `3 passed`
+
+```bash
+cd C:\page\frontend
+npx.cmd playwright test e2e/planning-template-flow.spec.ts --project=chromium --reporter=line --output=.playwright-results-sprint78
+```
+
+결과: `1 passed`
+
+```bash
+cd C:\page\frontend
+npm.cmd run build
+```
+
+결과: 통과. 단, 기존 React hook dependency warning 및 `<img>` 사용 warning은 남아 있습니다.
+
+판정: Sprint 78은 계획 기준 구현 완료로 볼 수 있습니다. 이번 재검증에서 추가 보완이 필요한 Sprint 78 범위의 기능 누락은 발견되지 않았습니다.
