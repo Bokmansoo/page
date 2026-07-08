@@ -134,7 +134,10 @@ def test_approve_planning_draft_uses_product_cutout_as_generation_reference(clie
                     "type": "hero",
                     "label": "Hero",
                     "title": "Use cool wind anywhere",
-                    "bullets": ["Portable fan for desk, car, and outdoor use."],
+                    "bullets": [
+                        "Portable fan for desk, car, and outdoor use.",
+                        "Cordless comfort without moving power cables.",
+                    ],
                     "visual_strategy": "image_overlay",
                     "source_fact_ids": [],
                     "sort_order": 0,
@@ -208,6 +211,15 @@ def test_approve_planning_draft_uses_product_cutout_as_generation_reference(clie
     assert "provided product cutout/reference" in job.prompt
 
     page = db_session.query(ProductPage).filter(ProductPage.project_id == project.id).one()
+    hero = (
+        db_session.query(PageSection)
+        .filter(PageSection.page_id == page.id, PageSection.section_type == "hero")
+        .one()
+    )
+    assert hero.body_copy == (
+        "- Portable fan for desk, car, and outdoor use.\n"
+        "- Cordless comfort without moving power cables."
+    )
     spec = (
         db_session.query(PageSection)
         .filter(PageSection.page_id == page.id, PageSection.section_type == "specifications")

@@ -275,6 +275,20 @@ def get_unconfirmed_warnings(db: Session, project_id: str) -> List[str]:
     return [f.fact_text for f in unconfirmed_facts]
 
 
+def format_planning_card_body_copy(card: dict) -> str:
+    bullets = [
+        str(bullet).strip()
+        for bullet in (card.get("bullets") or [])
+        if str(bullet).strip()
+    ]
+    if len(bullets) <= 1:
+        return "\n".join(bullets)
+    return "\n".join(
+        bullet if bullet.startswith(("- ", "* ", "• ")) else f"- {bullet}"
+        for bullet in bullets
+    )
+
+
 def get_image_candidates_for_section(
     section: PageSection,
     db: Session,
@@ -2028,7 +2042,7 @@ def approve_planning_draft(
         else:
             needs_image = visual_strategy in {"image_overlay", "lifestyle_image", "graphic_chart"}
             visual_kind = "image" if needs_image else "html_graphic"
-        body_copy = "\n".join(card.get("bullets") or [])
+        body_copy = format_planning_card_body_copy(card)
 
         section = PageSection(
             page_id=page.id,

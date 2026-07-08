@@ -117,6 +117,59 @@ function sectionTheme(sectionType: string, index: number) {
   };
 }
 
+function parseBodyBlock(block: string): { type: "list"; items: string[] } | { type: "paragraph"; lines: string[] } {
+  const lines = block
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const bulletItems = lines
+    .map((line) => line.match(/^[-*•]\s+(.+)$/) || line.match(/^\d+[.)]\s+(.+)$/))
+    .filter((match): match is RegExpMatchArray => Boolean(match))
+    .map((match) => match[1].trim());
+
+  if (lines.length > 0 && bulletItems.length === lines.length) {
+    return { type: "list", items: bulletItems };
+  }
+  return { type: "paragraph", lines };
+}
+
+function FormattedBodyCopy({ body, className }: { body: string; className: string }) {
+  const blocks = body
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split(/\n\s*\n/)
+    .map((block) => block.trim())
+    .filter(Boolean)
+    .map(parseBodyBlock);
+
+  if (blocks.length === 0) return null;
+
+  return (
+    <div className={`mx-auto mt-4 max-w-2xl space-y-4 text-sm leading-7 sm:text-base ${className}`}>
+      {blocks.map((block, index) => {
+        if (block.type === "list") {
+          return (
+            <ul
+              key={`list-${index}`}
+              className="mx-auto max-w-xl list-disc space-y-2 pl-5 text-left marker:text-emerald-600"
+            >
+              {block.items.map((item, itemIndex) => (
+                <li key={`${index}-${itemIndex}`}>{item}</li>
+              ))}
+            </ul>
+          );
+        }
+
+        return (
+          <p key={`paragraph-${index}`} className="whitespace-pre-line">
+            {block.lines.join("\n")}
+          </p>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function DetailPageDocument({ page, assets, exportMode = false }: DetailPageDocumentProps) {
   const [exportErrors, setExportErrors] = useState<string[]>([]);
   const visibleSections = page.sections
@@ -187,9 +240,7 @@ export default function DetailPageDocument({ page, assets, exportMode = false }:
             <h3 className={`mx-auto mt-3 max-w-2xl text-2xl font-extrabold leading-snug sm:text-3xl ${theme.title}`}>
               {title}
             </h3>
-            <p className={`mx-auto mt-4 max-w-2xl text-sm leading-7 sm:text-base ${theme.body}`}>
-              {body}
-            </p>
+            <FormattedBodyCopy body={body} className={theme.body} />
             {section.section_type !== "product_information" ? (
               isHtmlGraphic ? (
                 <HtmlGraphicVisual section={section as unknown as DetailPageSectionVisual} />
