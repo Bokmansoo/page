@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 from src.api.auth import get_current_user_and_workspace
 from src.db.database import get_db
-from src.db.models import ProductProject, AuditLog, JobStatus, Brand, Asset, ExportJob
+from src.db.models import ProductProject, AuditLog, JobStatus, Brand, Asset, ExportJob, AgentRun
 from src.schemas.project_worklist import ProjectWorklistItem, ProjectWorklistResponse
 from src.services.validation import validate_external_url
 from src.services.visual_background_service import VisualBackgroundService
@@ -122,10 +122,18 @@ def _thumbnail_url_from_job(job: ExportJob | None) -> str | None:
     if not job or not job.output_images:
         return None
     first_image = job.output_images[0]
-    return first_image if isinstance(first_image, str) else None
+    if not isinstance(first_image, str):
+        return None
+    if "/page/export/download/" in first_image or first_image.startswith("/api/"):
+        return None
+    return first_image
 
 
-def _to_worklist_item(project: ProductProject, latest_export_job: ExportJob | None) -> ProjectWorklistItem:
+def _to_worklist_item(
+    project: ProductProject,
+    latest_export_job: ExportJob | None,
+    run_id: str | None = None
+) -> ProjectWorklistItem:
     project_id = str(project.id)
     status_value = _normalize_worklist_status(project)
     return ProjectWorklistItem(
@@ -137,6 +145,7 @@ def _to_worklist_item(project: ProductProject, latest_export_job: ExportJob | No
         review_url=f"/workspace/projects/{project_id}/page-editor?mode=review",
         export_history_url=f"/workspace/exports?project_id={project_id}",
         last_export_status=latest_export_job.status if latest_export_job else None,
+        run_id=run_id,
         updated_at=project.updated_at.isoformat() if project.updated_at else "",
     )
 
@@ -163,7 +172,14 @@ def list_project_worklist(
             .order_by(ExportJob.created_at.desc())
             .first()
         )
-        items.append(_to_worklist_item(project, latest_export_job))
+        latest_run = (
+            db.query(AgentRun)
+            .filter(AgentRun.project_id == project.id)
+            .order_by(AgentRun.created_at.desc())
+            .first()
+        )
+        run_id_val = str(latest_run.id) if latest_run else None
+        items.append(_to_worklist_item(project, latest_export_job, run_id_val))
     return ProjectWorklistResponse(items=items)
 
 

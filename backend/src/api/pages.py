@@ -33,6 +33,7 @@ from src.services.page_asset_policy import (
     get_page_eligible_assets,
 )
 from src.services.visual_contract_backfill import backfill_page_visuals
+from src.services.planning_draft_service import PlanningDraftService
 
 
 router = APIRouter(tags=["Page Editor"])
@@ -1881,6 +1882,28 @@ def get_planning_draft(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Planning draft not found for this project"
         )
+
+    return PlanningDraftSchema(**project.planning_draft)
+
+
+@router.post("/projects/{project_id}/planning-draft", response_model=PlanningDraftSchema)
+def create_planning_draft(
+    project_id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace)
+):
+    workspace = auth_ctx["workspace"]
+    project = get_project_or_404(db, project_id, workspace.id)
+
+    confirmed_facts = db.query(ProductFact).filter(
+        ProductFact.project_id == project_id,
+        ProductFact.verification_status == "confirmed",
+    ).all()
+
+    draft = PlanningDraftService.generate_draft(project, confirmed_facts, db)
+    project.planning_draft = draft
+    db.commit()
+    db.refresh(project)
 
     return PlanningDraftSchema(**project.planning_draft)
 

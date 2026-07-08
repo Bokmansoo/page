@@ -4,6 +4,7 @@ import React, { useEffect, useState } from "react";
 import ProjectWorklist from "@/components/ProjectWorklist";
 import { fetchProjectWorklist, ProjectWorklistItem } from "@/lib/projectWorklistCompat";
 
+// 작업 목록 페이지는 dev 서버 chunk 캐시가 꼬이면 무한 로딩처럼 보일 수 있어 변경 시 재컴파일을 유도한다.
 export default function WorkspaceProjectsPage() {
   const [items, setItems] = useState<ProjectWorklistItem[]>([]);
   const [loading, setLoading] = useState(true);

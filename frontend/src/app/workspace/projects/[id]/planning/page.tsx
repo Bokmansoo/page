@@ -7,8 +7,15 @@ import PlanningDraftEditor from "@/components/planning/PlanningDraftEditor";
 import { PlanningCard } from "@/components/planning/PlanningDraftCard";
 
 const defaultHeaders = () => {
-  const uid = localStorage.getItem("X-Mock-User-Id") || "00000000-0000-0000-0000-000000000001";
-  const wid = localStorage.getItem("X-Mock-Workspace-Id") || "00000000-0000-0000-0000-000000000002";
+  const uid =
+    typeof window !== "undefined"
+      ? localStorage.getItem("X-Mock-User-Id") || "00000000-0000-0000-0000-000000000001"
+      : "00000000-0000-0000-0000-000000000001";
+  const wid =
+    typeof window !== "undefined"
+      ? localStorage.getItem("X-Mock-Workspace-Id") || "00000000-0000-0000-0000-000000000002"
+      : "00000000-0000-0000-0000-000000000002";
+
   return {
     "Content-Type": "application/json",
     "X-Mock-User-Id": uid,
@@ -18,11 +25,11 @@ const defaultHeaders = () => {
 
 export default function ProjectPlanningPage() {
   const params = useParams();
-  const projectId = params.id as string;
+  const projectId = String(params.id);
 
   const [cards, setCards] = useState<PlanningCard[] | null>(null);
   const [loading, setLoading] = useState(true);
-  const [statusText, setStatusText] = useState("기획안을 불러오는 중입니다...");
+  const [statusText, setStatusText] = useState("기획 초안을 불러오는 중입니다...");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -30,6 +37,9 @@ export default function ProjectPlanningPage() {
 
     const fetchPlanningDraft = async () => {
       try {
+        setLoading(true);
+        setError(null);
+
         const endpoint = apiUrl(`/api/v1/projects/${projectId}/planning-draft`);
         const getRes = await fetch(endpoint, {
           headers: defaultHeaders(),
@@ -38,7 +48,7 @@ export default function ProjectPlanningPage() {
 
         if (getRes.status === 404) {
           if (!active) return;
-          setStatusText("AI 기획 초안을 생성하는 중입니다...");
+          setStatusText("AI 기획 초안을 새로 준비하는 중입니다...");
 
           const postRes = await fetch(endpoint, {
             method: "POST",
@@ -50,24 +60,19 @@ export default function ProjectPlanningPage() {
           }
 
           const postData = await postRes.json();
-          if (active) {
-            setCards(postData.cards);
-            setLoading(false);
-          }
+          if (active) setCards(postData.cards ?? []);
         } else if (!getRes.ok) {
           throw new Error("기획 초안 조회에 실패했습니다.");
         } else {
           const getData = await getRes.json();
-          if (active) {
-            setCards(getData.cards);
-            setLoading(false);
-          }
+          if (active) setCards(getData.cards ?? []);
         }
       } catch (err) {
         if (active) {
-          setError(err instanceof Error ? err.message : "기획안 조회 또는 생성 중 오류가 발생했습니다.");
-          setLoading(false);
+          setError(err instanceof Error ? err.message : "기획안을 조회하거나 생성하는 중 오류가 발생했습니다.");
         }
+      } finally {
+        if (active) setLoading(false);
       }
     };
 
@@ -125,7 +130,7 @@ export default function ProjectPlanningPage() {
 
   return (
     <div className="min-h-screen bg-slate-50 p-6 text-slate-800 md:p-10">
-      {cards ? (
+      {cards && cards.length > 0 ? (
         <PlanningDraftEditor projectId={projectId} initialCards={cards} />
       ) : (
         <div className="py-10 text-center font-bold text-slate-400">표시할 기획안이 없습니다.</div>

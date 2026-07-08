@@ -44,6 +44,7 @@ test_temp.db
 test-results*/
 playwright-report/
 frontend/test-results*/
+frontend/.pw-test-results*/
 frontend/.e2e-*/
 .pytest-tmp*/
 backend/.pytest-tmp*/

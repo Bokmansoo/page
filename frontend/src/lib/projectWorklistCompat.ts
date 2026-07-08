@@ -11,6 +11,7 @@ export interface ProjectWorklistItem {
   review_url: string | null;
   export_history_url: string;
   last_export_status: string | null;
+  run_id?: string | null;
   updated_at: string;
 }
 
@@ -31,10 +32,16 @@ interface LegacyProjectListResponse {
 }
 
 function mockHeaders(): Record<string, string> {
-  if (typeof window === "undefined") return {};
+  const defaults = {
+    "X-Mock-User-Id": "00000000-0000-0000-0000-000000000001",
+    "X-Mock-Workspace-Id": "00000000-0000-0000-0000-000000000002",
+  };
+
+  if (typeof window === "undefined") return defaults;
+
   return {
-    "X-Mock-User-Id": localStorage.getItem("X-Mock-User-Id") || "00000000-0000-0000-0000-000000000001",
-    "X-Mock-Workspace-Id": localStorage.getItem("X-Mock-Workspace-Id") || "00000000-0000-0000-0000-000000000002",
+    "X-Mock-User-Id": localStorage.getItem("X-Mock-User-Id") || defaults["X-Mock-User-Id"],
+    "X-Mock-Workspace-Id": localStorage.getItem("X-Mock-Workspace-Id") || defaults["X-Mock-Workspace-Id"],
   };
 }
 
@@ -62,19 +69,20 @@ function fromLegacyProject(project: LegacyProjectItem): ProjectWorklistItem {
     review_url: `/workspace/projects/${project.id}/page-editor?mode=review`,
     export_history_url: `/workspace/exports?project_id=${project.id}`,
     last_export_status: null,
+    run_id: null,
     updated_at: project.updated_at,
   };
 }
 
 export async function fetchProjectWorklist(): Promise<ProjectWorklistItem[]> {
   const headers = mockHeaders();
-  const response = await fetch(apiUrl("/api/v1/projects/worklist"), {
+  const response = await fetchWithTimeout(apiUrl("/api/v1/projects/worklist"), {
     headers,
     cache: "no-store",
   });
 
   if (response.status === 404) {
-    const fallbackResponse = await fetch(apiUrl("/api/v1/projects"), {
+    const fallbackResponse = await fetchWithTimeout(apiUrl("/api/v1/projects"), {
       headers,
       cache: "no-store",
     });
@@ -93,4 +101,18 @@ export async function fetchProjectWorklist(): Promise<ProjectWorklistItem[]> {
   }
   const body: ProjectWorklistResponse = await response.json();
   return body.items;
+}
+
+async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: init.signal ?? controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 }

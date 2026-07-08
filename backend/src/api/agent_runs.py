@@ -59,6 +59,7 @@ class AgentRunCreateRequest(BaseModel):
     shipping: Optional[str] = None
     desired_mood: List[str] = Field(default_factory=list)
     planning_mode: Optional[str] = "quality"
+    force_new: bool = False
 
 
 class AgentRunResponseSchema(BaseModel):
@@ -231,8 +232,11 @@ def create_agent_run(
 
     resolved_product_name = req.product_name or collected_product_name
 
-    # Duplicate run guard: block if same product name has an active project
-    active_project = _find_active_project_by_name(db, workspace.id, resolved_product_name)
+    # Duplicate run guard: block by default, but allow the seller to intentionally
+    # create a new version of the same product page.
+    active_project = None
+    if not req.force_new:
+        active_project = _find_active_project_by_name(db, workspace.id, resolved_product_name)
     if active_project is not None:
         status_payload = GenerationStatusService(db).get_project_status(active_project.id, workspace.id)
         active_run = status_payload.get("active_run") or {}
@@ -245,6 +249,7 @@ def create_agent_run(
                 "run_id": active_run.get("id"),
                 "state": status_payload["state"],
                 "status_url": f"/workspace/operations?projectId={active_project.id}",
+                "review_url": status_payload.get("review_url"),
                 "result_url": status_payload.get("result_url"),
             },
         )

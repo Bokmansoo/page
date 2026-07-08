@@ -29,6 +29,18 @@ const worklistPayload = {
       last_export_status: null,
       updated_at: "2026-07-06T11:00:00",
     },
+    {
+      project_id: "project-3",
+      project_name: "Generating detail page",
+      status: "generating",
+      thumbnail_url: null,
+      result_url: "/workspace/projects/project-3/result",
+      review_url: "/workspace/projects/project-3/page-editor?mode=review",
+      export_history_url: "/workspace/exports?project_id=project-3",
+      last_export_status: null,
+      run_id: "run-project-3",
+      updated_at: "2026-07-06T10:00:00",
+    },
   ],
 };
 
@@ -66,9 +78,15 @@ test("user can view generated detail page worklist", async ({ page }) => {
     "href",
     "/workspace/projects/project-1/result",
   );
-  await expect(firstCard.getByRole("link", { name: "검수하며 다듬기" })).toHaveAttribute(
+  const reviewCard = page.locator("article").nth(1);
+  await expect(reviewCard.getByRole("link", { name: "검수하며 다듬기" })).toHaveAttribute(
     "href",
-    "/workspace/projects/project-1/page-editor?mode=review",
+    "/workspace/projects/project-2/page-editor?mode=review",
+  );
+  const generatingCard = page.locator("article").nth(2);
+  await expect(generatingCard.getByRole("link", { name: "이어서 진행" })).toHaveAttribute(
+    "href",
+    "/workspace?runId=run-project-3",
   );
   await expect(firstCard.getByRole("link", { name: "출력 이력" })).toHaveAttribute(
     "href",

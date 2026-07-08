@@ -10,6 +10,7 @@ class ProjectWorklistItem(BaseModel):
     review_url: str | None = None
     export_history_url: str
     last_export_status: str | None = None
+    run_id: str | None = None
     updated_at: str
 
 

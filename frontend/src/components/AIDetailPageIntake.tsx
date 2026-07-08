@@ -34,6 +34,9 @@ export default function AIDetailPageIntake() {
     <GenerationDuplicateRunDialog
       detail={duplicateRunDetail}
       onClose={() => setDuplicateRunDetail(null)}
+      onForceNew={() => {
+        void handleSubmit({ preventDefault() {} } as React.FormEvent, structuredDraft, true);
+      }}
     />
   ) : null;
 
@@ -101,7 +104,8 @@ export default function AIDetailPageIntake() {
 
   const handleSubmit = async (
     e: React.FormEvent,
-    confirmedDraft: StructuredIntakeDraft | null = structuredDraft
+    confirmedDraft: StructuredIntakeDraft | null = structuredDraft,
+    forceNew: boolean = false
   ) => {
     e.preventDefault();
     const finalProductName = confirmedDraft?.product_name.value || productName.trim() || "";
@@ -138,6 +142,7 @@ export default function AIDetailPageIntake() {
           shipping: confirmedDraft?.shipping?.value || "",
           desired_mood: confirmedDraft?.desired_mood || [selectedPreset],
           planning_mode: planningMode,
+          force_new: forceNew,
         }),
       });
 

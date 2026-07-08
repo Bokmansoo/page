@@ -118,26 +118,42 @@ export default function ProjectWorklist({ items }: { items: ProjectWorklistItem[
               </div>
             </div>
 
-            <div className="grid gap-2 sm:grid-cols-3 lg:w-[420px]">
-              {item.result_url && (
+            <div className="flex flex-wrap gap-2 w-full lg:w-[320px] lg:justify-end">
+              {item.status === "completed" && item.result_url && (
                 <Link
                   href={item.result_url}
-                  className="flex h-12 items-center justify-center whitespace-nowrap rounded-xl border border-slate-200 px-4 text-sm font-bold text-slate-700 hover:bg-slate-50"
+                  className="flex h-12 flex-1 items-center justify-center whitespace-nowrap rounded-xl border border-slate-200 px-4 text-sm font-bold text-slate-700 hover:bg-slate-50 lg:flex-initial"
                 >
                   결과 보기
                 </Link>
               )}
-              {item.review_url && (
+              {item.status === "needs_review" && item.review_url && (
                 <Link
                   href={item.review_url}
-                  className="flex h-12 items-center justify-center whitespace-nowrap rounded-xl border border-emerald-200 bg-emerald-50 px-4 text-sm font-bold text-emerald-700 hover:bg-emerald-100"
+                  className="flex h-12 flex-1 items-center justify-center whitespace-nowrap rounded-xl border border-emerald-200 bg-emerald-50 px-4 text-sm font-bold text-emerald-700 hover:bg-emerald-100 lg:flex-initial"
                 >
                   검수하며 다듬기
                 </Link>
               )}
+              {item.status === "generating" && (
+                <Link
+                  href={item.run_id ? `/workspace?runId=${item.run_id}` : "/workspace"}
+                  className="flex h-12 flex-1 items-center justify-center whitespace-nowrap rounded-xl border border-blue-200 bg-blue-50 px-4 text-sm font-bold text-blue-700 hover:bg-blue-100 lg:flex-initial"
+                >
+                  이어서 진행
+                </Link>
+              )}
+              {item.status === "failed" && (
+                <Link
+                  href={`/workspace/operations?projectId=${item.project_id}`}
+                  className="flex h-12 flex-1 items-center justify-center whitespace-nowrap rounded-xl border border-rose-200 bg-rose-50 px-4 text-sm font-bold text-rose-700 hover:bg-rose-100 lg:flex-initial"
+                >
+                  상태 확인
+                </Link>
+              )}
               <Link
                 href={item.export_history_url}
-                className="flex h-12 items-center justify-center whitespace-nowrap rounded-xl bg-slate-900 px-4 text-sm font-bold text-white hover:bg-slate-800"
+                className="flex h-12 flex-1 items-center justify-center whitespace-nowrap rounded-xl bg-slate-900 px-4 text-sm font-bold text-white hover:bg-slate-800 lg:flex-initial"
               >
                 출력 이력
               </Link>

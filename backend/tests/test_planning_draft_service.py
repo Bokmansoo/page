@@ -1,6 +1,7 @@
 import pytest
 from sqlalchemy.orm import Session
 from src.db.models import ProductProject, ProductFact
+from src.services.detail_page_template_service import DetailPageTemplateService
 from src.services.planning_draft_service import PlanningDraftService
 
 @pytest.fixture
@@ -31,20 +32,23 @@ def test_generate_draft_mock(db_session: Session, sample_project):
     
     assert draft is not None
     assert "cards" in draft
-    assert len(draft["cards"]) == 10
+    template_id = DetailPageTemplateService.select_template_id(
+        sample_project.category,
+        sample_project.intake_snapshot,
+    )
+    template = DetailPageTemplateService.get_template(template_id)
+    expected_types = [section["type"] for section in template["sections"]]
+    assert draft["template_id"] == template["id"]
+    assert draft["template_name"] == template["name"]
+    assert len(draft["cards"]) == len(expected_types)
     
     # 10개 필수 카드 종류 및 순서 확인
     card_types = [c["type"] for c in draft["cards"]]
-    expected_types = [
-        "hero", "target_customer", "problem_situation", "features",
-        "lifestyle_scene", "comparison", "pre_purchase", "specifications",
-        "caution", "cta"
-    ]
     assert card_types == expected_types
     
     # 사실 매핑 확인 (첫번째 카드에 mapping)
-    hero_card = draft["cards"][0]
-    assert hero_card["source_fact_ids"] == [fact.id]
+    first_card = draft["cards"][0]
+    assert first_card["source_fact_ids"] == [fact.id]
 
 def test_planning_draft_quality_rules(db_session: Session, sample_project):
     fact = ProductFact(
@@ -76,4 +80,3 @@ def test_planning_draft_quality_rules(db_session: Session, sample_project):
             assert pattern not in title, f"Title '{title}' contains forbidden pattern '{pattern}'"
             for bullet in bullets:
                 assert pattern not in bullet, f"Bullet '{bullet}' contains forbidden pattern '{pattern}'"
-
