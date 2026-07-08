@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { apiUrl } from "@/lib/api";
@@ -258,6 +258,8 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
   const [exportFormat, setExportFormat] = useState<ExportImageFormat>("png");
   const [exportStage, setExportStage] = useState<ExportStage>("idle");
   const [exportBlockers, setExportBlockers] = useState<Array<{ section_id: string; code: string; message: string }>>([]);
+  const [imageActionError, setImageActionError] = useState<string | null>(null);
+  const [regeneratingCandidateId, setRegeneratingCandidateId] = useState<string | null>(null);
 
   useEffect(() => {
     const loadData = async () => {
@@ -285,6 +287,60 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
 
     loadData();
   }, [projectId]);
+
+  const refreshPageAndAssets = useCallback(async () => {
+    const [pageRes, assetsRes] = await Promise.all([
+      fetch(apiUrl(`/api/v1/projects/${projectId}/page`), { headers: MOCK_HEADERS }),
+      fetch(apiUrl(`/api/v1/projects/${projectId}/assets`), { headers: MOCK_HEADERS }),
+    ]);
+    if (!pageRes.ok) {
+      throw new Error("\uc774\ubbf8\uc9c0 \uc0dd\uc131 \ud6c4 \uc0c1\uc138\ud398\uc774\uc9c0\ub97c \ub2e4\uc2dc \ubd88\ub7ec\uc624\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4.");
+    }
+    setPageData(await pageRes.json());
+    setAssets(assetsRes.ok ? await assetsRes.json() : []);
+  }, [projectId]);
+
+  const handleRegenerateImageCandidate = async (candidate: ImageCandidate) => {
+    setImageActionError(null);
+    setRegeneratingCandidateId(candidate.candidate_id);
+    try {
+      const regenerateRes = await fetch(
+        apiUrl(`/api/v1/projects/${projectId}/visual-jobs/${candidate.candidate_id}/regenerate`),
+        {
+          method: "POST",
+          headers: {
+            ...MOCK_HEADERS,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({}),
+        }
+      );
+      if (!regenerateRes.ok) {
+        throw new Error("\uc774\ubbf8\uc9c0 \uc7ac\uc0dd\uc131 \uc900\ube44\uc5d0 \uc2e4\ud328\ud588\uc2b5\ub2c8\ub2e4.");
+      }
+
+      const generateRes = await fetch(
+        apiUrl(`/api/v1/projects/${projectId}/visual-jobs/${candidate.candidate_id}/generate`),
+        {
+          method: "POST",
+          headers: {
+            ...MOCK_HEADERS,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ cost_approved: true }),
+        }
+      );
+      if (!generateRes.ok) {
+        throw new Error("\uc774\ubbf8\uc9c0 \uc7ac\uc0dd\uc131 \uc694\uccad\uc5d0 \uc2e4\ud328\ud588\uc2b5\ub2c8\ub2e4.");
+      }
+      await refreshPageAndAssets();
+    } catch (err) {
+      console.error(err);
+      setImageActionError(err instanceof Error ? err.message : "\uc774\ubbf8\uc9c0 \uc7ac\uc0dd\uc131 \uc911 \uc624\ub958\uac00 \ubc1c\uc0dd\ud588\uc2b5\ub2c8\ub2e4.");
+    } finally {
+      setRegeneratingCandidateId(null);
+    }
+  };
 
   const handleSelectImageCandidate = async (sectionId: string, candidate: ImageCandidate) => {
     if (!pageData || !candidate.asset_id) return;
@@ -486,6 +542,17 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
   const visibleSections = pageData.sections
     .filter((section) => section.is_visible)
     .sort((a, b) => a.sort_order - b.sort_order);
+  const failedImageCandidates = visibleSections.flatMap((section) =>
+    (section.image_candidates || []).filter((candidate) => candidate.status === "failed")
+  );
+  const hasBillingLimitImageFailure = failedImageCandidates.some((candidate) => {
+    const text = `${candidate.error_code || ""} ${(candidate.warnings || []).join(" ")}`.toLowerCase();
+    return (
+      text.includes("billing_hard_limit_reached") ||
+      text.includes("billing hard limit") ||
+      text.includes("billing_limit_user_error")
+    );
+  });
   const invalidVisualCount = visibleSections.filter(
     (section) => validateSectionVisual(section as unknown as DetailPageSectionVisual).length > 0
   ).length;
@@ -573,6 +640,33 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
           </Link>
         </div>
       </header>
+
+      {failedImageCandidates.length > 0 ? (
+        <section className="border-b border-amber-200 bg-amber-50 px-6 py-4">
+          <div className="mx-auto flex w-full max-w-7xl flex-col gap-2 text-sm text-amber-900 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <p className="font-extrabold">
+                {hasBillingLimitImageFailure
+                  ? "\uc774\ubbf8\uc9c0 \uc0dd\uc131\uc774 \uacb0\uc81c \ud55c\ub3c4 \ub54c\ubb38\uc5d0 \uc911\ub2e8\ub410\uc2b5\ub2c8\ub2e4"
+                  : "\uc77c\ubd80 \uc774\ubbf8\uc9c0 \uc0dd\uc131\uc774 \uc644\ub8cc\ub418\uc9c0 \uc54a\uc558\uc2b5\ub2c8\ub2e4"}
+              </p>
+              <p className="mt-1 text-xs leading-5 text-amber-800">
+                {hasBillingLimitImageFailure
+                  ? "OpenAI \uacc4\uc815\uc758 \uacb0\uc81c \ud55c\ub3c4\ub97c \ud574\uacb0\ud55c \ub4a4 \uc624\ub978\ucabd \ud6c4\ubcf4\uc5d0\uc11c \uc774\ubbf8\uc9c0\ub9cc \ub2e4\uc2dc \uc0dd\uc131\ud560 \uc218 \uc788\uc2b5\ub2c8\ub2e4."
+                  : "\ud14d\uc2a4\ud2b8 \uc0c1\uc138\ud398\uc774\uc9c0\ub294 \uc720\uc9c0\ud558\uace0, \uc2e4\ud328\ud55c \uc774\ubbf8\uc9c0 job\ub9cc \ub2e4\uc2dc \uc2e4\ud589\ud560 \uc218 \uc788\uc2b5\ub2c8\ub2e4."}
+              </p>
+              {imageActionError ? (
+                <p className="mt-2 rounded bg-white/70 px-3 py-2 text-xs font-bold text-rose-700">
+                  {imageActionError}
+                </p>
+              ) : null}
+            </div>
+            <span className="shrink-0 rounded-full bg-white px-3 py-1 text-xs font-extrabold text-amber-800">
+              {failedImageCandidates.length}\uac1c \uc7ac\uc2dc\ub3c4 \ud544\uc694
+            </span>
+          </div>
+        </section>
+      ) : null}
 
       <main className="mx-auto grid w-full max-w-7xl grid-cols-1 items-start gap-8 px-6 py-8 lg:grid-cols-[minmax(0,760px)_380px]">
         <div>
@@ -719,6 +813,18 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
                                 <p className="mt-1 break-words rounded bg-rose-50 px-2 py-1 text-[9px] font-semibold leading-4 text-rose-700">
                                   {cand.warnings[0]}
                                 </p>
+                              ) : null}
+                              {cand.status === "failed" ? (
+                                <button
+                                  type="button"
+                                  disabled={regeneratingCandidateId === cand.candidate_id}
+                                  onClick={() => handleRegenerateImageCandidate(cand)}
+                                  className="mt-2 w-full rounded bg-amber-600 py-1.5 text-[10px] font-bold text-white hover:bg-amber-700 disabled:bg-slate-200 disabled:text-slate-400"
+                                >
+                                  {regeneratingCandidateId === cand.candidate_id
+                                    ? "\uc7ac\uc0dd\uc131 \uc911..."
+                                    : "\uc774\ubbf8\uc9c0 \ub2e4\uc2dc \uc0dd\uc131"}
+                                </button>
                               ) : null}
                               <button
                                 type="button"
