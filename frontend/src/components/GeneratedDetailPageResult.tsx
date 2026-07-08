@@ -24,6 +24,10 @@ interface ImageCandidate {
   is_recommended: boolean;
   needs_identity_review: boolean;
   status?: string | null;
+  error_code?: string | null;
+  warnings?: string[] | null;
+  provider?: string | null;
+  model?: string | null;
   source_asset_id?: string | null;
   cutout_status?: string | null;
   background_removed?: boolean | null;
@@ -187,6 +191,11 @@ function candidateSourceLabel(candidate: ImageCandidate): string {
 }
 
 function candidateWarningLabel(candidate: ImageCandidate): string | null {
+  if (candidate.status === "failed") {
+    return candidate.error_code
+      ? `\uc774\ubbf8\uc9c0 \uc0dd\uc131 \uc2e4\ud328: ${candidate.error_code}`
+      : "\uc774\ubbf8\uc9c0 \uc0dd\uc131 \uc2e4\ud328";
+  }
   if (candidate.needs_identity_review || candidate.product_identity_preserved === false) {
     return "상품 형태 변경 가능성 있음";
   }
@@ -704,6 +713,11 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
                               {candidateWarningLabel(cand) ? (
                                 <p className="mt-1 text-[10px] font-bold text-amber-700">
                                   {candidateWarningLabel(cand)}
+                                </p>
+                              ) : null}
+                              {cand.status === "failed" && cand.warnings?.length ? (
+                                <p className="mt-1 break-words rounded bg-rose-50 px-2 py-1 text-[9px] font-semibold leading-4 text-rose-700">
+                                  {cand.warnings[0]}
                                 </p>
                               ) : null}
                               <button

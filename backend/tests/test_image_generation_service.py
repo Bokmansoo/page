@@ -253,6 +253,30 @@ def test_execute_image_generation_provider_failure(db_session, db_setup):
     assert record.error_code == "RATE_LIMIT_EXCEEDED"
 
 
+def test_execute_image_generation_persists_provider_failure_detail(db_session, db_setup):
+    project = db_setup["project"]
+
+    mock_provider = MagicMock()
+    mock_provider.generate.side_effect = RuntimeError(
+        "INVALID_REQUEST: Invalid parameter: quality is not supported for this model"
+    )
+
+    with pytest.raises(RuntimeError):
+        execute_image_generation(
+            project.id,
+            "job-service-1",
+            db_session,
+            cost_approved=True,
+            provider_override=mock_provider,
+        )
+
+    record = get_or_create_job_record(project.id, "job-service-1", db_session)
+    assert record.status == "failed"
+    assert record.error_code == "INVALID_REQUEST"
+    assert record.warnings
+    assert "quality is not supported" in record.warnings[0]
+
+
 def test_execute_retries_one_transient_provider_failure(db_session, db_setup):
     project = db_setup["project"]
     mock_provider = MagicMock()

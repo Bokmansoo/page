@@ -203,6 +203,65 @@ def test_openai_provider_error_mapping(mock_openai_class):
     assert "MODERATION_REJECTED" in str(exc.value)
 
 
+@patch("src.services.openai_image_provider.OpenAI")
+def test_openai_provider_preserves_bad_request_detail(mock_openai_class):
+    mock_client = MagicMock()
+    mock_openai_class.return_value = mock_client
+    mock_client.images.generate.side_effect = BadRequestError(
+        message="Invalid parameter: quality is not supported for this model",
+        response=MagicMock(status_code=400),
+        body={},
+    )
+
+    provider = OpenAIImageProvider(api_key="mock-key")
+    req = ImageGenerationRequest(
+        job_id="job-invalid-request",
+        role="badge_set",
+        prompt="badge",
+        preserve_product_identity=False,
+        source_asset_paths=[],
+    )
+
+    with pytest.raises(RuntimeError) as exc:
+        provider.generate(req)
+
+    message = str(exc.value)
+    assert "INVALID_REQUEST" in message
+    assert "quality is not supported" in message
+
+
+@patch("src.services.openai_image_provider.OpenAI")
+def test_openai_provider_maps_billing_hard_limit(mock_openai_class):
+    mock_client = MagicMock()
+    mock_openai_class.return_value = mock_client
+    mock_client.images.generate.side_effect = BadRequestError(
+        message="Billing hard limit has been reached.",
+        response=MagicMock(status_code=400),
+        body={
+            "error": {
+                "type": "billing_limit_user_error",
+                "code": "billing_hard_limit_reached",
+            }
+        },
+    )
+
+    provider = OpenAIImageProvider(api_key="mock-key")
+    req = ImageGenerationRequest(
+        job_id="job-billing-limit",
+        role="badge_set",
+        prompt="badge",
+        preserve_product_identity=False,
+        source_asset_paths=[],
+    )
+
+    with pytest.raises(RuntimeError) as exc:
+        provider.generate(req)
+
+    message = str(exc.value)
+    assert "BILLING_HARD_LIMIT_REACHED" in message
+    assert "Billing hard limit" in message
+
+
 def test_openai_provider_reports_missing_api_key_with_stable_error(monkeypatch):
     monkeypatch.setattr("src.services.openai_image_provider.settings.OPENAI_API_KEY", None)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)

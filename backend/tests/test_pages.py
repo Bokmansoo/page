@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 from src.api.auth import DEFAULT_BRAND_ID, DEFAULT_USER_ID, DEFAULT_WORKSPACE_ID
 from src.api.pages import create_page_snapshot
-from src.db.models import Asset, Brand, DetailPageVersion, ProductProject, ProductFact, ProductPage, PageSection, PageVersion, User, Workspace
+from src.db.models import Asset, Brand, DetailPageVersion, ImageGenerationJobRecord, ProductProject, ProductFact, ProductPage, PageSection, PageVersion, User, Workspace
 from src.services.page_generator import PageGenerationService
 
 
@@ -105,6 +105,67 @@ def test_get_page_backfills_incomplete_html_visual_payloads(client, db_session):
     assert by_id["guarantee-incomplete"]["visual_payload"]["table_rows"]
 
 # 기본적으로 conftest에서 제공하는 클라이언트 및 db_session fixture 활용
+
+def test_get_page_marks_failed_image_generation_candidates(client, db_session):
+    headers = {
+        "X-Mock-User-Id": DEFAULT_USER_ID,
+        "X-Mock-Workspace-Id": DEFAULT_WORKSPACE_ID,
+    }
+    user = User(id=DEFAULT_USER_ID, email="default@sellform.local", name="Default Seller")
+    workspace = Workspace(id=DEFAULT_WORKSPACE_ID, name="Default Workspace", owner_id=user.id)
+    brand = Brand(id=DEFAULT_BRAND_ID, workspace_id=workspace.id, name="Default Brand")
+    project = ProductProject(
+        id="failed-image-candidate-project",
+        workspace_id=workspace.id,
+        brand_id=brand.id,
+        name="Failed Image Product",
+        status="ready",
+    )
+    page = ProductPage(id="failed-image-candidate-page", project_id=project.id)
+    section = PageSection(
+        id="failed-image-candidate-section",
+        page_id=page.id,
+        section_type="hero",
+        title="Hero",
+        body_copy="Hero copy",
+        image_asset_id=None,
+        visual_kind="image",
+        visual_payload={"strategy": "image_overlay"},
+        sort_order=0,
+        is_visible=True,
+    )
+    job = ImageGenerationJobRecord(
+        project_id=project.id,
+        job_id="failed-image-candidate-job",
+        section_id=section.id,
+        role="hero",
+        source_asset_ids=[],
+        prompt="Create a commerce image",
+        preserve_product_identity=False,
+        output_size="1024x1024",
+        cost_tier="premium",
+        status="failed",
+        provider="openai",
+        model="gpt-image-1-mini",
+        error_code="INVALID_REQUEST",
+        warnings=["INVALID_REQUEST: quality is not supported for this model"],
+    )
+    db_session.add_all([user, workspace, brand, project, page, section, job])
+    db_session.commit()
+
+    response = client.get(
+        "/api/v1/projects/failed-image-candidate-project/page",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    hero = response.json()["sections"][0]
+    candidate = hero["image_candidates"][0]
+    assert candidate["status"] == "failed"
+    assert candidate["label"] == "\uc774\ubbf8\uc9c0 \uc0dd\uc131 \uc2e4\ud328"
+    assert candidate["error_code"] == "INVALID_REQUEST"
+    assert "quality is not supported" in candidate["warnings"][0]
+
 
 def test_create_page_and_filter_unconfirmed_facts(client, db_session):
     headers = {

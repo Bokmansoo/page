@@ -9,6 +9,10 @@ from src.services.image_generation_provider import ImageGenerationRequest, Image
 logger = logging.getLogger(__name__)
 
 
+def _compact_error_message(error: Exception, limit: int = 500) -> str:
+    return " ".join(str(error).split())[:limit]
+
+
 class OpenAIImageProvider:
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         self.api_key = api_key or settings.OPENAI_API_KEY
@@ -102,13 +106,20 @@ class OpenAIImageProvider:
 
         except BadRequestError as e:
             # Often moderation block or invalid format/size
-            err_msg = str(e).lower()
-            if "safety" in err_msg or "policy" in err_msg or "moderation" in err_msg:
+            detail = _compact_error_message(e)
+            err_msg = detail.lower()
+            if (
+                "billing_hard_limit_reached" in err_msg
+                or "billing_limit_user_error" in err_msg
+                or "billing hard limit" in err_msg
+            ):
+                error_code = "BILLING_HARD_LIMIT_REACHED"
+            elif "safety" in err_msg or "policy" in err_msg or "moderation" in err_msg:
                 error_code = "MODERATION_REJECTED"
             else:
                 error_code = "INVALID_REQUEST"
             logger.error(f"OpenAI BadRequestError: {e}")
-            raise RuntimeError(error_code) from e
+            raise RuntimeError(f"{error_code}: {detail}") from e
 
         except AuthenticationError as e:
             logger.error(f"OpenAI AuthenticationError: {e}")

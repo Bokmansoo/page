@@ -289,6 +289,38 @@ def get_image_candidates_for_section(
         .order_by(ImageGenerationJobRecord.updated_at.desc())
         .all()
     )
+
+    if job_records:
+        enriched_candidates = []
+        for job in job_records:
+            if job.output_asset_id:
+                label = "\uc0dd\uc131 \uc774\ubbf8\uc9c0"
+            elif job.status == "failed":
+                label = "\uc774\ubbf8\uc9c0 \uc0dd\uc131 \uc2e4\ud328"
+            else:
+                label = "\uc774\ubbf8\uc9c0 \uc0dd\uc131 \ub300\uae30"
+
+            cand_dict = {
+                "candidate_id": job.job_id,
+                "asset_id": job.output_asset_id,
+                "label": label,
+                "source_type": "ai_generated",
+                "status": job.status,
+                "prompt": job.prompt,
+                "error_code": job.error_code,
+                "warnings": job.warnings or [],
+                "provider": job.provider,
+                "model": job.model,
+            }
+            if job.output_asset_id:
+                asset = db.query(Asset).filter(Asset.id == job.output_asset_id).first()
+                if asset:
+                    cand_dict["source_asset_id"] = asset.source_asset_id
+                    cand_dict["cutout_status"] = asset.cutout_status
+                    cand_dict["background_removed"] = asset.background_removed
+                    cand_dict["product_identity_preserved"] = asset.product_identity_preserved
+            enriched_candidates.append(cand_dict)
+        return enriched_candidates
     
     candidates = []
     if job_records:

@@ -14,6 +14,12 @@ logger = logging.getLogger(__name__)
 RETRYABLE_PROVIDER_ERRORS = {"RATE_LIMIT_EXCEEDED", "TIMEOUT"}
 
 
+def _split_provider_error(error: Exception) -> tuple[str, str]:
+    detail = " ".join(str(error).split())[:500]
+    code = detail.split(":", 1)[0].strip() or "PROVIDER_ERROR"
+    return code, detail
+
+
 def get_or_create_job_record(project_id: str, job_id: str, db: Session) -> ImageGenerationJobRecord:
     # 1. Look up in table
     record = db.query(ImageGenerationJobRecord).filter(
@@ -185,11 +191,14 @@ def execute_image_generation(
             result = provider.generate(req)
             break
         except Exception as e:
-            error_code = str(e)
-            logger.error(f"Image generation provider failed: {error_code}")
+            error_code, error_detail = _split_provider_error(e)
+            logger.error(f"Image generation provider failed: {error_detail}")
             if error_code not in RETRYABLE_PROVIDER_ERRORS or provider_attempt == 1:
                 record.status = "failed"
+                record.provider = settings.SELLFORM_IMAGE_PROVIDER
+                record.model = settings.SELLFORM_IMAGE_MODEL
                 record.error_code = error_code
+                record.warnings = [error_detail]
                 db.commit()
                 sync_job_to_project_json(project_id, job_id, db)
                 raise
