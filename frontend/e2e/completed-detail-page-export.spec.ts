@@ -60,6 +60,29 @@ test("shows a completed page and downloads PNG/JPG via browser download", async 
               },
             ],
           },
+          {
+            id: "fact-card-section",
+            section_type: "benefits_summary",
+            title: "확인된 핵심 수치",
+            body_copy: "",
+            image_asset_id: null,
+            visual_kind: "html_graphic",
+            visual_payload: {
+              layout_variant: "numeric_highlights",
+              highlights: [
+                {
+                  label: "연속 사용 시간",
+                  value: "40분",
+                  body: "판매자가 확인한 상품 정보입니다.",
+                  verification_status: "confirmed",
+                  source_fact_ids: ["fact-40-minutes"],
+                },
+              ],
+            },
+            sort_order: 2,
+            is_visible: true,
+            image_candidates: [],
+          },
         ],
       }),
     });
@@ -180,6 +203,7 @@ test("shows a completed page and downloads PNG/JPG via browser download", async 
   await expect(page.getByAltText("공간마다 따라오는 나만의 화면")).toHaveAttribute("src", /hero-generated/);
   await expect(page.getByText("직접 업로드").first()).toBeVisible();
   await expect(page.getByText("ai_generated", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("40분", { exact: true })).toBeVisible();
 
   // Test PNG download via browser download event.
   const pngDownloadPromise = page.waitForEvent("download");

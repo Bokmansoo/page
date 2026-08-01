@@ -5,12 +5,43 @@ export interface VisualCard {
   title: string;
   body: string;
   tone?: "positive" | "muted" | "warning";
+  verification_status: "confirmed";
+  provenance_label?: string;
+  source_fact_ids: string[];
 }
 
 export interface VisualTableRow {
   label: string;
   value: string;
-  verification_status?: string;
+  verification_status: "confirmed";
+  provenance_label?: string;
+  source_fact_ids: string[];
+}
+
+export interface VisualNumericHighlight {
+  label: string;
+  value: string;
+  body?: string;
+  verification_status: "confirmed";
+  provenance_label?: string;
+  source_fact_ids: string[];
+}
+
+export interface VisualStep {
+  step: number;
+  title: string;
+  body: string;
+  verification_status: "confirmed";
+  provenance_label?: string;
+  source_fact_ids: string[];
+}
+
+export interface VisualChecklistItem {
+  text: string;
+  kind?: "seller_action";
+  verification_status: "confirmed" | "action_required";
+  provenance_label?: string;
+  source_fact_ids: string[];
 }
 
 export interface VisualPayload {
@@ -21,16 +52,23 @@ export interface VisualPayload {
     | "image_text"
     | "comparison_cards"
     | "benefit_cards"
-    | "spec_table";
+    | "numeric_highlights"
+    | "spec_table"
+    | "steps"
+    | "checklist";
   eyebrow?: string;
   badges?: string[];
   cards?: VisualCard[];
+  highlights?: VisualNumericHighlight[];
   table_rows?: VisualTableRow[];
+  steps?: VisualStep[];
+  items?: VisualChecklistItem[];
   palette?: { surface?: string; accent?: string; text?: string };
   product_fit?: "contain";
   text_safe_area?: "left" | "bottom";
   background_token?: "surface_mint" | "surface_ink" | "surface_sand";
   decoration_tokens?: string[];
+  missing_state?: "product_photo_required" | "quality_review_required" | "source_approval_required" | "ai_redesign_required";
 }
 
 export interface DetailPageSectionVisual {
@@ -66,7 +104,10 @@ export function validateSectionVisual(
     "image_text",
     "comparison_cards",
     "benefit_cards",
+    "numeric_highlights",
     "spec_table",
+    "steps",
+    "checklist",
   ]);
 
   if (!validKinds.includes(kind)) {
@@ -97,14 +138,49 @@ export function validateSectionVisual(
     if (!layout || !validLayouts.has(layout)) {
       issues.push("invalid_html_layout");
     }
-    if (
-      (layout === "comparison_cards" || layout === "benefit_cards") &&
-      (!payload.cards || (payload.cards as unknown[]).length === 0)
-    ) {
-      issues.push("html_cards_required");
+    const isText = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
+    const isGrounded = (item: unknown, fields: string[]) => {
+      if (!item || typeof item !== "object") return false;
+      const record = item as Record<string, unknown>;
+      return (
+        record.verification_status === "confirmed" &&
+        Array.isArray(record.source_fact_ids) &&
+        record.source_fact_ids.length > 0 &&
+        record.source_fact_ids.every(isText) &&
+        fields.every((field) => isText(record[field]))
+      );
+    };
+    if (layout === "comparison_cards" || layout === "benefit_cards") {
+      const cards = payload.cards;
+      if (!Array.isArray(cards) || cards.length === 0) issues.push("html_cards_required");
+      else if (!cards.every((card) => isGrounded(card, ["title", "body"]))) issues.push("html_card_grounding_required");
     }
-    if (layout === "spec_table" && (!payload.table_rows || (payload.table_rows as unknown[]).length === 0)) {
-      issues.push("spec_rows_required");
+    if (layout === "numeric_highlights") {
+      const highlights = payload.highlights;
+      if (!Array.isArray(highlights) || highlights.length === 0) issues.push("numeric_highlights_required");
+      else if (!highlights.every((item) => isGrounded(item, ["label", "value"]))) issues.push("numeric_highlight_grounding_required");
+    }
+    if (layout === "spec_table") {
+      const rows = payload.table_rows;
+      if (!Array.isArray(rows) || rows.length === 0) issues.push("spec_rows_required");
+      else if (!rows.every((row) => isGrounded(row, ["label", "value"]))) issues.push("spec_row_grounding_required");
+    }
+    if (layout === "steps") {
+      const steps = payload.steps;
+      if (!Array.isArray(steps) || steps.length === 0) issues.push("html_steps_required");
+      else if (!steps.every((step) => {
+        const record = step as Record<string, unknown>;
+        return typeof record.step === "number" && record.step > 0 && isGrounded(step, ["title", "body"]);
+      })) issues.push("html_step_grounding_required");
+    }
+    if (layout === "checklist") {
+      const items = payload.items;
+      if (!Array.isArray(items) || items.length === 0) issues.push("html_checklist_required");
+      else if (!items.every((item) => {
+        if (isGrounded(item, ["text"])) return true;
+        const record = item as Record<string, unknown>;
+        return record.kind === "seller_action" && record.verification_status === "action_required" && Array.isArray(record.source_fact_ids) && record.source_fact_ids.length === 0 && isText(record.text);
+      })) issues.push("html_checklist_grounding_required");
     }
   }
   return issues;

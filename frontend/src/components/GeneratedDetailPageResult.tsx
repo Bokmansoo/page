@@ -26,6 +26,7 @@ interface ImageCandidate {
   status?: string | null;
   error_code?: string | null;
   warnings?: string[] | null;
+  quality_warnings?: string[] | null;
   provider?: string | null;
   model?: string | null;
   source_asset_id?: string | null;
@@ -147,6 +148,7 @@ function sourceLabel(sourceType: string): string {
     case "real-generated":
       return "AI 생성 이미지";
     case "ai-generated":
+    case "ai_generated":
       return "AI 생성";
     case "generation-skipped":
       return "생성 생략";
@@ -179,6 +181,7 @@ function readableSourceLabel(sourceType: string): string {
     case "real-generated":
       return "AI 생성 이미지";
     case "ai-generated":
+    case "ai_generated":
       return "AI 생성";
     case "generation-skipped":
       return "HTML 그래픽";
@@ -193,6 +196,9 @@ function readableSourceLabel(sourceType: string): string {
 
 function assetSourceLabel(asset?: ProjectAsset | null): string {
   if (!asset) return "사진 필요";
+  if (asset.source_type === "local_upscaled") {
+    return "자동 고화질 보정본";
+  }
   if (asset.background_removed || asset.cutout_status === "completed" || asset.source_type === "ai_corrected") {
     return "실제 상품 누끼 사용";
   }
@@ -205,7 +211,10 @@ function assetSourceLabel(asset?: ProjectAsset | null): string {
   return readableSourceLabel(asset.source_type);
 }
 
-function candidateSourceLabel(candidate: ImageCandidate): string {
+function candidateSourceLabel(candidate: ImageCandidate, linkedAsset?: ProjectAsset | null): string {
+  if (linkedAsset) {
+    return assetSourceLabel(linkedAsset);
+  }
   if (candidate.background_removed || candidate.cutout_status === "completed" || candidate.source_type === "ai_corrected") {
     return "실제 상품 누끼 사용";
   }
@@ -219,6 +228,9 @@ function candidateSourceLabel(candidate: ImageCandidate): string {
 }
 
 function candidateWarningLabel(candidate: ImageCandidate): string | null {
+  if (candidate.error_code === "LOW_QUALITY_HERO_SOURCE") {
+    return "저화질 이미지라 HERO 자동 적용에서 제외되었습니다.";
+  }
   if (candidate.status === "failed") {
     return candidate.error_code
       ? `\uc774\ubbf8\uc9c0 \uc0dd\uc131 \uc2e4\ud328: ${candidate.error_code}`
@@ -973,7 +985,10 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
               .filter((section) => section.section_type !== "product_information")
               .map((section) => {
                 const cands = (section.image_candidates || []).filter(
-                  (candidate) => candidate.source_type !== "mock-generated"
+                  (candidate) => {
+                    const linkedAsset = assets.find((asset) => asset.id === candidate.asset_id);
+                    return (linkedAsset?.source_type || candidate.source_type) !== "mock-generated";
+                  }
                 );
                 return (
                   <div key={section.id} className="space-y-3 border-b border-slate-100 pb-5 last:border-0">
@@ -989,8 +1004,9 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
                       <div className="grid grid-cols-2 gap-2">
                         {cands.map((cand) => {
                           const isSelected = Boolean(cand.asset_id) && section.image_asset_id === cand.asset_id;
-                          const requiresUrlApproval = ["url-extracted", "url-imported"].includes(cand.source_type);
                           const candAsset = assets.find((asset) => asset.id === cand.asset_id);
+                          const effectiveSourceType = candAsset?.source_type || cand.source_type;
+                          const requiresUrlApproval = ["url-extracted", "url-imported"].includes(effectiveSourceType);
                           const candThumbnail = cand.asset_id
                             ? assetUrl(candAsset || { id: cand.asset_id })
                             : null;
@@ -1012,7 +1028,7 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
                                   </span>
                                 )}
                                 <span className="absolute right-1.5 top-1.5 rounded-full bg-slate-900/80 px-1.5 py-0.5 text-[8px] font-bold text-white">
-                                  {candidateSourceLabel(cand)}
+                                  {candidateSourceLabel(cand, candAsset)}
                                 </span>
                               </div>
                               <p className="mt-2 truncate text-[10px] font-bold text-slate-700">{cand.label}</p>
@@ -1027,6 +1043,26 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
                               {candAsset?.quality_warnings?.length ? (
                                 <p className="mt-1 text-[10px] font-bold text-amber-700">
                                   {candAsset.quality_warnings.join(", ")}
+                                </p>
+                              ) : null}
+                              {cand.error_code === "LOW_QUALITY_HERO_SOURCE" ? (
+                                <p className="mt-1 text-[10px] leading-4 text-slate-500">
+                                  고화질로 보정하거나, 위의 이미지 분류에서 다른 사진을 선택해 주세요.
+                                </p>
+                              ) : null}
+                              {candAsset?.quality_warnings?.includes("LOW_RESOLUTION") && candAsset.source_type !== "local_upscaled" ? (
+                                <button
+                                  type="button"
+                                  disabled={upscalingAssetId === candAsset.id}
+                                  onClick={() => handleCreateUpscale(candAsset)}
+                                  className="mt-2 w-full rounded bg-amber-600 py-1.5 text-[10px] font-bold text-white hover:bg-amber-700 disabled:bg-slate-300"
+                                >
+                                  {upscalingAssetId === candAsset.id ? "고화질 보정 중..." : "고화질로 보정"}
+                                </button>
+                              ) : null}
+                              {candAsset?.source_type === "local_upscaled" ? (
+                                <p className="mt-1 text-[10px] font-semibold leading-4 text-emerald-700">
+                                  저화질 원본에서 자동으로 준비한 보정본입니다. 확인 후 이 이미지를 선택하세요.
                                 </p>
                               ) : null}
                               {cand.status === "failed" && cand.warnings?.length ? (

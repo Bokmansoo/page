@@ -8,10 +8,11 @@ from sqlalchemy.orm import Session
 
 from src.api.auth import get_current_user_and_workspace
 from src.db.database import get_db
-from src.db.models import AgentRun, AgentRunStep, Asset, Brand, ProductProject
+from src.db.models import AgentRun, AgentRunStep, Asset, Brand, ProductProject, SourceCapture
 from src.services.intake_structuring_service import structure_intake
 from src.services.url_evidence_collector import collect_url_evidence
 from src.services.generation_status_service import GenerationStatusService
+from src.services.seller_fact_ingestion_service import persist_confirmed_seller_specs
 
 
 router = APIRouter(prefix="/agent-runs", tags=["agent-runs"])
@@ -45,6 +46,52 @@ def _image_mime_type_from_url(image_url: str) -> str:
     }.get(suffix, "image/jpeg")
 
 
+def _platform_from_url(source_url: str) -> str:
+    host = (urlparse(source_url).hostname or "").lower().removeprefix("www.")
+    for key, label in (
+        ("1688.com", "1688"),
+        ("coupang.com", "coupang"),
+        ("xiaohongshu.com", "xiaohongshu"),
+        ("xhslink.com", "xiaohongshu"),
+        ("smartstore.naver.com", "naver_smartstore"),
+    ):
+        if host == key or host.endswith(f".{key}"):
+            return label
+    return host or "unknown"
+
+
+def _collection_failure_code(error: Exception) -> str:
+    message = str(error).lower()
+    if "403" in message or "forbidden" in message:
+        return "http_403"
+    if "401" in message or "login" in message or "sign in" in message:
+        return "login_required"
+    if "captcha" in message or "verify you are human" in message:
+        return "captcha_required"
+    if "dynamic" in message or "javascript" in message:
+        return "dynamic_page"
+    if "timeout" in message:
+        return "timeout"
+    return "collection_failed"
+
+
+def _asset_snapshot(assets: list[Asset], ordered_ids: list[str]) -> list[dict[str, Any]]:
+    assets_by_id = {asset.id: asset for asset in assets}
+    return [
+        {
+            "asset_id": asset.id,
+            "order": index + 1,
+            "filename": asset.filename,
+            "mime_type": asset.mime_type,
+            "file_size": asset.file_size,
+            "source_type": asset.source_type,
+            "usage_status": asset.usage_status,
+        }
+        for index, asset_id in enumerate(ordered_ids)
+        if (asset := assets_by_id.get(asset_id)) is not None
+    ]
+
+
 def _persist_collected_url_images(
     db: Session,
     project_id: str,
@@ -58,14 +105,17 @@ def _persist_collected_url_images(
     sections, candidates, and future provenance work.
     """
     persisted: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
     for image in collected_images:
         image_url = image.get("url") or ""
-        if not image_url.startswith(("https://", "http://")):
+        if not image_url.startswith(("https://", "http://")) or image_url in seen_urls:
             continue
+        seen_urls.add(image_url)
         filename = image.get("filename") or urlparse(image_url).path.rsplit("/", 1)[-1] or "url-image"
         asset = Asset(
             project_id=project_id,
             source_type="url-extracted",
+            usage_status="reference_only",
             filename=filename[:255],
             file_path=image_url,
             mime_type=_image_mime_type_from_url(image_url),
@@ -85,7 +135,11 @@ def _persist_collected_url_images(
 # Pydantic Schemas
 class ProductInputSchema(BaseModel):
     product_name: str = ""
+    category: Optional[str] = None
     description: Optional[str] = None
+    feature_details: Optional[str] = None
+    components: Optional[str] = None
+    cautions: Optional[str] = None
     product_url: Optional[str] = None
     freeform_input: Optional[str] = None
     asset_ids: List[str] = Field(default_factory=list)
@@ -93,19 +147,40 @@ class ProductInputSchema(BaseModel):
     selling_points: List[str] = Field(default_factory=list)
     price: Optional[str] = None
     shipping: Optional[str] = None
+    sales_channel: Optional[str] = None
+    model_options: Optional[str] = None
     desired_mood: List[str] = Field(default_factory=list)
+
+
+class SourceCaptureSchema(BaseModel):
+    url: str
+    platform: str
+    source_role: str
+    collection_status: str
+    failure_code: Optional[str] = None
+    error_message: Optional[str] = None
+    collected_image_count: int = 0
+    collected_spec_count: int = 0
 
 
 class AgentRunCreateRequest(BaseModel):
     product_name: str = ""
+    category: Optional[str] = None
     description: Optional[str] = None
+    feature_details: Optional[str] = None
+    components: Optional[str] = None
+    cautions: Optional[str] = None
     product_url: Optional[str] = None
     freeform_input: Optional[str] = None
-    asset_ids: List[str] = Field(default_factory=list)
+    # Assets are attached only after the draft project exists. Accepting ids at
+    # project creation would make ownership impossible to validate correctly.
+    asset_ids: List[str] = Field(default_factory=list, max_length=0)
     reference_urls: List[str] = Field(default_factory=list, max_length=3)
     selling_points: List[str] = Field(default_factory=list)
     price: Optional[str] = None
     shipping: Optional[str] = None
+    sales_channel: Optional[str] = None
+    model_options: Optional[str] = None
     desired_mood: List[str] = Field(default_factory=list)
     planning_mode: Optional[str] = "quality"
     force_new: bool = False
@@ -120,6 +195,40 @@ class AgentRunResponseSchema(BaseModel):
     product_input: ProductInputSchema
     outputs: Dict[str, Any] = Field(default_factory=dict)
     planning_mode: Optional[str] = "quality"
+    collection_warnings: List[str] = Field(default_factory=list)
+    source_captures: List[SourceCaptureSchema] = Field(default_factory=list)
+    input_guidance: List[str] = Field(default_factory=list)
+
+
+def _capture_schema(capture: SourceCapture | dict[str, Any]) -> SourceCaptureSchema:
+    if isinstance(capture, dict):
+        return SourceCaptureSchema(**capture)
+    return SourceCaptureSchema(
+        url=capture.url,
+        platform=capture.platform,
+        source_role=capture.source_role,
+        collection_status=capture.collection_status,
+        failure_code=capture.failure_code,
+        error_message=capture.error_message,
+        collected_image_count=capture.collected_image_count,
+        collected_spec_count=capture.collected_spec_count,
+    )
+
+
+def _input_guidance(captures: list[SourceCapture | dict[str, Any]]) -> list[str]:
+    if any(
+        (item.get("collection_status") if isinstance(item, dict) else item.collection_status)
+        in {"access_limited", "failed"}
+        for item in captures
+    ):
+        return ["링크 자료를 모두 가져오지 못했습니다. 대표 사진과 기능·사용 장면·구성품 사진을 직접 올려 계속 진행할 수 있습니다."]
+    return []
+
+
+class AgentRunInputAssetsRequest(BaseModel):
+    """Ordered seller image assets selected during the Sprint 1 intake flow."""
+
+    asset_ids: List[str] = Field(default_factory=list, max_length=20)
 
 
 class AgentRunProgressStepSchema(BaseModel):
@@ -244,6 +353,7 @@ def create_agent_run(
     collected_text: list[str] = []
     collected_ocr_text: list[str] = []
     collection_warnings: list[str] = []
+    source_capture_attempts: list[dict[str, Any]] = []
     collected_product_name = ""
 
     for source_role, source_url in [
@@ -252,6 +362,16 @@ def create_agent_run(
     ]:
         if not source_url:
             continue
+        capture = {
+            "url": source_url,
+            "platform": _platform_from_url(source_url),
+            "source_role": source_role,
+            "collection_status": "pending",
+            "failure_code": None,
+            "error_message": None,
+            "collected_image_count": 0,
+            "collected_spec_count": 0,
+        }
         try:
             evidence = collect_url_evidence(
                 source_url,
@@ -278,8 +398,35 @@ def create_agent_run(
                 ]
             )
             collected_ocr_text.extend(evidence.ocr_text_blocks)
+            image_count = len(evidence.image_urls)
+            spec_count = len(evidence.specs)
+            # A marketplace can return a login shell or anti-bot placeholder
+            # with HTTP 200.  It is not a successful collection when no
+            # structured product evidence was actually obtained.
+            if image_count == 0 and spec_count == 0:
+                capture.update(
+                    collection_status="access_limited",
+                    failure_code="no_extractable_evidence",
+                    error_message="상품 이미지나 스펙을 수집하지 못했습니다. 직접 업로드한 자료로 계속 진행할 수 있습니다.",
+                )
+                collection_warnings.append(
+                    f"{source_url}: no extractable product images or specifications"
+                )
+            else:
+                capture.update(
+                    collection_status="collected",
+                    collected_image_count=image_count,
+                    collected_spec_count=spec_count,
+                )
         except Exception as exc:
+            failure_code = _collection_failure_code(exc)
+            capture.update(
+                collection_status="access_limited" if failure_code in {"http_403", "login_required", "captcha_required", "dynamic_page"} else "failed",
+                failure_code=failure_code,
+                error_message=str(exc)[:1000],
+            )
             collection_warnings.append(f"{source_url}: {exc}")
+        source_capture_attempts.append(capture)
 
     resolved_product_name = req.product_name or collected_product_name
 
@@ -326,11 +473,55 @@ def create_agent_run(
         raw_input_url=req.product_url,
         status="draft",
         current_step="raw_input",
+        category=req.category,
+        category_confirmed=bool(req.category),
+        category_confirmed_by=user.id if req.category else None,
+        category_confirmed_at=datetime.utcnow() if req.category else None,
         planning_mode=req.planning_mode or "quality",
+        intake_snapshot={
+            "input_bundle": {
+                "product_name": resolved_product_name,
+                "category": req.category,
+                "description": req.description,
+                "feature_details": req.feature_details,
+                "components": req.components,
+                "cautions": req.cautions,
+                "price": req.price,
+                "shipping": req.shipping,
+                "sales_channel": req.sales_channel,
+                "model_options": req.model_options,
+                "product_url": req.product_url,
+                "reference_urls": req.reference_urls,
+                "asset_ids": list(req.asset_ids or []),
+                "asset_records": [],
+                "source_captures": source_capture_attempts,
+            }
+        },
     )
     db.add(project)
     db.commit()
     db.refresh(project)
+
+    for capture in source_capture_attempts:
+        db.add(SourceCapture(project_id=project.id, **capture))
+    db.commit()
+
+    # Numeric specifications entered directly by the seller are first-party
+    # facts. Persist them before generation so Sprint 4 can build grounded
+    # spec tables and numeric highlights even when no LLM extraction is used.
+    persist_confirmed_seller_specs(
+        db,
+        project.id,
+        [
+            req.description,
+            req.feature_details,
+            req.components,
+            req.cautions,
+            req.freeform_input,
+            *(req.selling_points or []),
+        ],
+    )
+    db.commit()
 
     # Preserve URL-collected product photos as first-class assets. They are later
     # preferred after uploads and can be linked to a page section by id.
@@ -344,6 +535,15 @@ def create_agent_run(
     input_asset_ids = list(
         dict.fromkeys([*(req.asset_ids or []), *(image["asset_id"] for image in collected_images)])
     )
+    if input_asset_ids:
+        assets = db.query(Asset).filter(Asset.project_id == project.id, Asset.id.in_(input_asset_ids)).all()
+        intake_snapshot = dict(project.intake_snapshot or {})
+        input_bundle = dict(intake_snapshot.get("input_bundle") or {})
+        input_bundle["asset_ids"] = input_asset_ids
+        input_bundle["asset_records"] = _asset_snapshot(assets, input_asset_ids)
+        intake_snapshot["input_bundle"] = input_bundle
+        project.intake_snapshot = intake_snapshot
+        db.commit()
 
     # 3. Create AgentRun
     run_id = str(uuid.uuid4())
@@ -356,7 +556,11 @@ def create_agent_run(
         current_stage="intake",
         input_snapshot={
             "product_name": resolved_product_name,
+            "category": req.category,
             "description": req.description,
+            "feature_details": req.feature_details,
+            "components": req.components,
+            "cautions": req.cautions,
             "product_url": req.product_url,
             "freeform_input": req.freeform_input,
             "asset_ids": input_asset_ids,
@@ -364,6 +568,8 @@ def create_agent_run(
             "selling_points": req.selling_points,
             "price": req.price,
             "shipping": req.shipping,
+            "sales_channel": req.sales_channel,
+            "model_options": req.model_options,
             "desired_mood": req.desired_mood,
             "url_images": collected_images,
             "url_specs": collected_specs,
@@ -386,7 +592,11 @@ def create_agent_run(
         current_stage=run.current_stage,
         product_input=ProductInputSchema(
             product_name=resolved_product_name,
+            category=req.category,
             description=req.description,
+            feature_details=req.feature_details,
+            components=req.components,
+            cautions=req.cautions,
             product_url=req.product_url,
             freeform_input=req.freeform_input,
             asset_ids=input_asset_ids,
@@ -394,9 +604,119 @@ def create_agent_run(
             selling_points=req.selling_points,
             price=req.price,
             shipping=req.shipping,
+            sales_channel=req.sales_channel,
+            model_options=req.model_options,
             desired_mood=req.desired_mood,
         ),
         planning_mode=project.planning_mode,
+        collection_warnings=collection_warnings,
+        source_captures=[_capture_schema(capture) for capture in source_capture_attempts],
+        input_guidance=_input_guidance(source_capture_attempts),
+    )
+
+
+@router.patch("/{id}/input-assets", response_model=AgentRunResponseSchema)
+def update_agent_run_input_assets(
+    id: str,
+    req: AgentRunInputAssetsRequest,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Persist the seller's image order before any agent stage is executed."""
+    workspace = auth_ctx["workspace"]
+    run = (
+        db.query(AgentRun)
+        .filter(AgentRun.id == id, AgentRun.workspace_id == workspace.id)
+        .first()
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="AgentRun not found")
+
+    project = db.query(ProductProject).filter(ProductProject.id == run.project_id).first()
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    existing_intake_snapshot = dict(project.intake_snapshot or {})
+    if existing_intake_snapshot.get("input_bundle_locked"):
+        raise HTTPException(
+            status_code=409,
+            detail="The product input bundle is already confirmed. Create a new run to change image order.",
+        )
+
+    ordered_ids = list(dict.fromkeys(req.asset_ids))
+    if not ordered_ids:
+        raise HTTPException(
+            status_code=422,
+            detail="A representative product image is required before confirming the input bundle.",
+        )
+    assets = db.query(Asset).filter(Asset.project_id == run.project_id, Asset.id.in_(ordered_ids)).all()
+    if len(assets) != len(ordered_ids) or any(not asset.mime_type.startswith("image/") for asset in assets):
+        raise HTTPException(status_code=422, detail="asset_ids must be image assets from this project")
+
+    input_snapshot = run.input_snapshot or {}
+    if not str(input_snapshot.get("product_name") or "").strip() and not str(input_snapshot.get("product_url") or "").strip():
+        raise HTTPException(status_code=422, detail="A product name or product URL is required.")
+    seller_core_fields = [
+        input_snapshot.get("description"),
+        input_snapshot.get("feature_details"),
+        input_snapshot.get("components"),
+        input_snapshot.get("cautions"),
+        input_snapshot.get("freeform_input"),
+        *(input_snapshot.get("selling_points") or []),
+    ]
+    if not any(str(value or "").strip() for value in seller_core_fields):
+        raise HTTPException(
+            status_code=422,
+            detail="At least one seller-confirmed product fact is required before confirming the input bundle.",
+        )
+
+    assets_by_id = {asset.id: asset for asset in assets}
+    for index, asset_id in enumerate(ordered_ids, start=1):
+        assets_by_id[asset_id].intake_order = index
+
+    snapshot = dict(run.input_snapshot or {})
+    snapshot["asset_ids"] = ordered_ids
+    snapshot["asset_records"] = _asset_snapshot(assets, ordered_ids)
+    run.input_snapshot = snapshot
+    input_bundle = dict(existing_intake_snapshot.get("input_bundle") or {})
+    input_bundle["asset_ids"] = ordered_ids
+    input_bundle["asset_records"] = _asset_snapshot(assets, ordered_ids)
+    input_bundle["confirmed_at"] = datetime.utcnow().isoformat()
+    existing_intake_snapshot["input_bundle"] = input_bundle
+    existing_intake_snapshot["input_bundle_locked"] = True
+    project.intake_snapshot = existing_intake_snapshot
+    db.commit()
+    db.refresh(run)
+    source_captures = db.query(SourceCapture).filter(SourceCapture.project_id == run.project_id).all()
+
+    return AgentRunResponseSchema(
+        id=run.id,
+        project_id=run.project_id,
+        workspace_id=run.workspace_id,
+        mode=run.mode,
+        current_stage=run.current_stage,
+        product_input=ProductInputSchema(
+            product_name=run.input_snapshot.get("product_name") or "",
+            category=run.input_snapshot.get("category"),
+            description=run.input_snapshot.get("description"),
+            feature_details=run.input_snapshot.get("feature_details"),
+            components=run.input_snapshot.get("components"),
+            cautions=run.input_snapshot.get("cautions"),
+            product_url=run.input_snapshot.get("product_url"),
+            freeform_input=run.input_snapshot.get("freeform_input"),
+            asset_ids=run.input_snapshot.get("asset_ids") or [],
+            reference_urls=run.input_snapshot.get("reference_urls") or [],
+            selling_points=run.input_snapshot.get("selling_points") or [],
+            price=run.input_snapshot.get("price"),
+            shipping=run.input_snapshot.get("shipping"),
+            sales_channel=run.input_snapshot.get("sales_channel"),
+            model_options=run.input_snapshot.get("model_options"),
+            desired_mood=run.input_snapshot.get("desired_mood") or [],
+        ),
+        outputs=run.outputs_json or {},
+        planning_mode=run.project.planning_mode if run.project else "quality",
+        collection_warnings=run.input_snapshot.get("source_collection_warnings") or [],
+        source_captures=[_capture_schema(capture) for capture in source_captures],
+        input_guidance=_input_guidance(source_captures),
     )
 
 
@@ -414,6 +734,7 @@ def run_mock(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
+    source_captures = db.query(SourceCapture).filter(SourceCapture.project_id == run.project_id).all()
     return AgentRunResponseSchema(
         id=run.id,
         project_id=run.project_id,
@@ -422,14 +743,23 @@ def run_mock(
         current_stage=run.current_stage,
         product_input=ProductInputSchema(
             product_name=run.input_snapshot.get("product_name") or "",
+            category=run.input_snapshot.get("category"),
             description=run.input_snapshot.get("description"),
+            feature_details=run.input_snapshot.get("feature_details"),
+            components=run.input_snapshot.get("components"),
+            cautions=run.input_snapshot.get("cautions"),
             product_url=run.input_snapshot.get("product_url"),
             freeform_input=run.input_snapshot.get("freeform_input"),
             asset_ids=run.input_snapshot.get("asset_ids") or [],
             reference_urls=run.input_snapshot.get("reference_urls") or [],
+            sales_channel=run.input_snapshot.get("sales_channel"),
+            model_options=run.input_snapshot.get("model_options"),
         ),
         outputs=run.outputs_json,
         planning_mode=run.project.planning_mode if run.project else "quality",
+        collection_warnings=run.input_snapshot.get("source_collection_warnings") or [],
+        source_captures=[_capture_schema(capture) for capture in source_captures],
+        input_guidance=_input_guidance(source_captures),
     )
 
 
@@ -447,6 +777,7 @@ def run_real(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
+    source_captures = db.query(SourceCapture).filter(SourceCapture.project_id == run.project_id).all()
     return AgentRunResponseSchema(
         id=run.id,
         project_id=run.project_id,
@@ -455,12 +786,21 @@ def run_real(
         current_stage=run.current_stage,
         product_input=ProductInputSchema(
             product_name=run.input_snapshot.get("product_name") or "",
+            category=run.input_snapshot.get("category"),
             description=run.input_snapshot.get("description"),
+            feature_details=run.input_snapshot.get("feature_details"),
+            components=run.input_snapshot.get("components"),
+            cautions=run.input_snapshot.get("cautions"),
             product_url=run.input_snapshot.get("product_url"),
             freeform_input=run.input_snapshot.get("freeform_input"),
             asset_ids=run.input_snapshot.get("asset_ids") or [],
             reference_urls=run.input_snapshot.get("reference_urls") or [],
+            sales_channel=run.input_snapshot.get("sales_channel"),
+            model_options=run.input_snapshot.get("model_options"),
         ),
         outputs=run.outputs_json,
         planning_mode=run.project.planning_mode if run.project else "quality",
+        collection_warnings=run.input_snapshot.get("source_collection_warnings") or [],
+        source_captures=[_capture_schema(capture) for capture in source_captures],
+        input_guidance=_input_guidance(source_captures),
     )

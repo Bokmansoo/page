@@ -9,14 +9,20 @@ from sqlalchemy import (
     Text,
     JSON,
     Float,
-    Boolean
+    Boolean,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 from src.db.database import Base
+from src.services.commerce_policy import initial_asset_usage_status
 
 
 def generate_uuid():
     return str(uuid.uuid4())
+
+
+def default_asset_usage_status(context):
+    return initial_asset_usage_status(context.get_current_parameters().get("source_type"))
 
 
 class User(Base):
@@ -88,6 +94,7 @@ class ProductProject(Base):
     workspace = relationship("Workspace", back_populates="projects")
     brand = relationship("Brand", back_populates="projects")
     assets = relationship("Asset", back_populates="project", cascade="all, delete-orphan")
+    source_captures = relationship("SourceCapture", back_populates="project", cascade="all, delete-orphan")
     job_statuses = relationship("JobStatus", back_populates="project", cascade="all, delete-orphan")
     facts = relationship("ProductFact", back_populates="project", cascade="all, delete-orphan")
     job_logs = relationship("AiJobLog", back_populates="project", cascade="all, delete-orphan")
@@ -102,10 +109,16 @@ class Asset(Base):
     id = Column(String(36), primary_key=True, default=generate_uuid)
     project_id = Column(String(36), ForeignKey("product_projects.id"), nullable=False)
     source_type = Column(String(50), nullable=False)  # sourced, self_shot, ai_corrected
+    # V2 policy status: supplier captures can be retained as references without
+    # becoming eligible for the final seller-facing detail page.
+    usage_status = Column(String(30), nullable=False, default=default_asset_usage_status)
     filename = Column(String(255), nullable=False)
     file_path = Column(String(500), nullable=False)
     mime_type = Column(String(100), nullable=False)
     file_size = Column(Integer, nullable=False)
+    # Seller-confirmed position in the immutable Sprint 1 intake bundle.
+    # Null means that the asset has not been selected for an intake bundle.
+    intake_order = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     source_asset_id = Column(String(36), ForeignKey("assets.id"), nullable=True)
@@ -131,6 +144,52 @@ class Asset(Base):
     classification_version = Column(Integer, nullable=False, default=0)
 
     project = relationship("ProductProject", back_populates="assets")
+
+
+class SourceCapture(Base):
+    """One attempted product/reference URL collection in an intake bundle."""
+
+    __tablename__ = "source_captures"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False)
+    url = Column(String(1000), nullable=False)
+    platform = Column(String(100), nullable=False, default="unknown")
+    source_role = Column(String(30), nullable=False, default="product")
+    collection_status = Column(String(30), nullable=False, default="pending")
+    failure_code = Column(String(50), nullable=True)
+    error_message = Column(Text, nullable=True)
+    collected_image_count = Column(Integer, nullable=False, default=0)
+    collected_spec_count = Column(Integer, nullable=False, default=0)
+    attempted_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+    project = relationship("ProductProject", back_populates="source_captures")
+
+
+class CommerceStoryBaselineRecord(Base):
+    """Workspace-owned registration for one fixed Coupang-style regression pack."""
+
+    __tablename__ = "commerce_story_baseline_records"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "baseline_key", name="uq_commerce_baseline_workspace_key"),
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    workspace_id = Column(String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    baseline_key = Column(String(50), nullable=False)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False)
+    reference_capture_asset_id = Column(String(36), ForeignKey("assets.id", ondelete="SET NULL"), nullable=True)
+    baseline_export_asset_id = Column(String(36), ForeignKey("assets.id", ondelete="SET NULL"), nullable=True)
+    evaluation_json = Column(JSON, nullable=False, default=dict)
+    created_by = Column(String(36), ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    workspace = relationship("Workspace")
+    project = relationship("ProductProject")
+    reference_capture_asset = relationship("Asset", foreign_keys=[reference_capture_asset_id])
+    baseline_export_asset = relationship("Asset", foreign_keys=[baseline_export_asset_id])
+    user = relationship("User")
 
 
 class AuditLog(Base):
@@ -166,7 +225,10 @@ class ProductFact(Base):
     fact_text = Column(Text, nullable=False)
     source_text = Column(Text, nullable=True)
     source_asset_id = Column(String(36), ForeignKey("assets.id"), nullable=True)
-    verification_status = Column(String(50), nullable=False, default="unknown")  # unknown, confirmed, needs_revision
+    # V2: extracted, source_confirmed, seller_confirmed, needs_review,
+    # conflicted or rejected.  Legacy string values remain readable during
+    # local-project migration.
+    verification_status = Column(String(50), nullable=False, default="extracted")
     extraction_source = Column(String(50), nullable=True)  # manual_text, url, image, metadata
     provider = Column(String(50), nullable=True)
     model_name = Column(String(100), nullable=True)

@@ -90,8 +90,19 @@ class AgentRunService:
             if asset.source_type
             in {"uploaded", "self_shot", "sourced", "url-extracted", "url-imported"}
         ]
+        asset_ids_by_id = {asset.id: asset for asset in project_assets}
+        requested_asset_ids = list(dict.fromkeys(snapshot.get("asset_ids") or []))
+        # Sprint 1: preserve the seller's intake order.  Auto-detected assets
+        # only fill in when no explicit bundle was submitted.
+        selected_requested_ids = [
+            asset_id
+            for asset_id in requested_asset_ids
+            if asset_id in asset_ids_by_id
+            and asset_ids_by_id[asset_id].source_type
+            in {"uploaded", "self_shot", "sourced", "url-extracted", "url-imported"}
+        ]
         selected_assets = source_assets or project_assets
-        asset_ids = [asset.id for asset in selected_assets]
+        asset_ids = selected_requested_ids or [asset.id for asset in selected_assets]
         snapshot["asset_ids"] = asset_ids
         run.input_snapshot = snapshot
         db.add(run)
@@ -214,7 +225,11 @@ class AgentRunService:
         asset_ids = AgentRunService._ensure_input_asset_ids(run, db)
         product_input = ProductInput(
             product_name=input_snapshot.get("product_name") or "",
+            category=input_snapshot.get("category"),
             description=input_snapshot.get("description"),
+            feature_details=input_snapshot.get("feature_details"),
+            components=input_snapshot.get("components"),
+            cautions=input_snapshot.get("cautions"),
             product_url=input_snapshot.get("product_url"),
             freeform_input=input_snapshot.get("freeform_input"),
             asset_ids=asset_ids,
@@ -266,7 +281,11 @@ class AgentRunService:
         asset_ids = AgentRunService._ensure_input_asset_ids(run, db)
         product_input = ProductInput(
             product_name=input_snapshot.get("product_name") or "",
+            category=input_snapshot.get("category"),
             description=input_snapshot.get("description"),
+            feature_details=input_snapshot.get("feature_details"),
+            components=input_snapshot.get("components"),
+            cautions=input_snapshot.get("cautions"),
             product_url=input_snapshot.get("product_url"),
             freeform_input=input_snapshot.get("freeform_input"),
             asset_ids=asset_ids,

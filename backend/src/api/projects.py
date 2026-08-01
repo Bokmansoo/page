@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 from src.api.auth import get_current_user_and_workspace
 from src.db.database import get_db
-from src.db.models import ProductProject, AuditLog, JobStatus, Brand, Asset, ExportJob, AgentRun
+from src.db.models import ProductProject, AuditLog, JobStatus, Brand, Asset, ExportJob, AgentRun, SourceCapture
 from src.schemas.project_worklist import ProjectWorklistItem, ProjectWorklistResponse
 from src.services.validation import validate_external_url
 from src.services.visual_background_service import VisualBackgroundService
@@ -45,10 +45,12 @@ class AssetResponseSchema(BaseModel):
     id: str
     project_id: str
     source_type: str
+    usage_status: str
     filename: str
     file_path: str
     mime_type: str
     file_size: int
+    intake_order: Optional[int] = None
     source_asset_id: Optional[str] = None
     cutout_status: Optional[str] = None
     background_removed: bool = False
@@ -67,6 +69,22 @@ class AssetResponseSchema(BaseModel):
     is_representative: bool = False
     representative_source: str = "auto"
     classification_version: int = 0
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SourceCaptureResponseSchema(BaseModel):
+    id: str
+    project_id: str
+    url: str
+    platform: str
+    source_role: str
+    collection_status: str
+    failure_code: Optional[str] = None
+    error_message: Optional[str] = None
+    collected_image_count: int
+    collected_spec_count: int
+    attempted_at: datetime.datetime
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -448,6 +466,7 @@ class ProjectAssetResponse(BaseModel):
     id: str
     project_id: str
     source_type: str
+    usage_status: str
     filename: str
     file_path: str
     mime_type: str
@@ -493,6 +512,28 @@ def list_project_assets(
     backfill_project_asset_metadata(project_id, db)
     assets = db.query(Asset).filter(Asset.project_id == project_id).all()
     return assets
+
+
+@router.get("/{project_id}/source-captures", response_model=List[SourceCaptureResponseSchema])
+def list_project_source_captures(
+    project_id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Show URL collection attempts, including normal access-limited outcomes."""
+    workspace = auth_ctx["workspace"]
+    project = db.query(ProductProject).filter(
+        ProductProject.id == project_id,
+        ProductProject.workspace_id == workspace.id,
+    ).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return (
+        db.query(SourceCapture)
+        .filter(SourceCapture.project_id == project.id)
+        .order_by(SourceCapture.attempted_at.asc())
+        .all()
+    )
 
 
 class AssetClassificationUpdate(BaseModel):

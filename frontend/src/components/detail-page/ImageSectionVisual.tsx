@@ -19,6 +19,7 @@ export default function ImageSectionVisual({
   const badges = payload.badges || [];
   const title = section.title || "";
   const body = section.body_copy || section.body || "";
+  const isAiRedesignRequired = payload.missing_state === "ai_redesign_required";
 
   if (!imageSrc) {
     return (
@@ -26,7 +27,9 @@ export default function ImageSectionVisual({
         className="mt-8 flex aspect-[4/3] items-center justify-center border border-amber-200 bg-amber-50 text-sm font-bold text-amber-700"
         data-section-visual="image"
       >
-        상품 사진을 추가해 주세요
+        {isAiRedesignRequired
+          ? "AI 리디자인 이미지 생성 및 검토가 필요합니다"
+          : "대표 상품 사진을 추가해 주세요"}
       </div>
     );
   }

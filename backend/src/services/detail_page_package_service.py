@@ -9,6 +9,7 @@ from src.services.page_generator import PageGenerationService
 from src.services.visual_page_renderer import build_visual_sections
 from src.services.sales_strategy_service import generate_sales_strategy
 from src.services.page_asset_policy import get_page_eligible_assets
+from src.services.commerce_policy import CONFIRMED_FACT_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +74,7 @@ class DetailPagePackageService:
             # Generate new page draft
             confirmed_facts = db.query(ProductFact).filter(
                 ProductFact.project_id == project.id,
-                ProductFact.verification_status == "confirmed"
+                ProductFact.verification_status.in_(CONFIRMED_FACT_STATUSES)
             ).all()
             facts_payload = [
                 {"id": f.id, "fact_text": f.fact_text, "source_text": f.source_text}

@@ -1,6 +1,6 @@
 import os
 import uuid
-from typing import Optional
+from typing import Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
@@ -10,6 +10,7 @@ from src.config import settings
 from src.db.database import get_db
 from src.db.models import ProductProject, ProductPage, PageSection, Asset, AuditLog
 from src.services.validation import validate_file_upload
+from src.services.commerce_policy import initial_asset_usage_status
 
 router = APIRouter(prefix="/files", tags=["files"])
 
@@ -18,10 +19,12 @@ class AssetResponseSchema(BaseModel):
     id: str
     project_id: str
     source_type: str
+    usage_status: str
     filename: str
     file_path: str
     mime_type: str
     file_size: int
+    intake_order: Optional[int] = None
     source_asset_id: Optional[str] = None
     cutout_status: Optional[str] = None
     background_removed: bool = False
@@ -44,10 +47,19 @@ class AssetResponseSchema(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class AssetUsageStatusUpdateSchema(BaseModel):
+    """Seller review result for an asset's final-page eligibility."""
+
+    usage_status: Literal["reference_only", "seller_owned", "blocked"]
+
+
 @router.post("/upload", response_model=AssetResponseSchema, status_code=status.HTTP_201_CREATED)
 async def upload_file(
     project_id: str = Form(...),
-    source_type: str = Form("self_shot"),
+    # An API client which omits this field must not silently mark a supplier
+    # capture as seller-owned.  The intake UI asks the seller to opt in to a
+    # final-use right explicitly.
+    source_type: Literal["self_shot", "uploaded", "sourced"] = Form("sourced"),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     auth_ctx: dict = Depends(get_current_user_and_workspace)
@@ -91,6 +103,7 @@ async def upload_file(
     asset = Asset(
         project_id=project_id,
         source_type=source_type,
+        usage_status=initial_asset_usage_status(source_type),
         filename=filename,
         file_path=file_path,
         mime_type=file.content_type or "application/octet-stream",
@@ -100,8 +113,16 @@ async def upload_file(
     db.flush()
     if asset.mime_type.startswith("image/"):
         from src.services.image_asset_inspector import apply_asset_inspection, refresh_representative_product_asset
+        from src.services.local_image_upscale import create_auto_upscale_preview
+
         apply_asset_inspection(asset, db)
+        # Preserve the original as the automatic representative.  The local
+        # enlargement is only a seller-reviewable candidate, never a silent
+        # HERO assignment.
         refresh_representative_product_asset(project_id, db)
+        upscale_preview = create_auto_upscale_preview(asset, db)
+    else:
+        upscale_preview = None
     db.commit()
     db.refresh(asset)
 
@@ -114,6 +135,17 @@ async def upload_file(
         payload={"filename": filename, "file_size": file_size, "project_id": project_id}
     )
     db.add(log)
+    if upscale_preview:
+        db.add(
+            AuditLog(
+                workspace_id=workspace.id,
+                user_id=user.id,
+                action="asset_local_upscale_auto_suggested",
+                entity_type="asset",
+                entity_id=upscale_preview.id,
+                payload={"source_asset_id": asset.id, "trigger": "LOW_RESOLUTION"},
+            )
+        )
     db.commit()
 
     return asset
@@ -128,6 +160,36 @@ def _workspace_asset_or_404(asset_id: str, workspace_id: str, db: Session) -> As
     )
     if not asset:
         raise HTTPException(status_code=404, detail="Asset not found")
+    return asset
+
+
+@router.patch("/assets/{asset_id}/usage-status", response_model=AssetResponseSchema)
+def update_asset_usage_status(
+    asset_id: str,
+    payload: AssetUsageStatusUpdateSchema,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Mark a supplier capture as reference-only or approve seller ownership.
+
+    AI-generated and derived-graphic values are set by their own pipelines;
+    a seller cannot relabel a supplier capture as AI generated through this
+    endpoint.
+    """
+    asset = _workspace_asset_or_404(asset_id, auth_ctx["workspace"].id, db)
+    asset.usage_status = payload.usage_status
+    db.add(
+        AuditLog(
+            workspace_id=auth_ctx["workspace"].id,
+            user_id=auth_ctx["user"].id,
+            action="asset_usage_status_updated",
+            entity_type="asset",
+            entity_id=asset.id,
+            payload={"usage_status": payload.usage_status},
+        )
+    )
+    db.commit()
+    db.refresh(asset)
     return asset
 
 

@@ -200,6 +200,7 @@ def run_export_task(
         zip_asset = Asset(
             project_id=project_id,
             source_type="exported_zip",
+            usage_status="blocked",
             filename=zip_filename,
             file_path=zip_path,
             mime_type="application/zip",
@@ -217,6 +218,7 @@ def run_export_task(
         long_asset = Asset(
             project_id=project_id,
             source_type="exported_image",
+            usage_status="blocked",
             filename=export_filename,
             file_path=long_image_path,
             mime_type="image/jpeg" if output_format in {"jpg", "jpeg"} else "image/png",

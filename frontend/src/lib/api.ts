@@ -6,6 +6,7 @@ export function apiUrl(path: string): string {
 
 export type StructuredIntakeDraft = {
   product_name: { value: string; source: string; confidence: string };
+  category?: { value: string; source: string; confidence: string };
   description?: { value: string; source: string; confidence: string };
   product_url?: { value: string; source: string; confidence: string };
   reference_urls: string[];
@@ -21,11 +22,14 @@ export async function structureIntake(
   payload: {
     freeform_input: string;
     product_name?: string;
+    category?: string;
     description?: string;
     product_url?: string;
     reference_urls?: string[];
     desired_mood?: string;
     asset_ids?: string[];
+    sales_channel?: string;
+    model_options?: string;
   },
   headers: Record<string, string> = {}
 ): Promise<StructuredIntakeDraft> {

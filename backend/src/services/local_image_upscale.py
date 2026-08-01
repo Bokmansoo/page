@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from src.config import settings
 from src.db.models import Asset
 from src.services.image_asset_inspector import apply_asset_inspection
+from src.services.commerce_policy import resolved_asset_usage_status
 
 
 TARGET_MIN_EDGE = 1024
@@ -81,6 +82,7 @@ def create_local_upscaled_asset(source: Asset, db: Session) -> Asset:
     asset = Asset(
         project_id=source.project_id,
         source_type="local_upscaled",
+        usage_status=resolved_asset_usage_status(source),
         filename=f"{stem}-고화질보정.png",
         file_path=output_path,
         mime_type="image/png",
@@ -97,3 +99,20 @@ def create_local_upscaled_asset(source: Asset, db: Session) -> Asset:
     apply_asset_inspection(asset, db)
     db.flush()
     return asset
+
+
+def create_auto_upscale_preview(source: Asset, db: Session) -> Asset | None:
+    """Prepare a local upscale candidate for a low-resolution seller upload.
+
+    The preview deliberately remains unselected: the seller can review it in
+    the candidate panel before making it representative or using it in HERO.
+    """
+    if source.source_type not in {"uploaded", "self_shot", "sourced"}:
+        return None
+    if "LOW_RESOLUTION" not in (source.quality_warnings or []):
+        return None
+    try:
+        return create_local_upscaled_asset(source, db)
+    except ImageUpscaleError:
+        # An optional preview must never make an otherwise valid upload fail.
+        return None

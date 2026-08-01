@@ -2,6 +2,25 @@ from src.agents.nodes.base import AgentNode
 from src.agents.state import AgentRunState
 from src.agents.mock_outputs import build_mock_page_assembly
 
+
+HERO_AUTO_ASSIGN_BLOCKING_WARNINGS = {
+    "LOW_RESOLUTION",
+    "EXTREME_ASPECT_RATIO",
+    "DUPLICATE_FILE",
+    "IMAGE_INTEGRITY_WARNING",
+    "SAFE_CROP_REVIEW_REQUIRED",
+}
+
+
+def _has_hero_auto_assign_blocker(candidate: dict) -> bool:
+    """Keep quality-warning assets available for manual review, never auto-use."""
+    return bool(
+        HERO_AUTO_ASSIGN_BLOCKING_WARNINGS.intersection(
+            set(candidate.get("quality_warnings") or [])
+        )
+    )
+
+
 class PageAssemblyAgent(AgentNode):
     name = "page_assembly"
 
@@ -15,7 +34,21 @@ class PageAssemblyAgent(AgentNode):
             db = SessionLocal()
             try:
                 if state.product_input.asset_ids:
-                    assets = db.query(Asset).filter(Asset.id.in_(state.product_input.asset_ids)).all()
+                    requested_asset_ids = list(state.product_input.asset_ids)
+                    assets = db.query(Asset).filter(Asset.id.in_(requested_asset_ids)).all()
+                    # Include a prepared local-upscale preview without making
+                    # it the automatically selected image.
+                    previews = (
+                        db.query(Asset)
+                        .filter(
+                            Asset.project_id == state.project_id,
+                            Asset.source_type == "local_upscaled",
+                            Asset.source_asset_id.in_(requested_asset_ids),
+                        )
+                        .all()
+                    )
+                    known_ids = {item.id for item in assets}
+                    assets.extend(preview for preview in previews if preview.id not in known_ids)
                 else:
                     assets = db.query(Asset).filter(Asset.project_id == state.project_id).all()
                 for a in assets:
@@ -143,14 +176,39 @@ class PageAssemblyAgent(AgentNode):
                 for candidate in slot_cand_list
             )
             if not target_cand and slot_cand_list and not generation_failed and not awaiting_source_approval:
-                target_cand = slot_cand_list[0]
+                # A low-quality HERO stays available for manual review, but is
+                # never picked by this automatic fallback.
+                auto_assignable_candidates = slot_cand_list
+                if slot_id == "hero":
+                    auto_assignable_candidates = [
+                        candidate
+                        for candidate in slot_cand_list
+                        if not _has_hero_auto_assign_blocker(candidate)
+                        # A local upscale generated at upload time is a
+                        # suggestion, not an implicit seller confirmation.
+                        and candidate.get("source_type") != "local_upscaled"
+                    ]
+                if auto_assignable_candidates:
+                    target_cand = auto_assignable_candidates[0]
+
+            quality_review_required = bool(
+                slot_id == "hero"
+                and not target_cand
+                and any(
+                    candidate.get("asset_id") and _has_hero_auto_assign_blocker(candidate)
+                    for candidate in slot_cand_list
+                )
+            )
                 
             if target_cand and target_cand.get("asset_id"):
+                linked_asset = assets_by_id.get(target_cand.get("asset_id")) or {}
+                source_type = linked_asset.get("source_type") or target_cand.get("source_type")
+                label = linked_asset.get("filename") or target_cand.get("label", "")
                 section["visual_slot"] = {
                     "asset_id": target_cand.get("asset_id"),
-                    "source_type": target_cand.get("source_type"),
+                    "source_type": source_type,
                     "status": "completed",
-                    "label": target_cand.get("label", ""),
+                    "label": label,
                     "candidate_id": target_cand.get("candidate_id"),
                     "identity_check": target_cand.get("identity_check"),
                 }
@@ -183,11 +241,15 @@ class PageAssemblyAgent(AgentNode):
                         if generation_failed
                         else "awaiting_source_approval"
                         if awaiting_source_approval
+                        else "quality_review_required"
+                        if quality_review_required
                         else "missing_image"
                     ),
                     "label": (
                         "URL 상품 사진을 선택해 주세요"
                         if awaiting_source_approval
+                        else "HERO에 사용할 고화질 상품 사진을 추가하거나 품질 경고를 확인해 주세요"
+                        if quality_review_required
                         else "상품 사진을 추가해 주세요"
                     ),
                     "candidate_id": target_cand.get("candidate_id") if target_cand else None,
@@ -198,7 +260,13 @@ class PageAssemblyAgent(AgentNode):
                 section["visual_kind"] = "image"
                 section["visual_payload"] = {
                     "layout_variant": "hero_overlay" if slot_id == "hero" else "image_text",
-                    "missing_state": "source_approval_required" if awaiting_source_approval else "photo_required",
+                    "missing_state": (
+                        "source_approval_required"
+                        if awaiting_source_approval
+                        else "quality_review_required"
+                        if quality_review_required
+                        else "photo_required"
+                    ),
                 }
 
         return state

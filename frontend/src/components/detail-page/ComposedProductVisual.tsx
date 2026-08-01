@@ -28,6 +28,7 @@ export default function ComposedProductVisual({
   const badges = payload.badges || [];
   const title = section.title || "";
   const body = section.body_copy || section.body || "";
+  const isAiRedesignRequired = payload.missing_state === "ai_redesign_required";
 
   return (
     <figure
@@ -74,7 +75,9 @@ export default function ComposedProductVisual({
             />
           ) : (
             <div className="relative z-10 flex h-[72%] w-[72%] items-center justify-center rounded-3xl border border-dashed border-emerald-700/30 bg-white/40 text-sm font-bold text-emerald-800">
-              대표 상품 사진을 추가해 주세요
+              {isAiRedesignRequired
+                ? "AI 리디자인 이미지 생성 및 검토가 필요합니다"
+                : "대표 상품 사진을 추가해 주세요"}
             </div>
           )}
         </div>

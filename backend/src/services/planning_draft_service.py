@@ -121,8 +121,8 @@ class PlanningDraftService:
                 ["간편한 사용 방식과 실용성을 가장 중요하게 생각하시는 분", "기존 제품들의 번거로움에 지쳐 새로운 대안을 찾고 계셨던 분"],
             ),
             "caution": (
-                "안전한 제품 사용을 위해 반드시 지켜주실 주의사항",
-                ["기기에 무리한 힘을 가하거나 임의로 분해하지 말아주세요.", "직사광선이 닿지 않고 습기가 없는 건조한 곳에 보관을 권장합니다."],
+                "사용 전 확인할 주의사항",
+                ["사용 전 제품 설명서와 구성품을 확인해 주세요.", "제품 상태와 사용 환경을 확인한 뒤 안내에 따라 사용해 주세요."],
             ),
             "cta": (
                 f"지금 {product_name}와 함께 한결 더 편리한 하루를 시작해 보세요",
@@ -155,8 +155,15 @@ class PlanningDraftService:
             # Fallback mock values
             title, bullets = mock_templates_database.get(card_type, (f"{role} 타이틀", ["상세 카피 내용"]))
             
-            # Map source facts dynamically
-            source_facts = fact_ids[idx:idx+1] if idx < len(fact_ids) else []
+            # A final spec block must show every seller-confirmed fact, not a
+            # generic placeholder or only the last remaining fact.
+            if card_type == "specifications":
+                source_facts = fact_ids
+                if fact_texts:
+                    title = "확인된 제품 사양·고지"
+                    bullets = fact_texts
+            else:
+                source_facts = fact_ids[idx:idx + 1] if idx < len(fact_ids) else []
 
             cards.append(
                 {

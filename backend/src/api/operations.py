@@ -12,6 +12,8 @@ from src.db.models import (
 )
 from src.services.compliance_checker import PageComplianceChecker
 from src.services.generation_status_service import GenerationStatusService
+from src.services.commerce_policy import initial_asset_usage_status
+from src.services.commerce_policy import fact_status_requires_review, is_confirmed_fact_status, normalize_legacy_fact_status
 
 router = APIRouter(prefix="/operations", tags=["Operations"])
 logger = logging.getLogger(__name__)
@@ -540,6 +542,7 @@ def seed_operations_data(
             asset = Asset(
                 project_id=project.id,
                 source_type=a_def["type"],
+                usage_status=initial_asset_usage_status(a_def["type"]),
                 filename=a_def["filename"],
                 file_path=a_def["path"],
                 mime_type="image/jpeg",
@@ -552,11 +555,13 @@ def seed_operations_data(
         # Create Facts
         facts_list = []
         for f_def in p_def["facts"]:
+            normalized_status = normalize_legacy_fact_status(f_def["status"])
             fact = ProductFact(
                 project_id=project.id,
                 fact_text=f_def["text"],
                 source_text=f_def["source"],
-                verification_status=f_def["status"]
+                verification_status=normalized_status,
+                needs_review=fact_status_requires_review(normalized_status),
             )
             db.add(fact)
             db.flush()
@@ -604,7 +609,7 @@ def seed_operations_data(
                 # Map some fact IDs to association
                 assoc_ids = []
                 if sec_def["type"] == "specifications" and facts_list:
-                    assoc_ids = [f.id for f in facts_list if f.verification_status == "confirmed"]
+                    assoc_ids = [f.id for f in facts_list if is_confirmed_fact_status(f.verification_status)]
                     
                 # Link asset ID if header or features
                 asset_id = None

@@ -1,5 +1,6 @@
 from typing import Any, Dict, List
 from src.db.models import ProductFact, ProductProject
+from src.services.commerce_policy import is_confirmed_fact_status
 
 class PageComposerService:
     @staticmethod
@@ -20,7 +21,7 @@ class PageComposerService:
                 fact_id = fact.get("id")
                 fact_text = fact.get("fact_text") or fact.get("text")
                 fact_source = fact.get("source_text") or fact.get("source") or "unknown"
-                fact_status = fact.get("verification_status", "confirmed")
+                fact_status = fact.get("verification_status", "extracted")
             else:
                 fact_id = fact.id
                 fact_text = fact.fact_text
@@ -33,7 +34,7 @@ class PageComposerService:
                 "source": fact_source,
             }
 
-            if fact_status == "confirmed":
+            if is_confirmed_fact_status(fact_status):
                 confirmed_facts.append(fact_data)
             else:
                 needs_verification.append(fact_data)

@@ -260,6 +260,7 @@ def execute_image_generation(
     output_asset = Asset(
         project_id=project_id,
         source_type="ai_generated",
+        usage_status="ai_generated",
         filename=filename,
         file_path=full_path,
         mime_type=result.mime_type,

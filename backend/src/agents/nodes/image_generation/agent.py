@@ -45,6 +45,7 @@ class ImageGenerationAgent(AgentNode):
                 asset = Asset(
                     project_id=state.project_id,
                     source_type="real-generated",
+                    usage_status="ai_generated",
                     filename=filename,
                     file_path=full_path,
                     mime_type=result.mime_type,
@@ -68,7 +69,19 @@ class ImageGenerationAgent(AgentNode):
             db = SessionLocal()
             try:
                 if state.product_input.asset_ids:
-                    assets = db.query(Asset).filter(Asset.id.in_(state.product_input.asset_ids)).all()
+                    requested_asset_ids = list(state.product_input.asset_ids)
+                    assets = db.query(Asset).filter(Asset.id.in_(requested_asset_ids)).all()
+                    previews = (
+                        db.query(Asset)
+                        .filter(
+                            Asset.project_id == state.project_id,
+                            Asset.source_type == "local_upscaled",
+                            Asset.source_asset_id.in_(requested_asset_ids),
+                        )
+                        .all()
+                    )
+                    known_ids = {item.id for item in assets}
+                    assets.extend(preview for preview in previews if preview.id not in known_ids)
                 else:
                     assets = db.query(Asset).filter(Asset.project_id == state.project_id).all()
                 for a in assets:
@@ -237,7 +250,13 @@ class ImageGenerationAgent(AgentNode):
                 if candidate["source_type"] in {"uploaded", "self_shot", "sourced"}
                 and not (
                     slot_id == "hero"
-                    and {"LOW_RESOLUTION", "EXTREME_ASPECT_RATIO", "DUPLICATE_FILE", "IMAGE_INTEGRITY_WARNING"}.intersection(candidate.get("quality_warnings") or [])
+                    and {
+                        "LOW_RESOLUTION",
+                        "EXTREME_ASPECT_RATIO",
+                        "DUPLICATE_FILE",
+                        "IMAGE_INTEGRITY_WARNING",
+                        "SAFE_CROP_REVIEW_REQUIRED",
+                    }.intersection(candidate.get("quality_warnings") or [])
                 )
             ]
             selected_candidate_id = state.selected_image_candidates.get(slot_id)

@@ -256,8 +256,7 @@ export default function DetailPageDocument({ page, assets, exportMode = false }:
                 <FormattedBodyCopy body={body} className={theme.body} />
               </>
             ) : null}
-            {section.section_type !== "product_information" ? (
-              isComposedProduct ? (
+            {isComposedProduct ? (
                 <ComposedProductVisual
                   section={section as unknown as DetailPageSectionVisual}
                   imageSrc={imageSrc}
@@ -284,8 +283,7 @@ export default function DetailPageDocument({ page, assets, exportMode = false }:
                 >
                   이미지 확인이 필요합니다
                 </div>
-              ) : null
-            ) : null}
+              ) : null}
           </section>
         );
       })}

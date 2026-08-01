@@ -1,5 +1,9 @@
 from unittest.mock import patch
 
+from io import BytesIO
+
+from PIL import Image
+
 from src.agents.nodes.image_generation.agent import ImageGenerationAgent
 from src.agents.nodes.page_assembly.agent import PageAssemblyAgent
 from src.agents.state import AgentRunState
@@ -11,10 +15,14 @@ AUTH_HEADERS = {
     "X-Mock-User-Id": "00000000-0000-0000-0000-000000000001",
     "X-Mock-Workspace-Id": "00000000-0000-0000-0000-000000000002",
 }
-MINIMAL_PNG = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0dIDAT\x08\xd7c\xf8\xcf\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99=\x1d\x00\x00\x00\x00IEND\xaeB`\x82"
-)
+
+def _high_resolution_png() -> bytes:
+    buffer = BytesIO()
+    Image.new("RGB", (1200, 1200), color="white").save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+HIGH_RES_PNG = _high_resolution_png()
 
 
 def test_uploaded_photo_is_preferred_and_second_photo_is_used_for_product_introduction():
@@ -138,7 +146,7 @@ def test_uploaded_photo_is_served_and_linked_to_hero(client, db_session, tmp_pat
         "/api/v1/files/upload",
         headers=AUTH_HEADERS,
         data={"project_id": project_id, "source_type": "uploaded"},
-        files={"file": ("massage-gun-main.png", MINIMAL_PNG, "image/png")},
+        files={"file": ("massage-gun-main.png", HIGH_RES_PNG, "image/png")},
     )
     assert uploaded.status_code == 201
     asset_id = uploaded.json()["id"]
@@ -153,7 +161,7 @@ def test_uploaded_photo_is_served_and_linked_to_hero(client, db_session, tmp_pat
 
     served = client.get(f"/api/v1/files/assets/{asset_id}", headers=AUTH_HEADERS)
     assert served.status_code == 200
-    assert served.content == MINIMAL_PNG
+    assert served.content == HIGH_RES_PNG
     assert served.headers["content-type"] == "image/png"
     assert not any(
         candidate["source_type"] == "mock-generated"
@@ -173,7 +181,7 @@ def test_url_collected_photo_requires_selection_before_being_linked_to_hero(clie
         created = client.post(
             "/api/agent-runs",
             headers=AUTH_HEADERS,
-            json={"product_name": "", "product_url": product_url},
+            json={"product_name": "", "product_url": product_url, "description": "판매자가 확인한 마사지 기능"},
         )
 
     assert created.status_code == 201
@@ -192,6 +200,13 @@ def test_url_collected_photo_requires_selection_before_being_linked_to_hero(clie
     assert hero.image_asset_id is None
     assert hero.visual_payload["missing_state"] == "source_approval_required"
     assert completed.json()["outputs"]["image_generation"]["jobs"][0]["status"] == "awaiting_source_approval"
+
+    rights_confirmed = client.patch(
+        f"/api/v1/files/assets/{asset.id}/usage-status",
+        headers=AUTH_HEADERS,
+        json={"usage_status": "seller_owned"},
+    )
+    assert rights_confirmed.status_code == 200
 
     selected = client.patch(
         f"/api/v1/projects/{created.json()['project_id']}/page",
@@ -266,7 +281,7 @@ def test_uploaded_photo_added_after_url_collection_is_preferred_for_hero(
         created = client.post(
             "/api/agent-runs",
             headers=AUTH_HEADERS,
-            json={"product_name": "massage gun", "product_url": product_url},
+            json={"product_name": "massage gun", "product_url": product_url, "description": "판매자가 확인한 마사지 기능"},
         )
 
     assert created.status_code == 201
@@ -274,10 +289,17 @@ def test_uploaded_photo_added_after_url_collection_is_preferred_for_hero(
         "/api/v1/files/upload",
         headers=AUTH_HEADERS,
         data={"project_id": created.json()["project_id"], "source_type": "uploaded"},
-        files={"file": ("massage-gun-front.png", MINIMAL_PNG, "image/png")},
+        files={"file": ("massage-gun-front.png", HIGH_RES_PNG, "image/png")},
     )
     assert uploaded.status_code == 201
     uploaded_asset_id = uploaded.json()["id"]
+    url_asset_id = created.json()["product_input"]["asset_ids"][0]
+    finalized = client.patch(
+        f"/api/agent-runs/{created.json()['id']}/input-assets",
+        headers=AUTH_HEADERS,
+        json={"asset_ids": [uploaded_asset_id, url_asset_id]},
+    )
+    assert finalized.status_code == 200
 
     completed = client.post(
         f"/api/agent-runs/{created.json()['id']}/run-mock",

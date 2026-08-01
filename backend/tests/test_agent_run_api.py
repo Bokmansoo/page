@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import patch
 
-from src.db.models import AgentRun, AgentRunStep
+from src.db.models import AgentRun, AgentRunStep, ProductFact
 from src.services.url_evidence_collector import URLEvidence
 
 
@@ -51,6 +51,30 @@ def test_create_agent_run_preserves_confirmed_structured_intake(
     assert run.input_snapshot["price"] == "39,900원"
     assert run.input_snapshot["shipping"] == "무료배송"
     assert run.input_snapshot["desired_mood"] == ["안전한", "감성적인"]
+
+
+def test_create_agent_run_persists_direct_numeric_specs_as_confirmed_facts(
+    client,
+    auth_headers,
+    db_session,
+):
+    response = client.post(
+        "/api/agent-runs",
+        headers=auth_headers,
+        json={
+            "product_name": "미니 마사지건",
+            "description": "260g, 10분, 800mAh",
+        },
+    )
+
+    assert response.status_code == 201
+    facts = (
+        db_session.query(ProductFact)
+        .filter(ProductFact.project_id == response.json()["project_id"])
+        .all()
+    )
+    assert [fact.source_text for fact in facts] == ["260g", "10분", "800mAh"]
+    assert all(fact.verification_status == "seller_confirmed" for fact in facts)
 
 
 def test_create_agent_run_collects_product_and_reference_url_evidence(

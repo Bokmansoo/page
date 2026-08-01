@@ -6,13 +6,14 @@
 import logging
 import anthropic
 from typing import Optional, List, Dict, Any, Literal
+from types import SimpleNamespace
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from src.api.auth import get_current_user_and_workspace
 from src.config import settings
 from src.db.database import get_db
-from src.db.models import ProductProject, ProductPage, PageSection, PageVersion, ProductFact, Asset, User, AgentRun, ImageGenerationJobRecord
+from src.db.models import ProductProject, ProductPage, PageSection, PageVersion, ProductFact, Asset, User, AgentRun, ImageGenerationJobRecord, CommerceStoryBaselineRecord
 from src.schemas.planning_draft import PlanningDraftSchema
 
 from src.services.page_generator import PageGenerationService
@@ -21,6 +22,17 @@ from src.services.grounding_validator import detect_claim_risks, map_section_to_
 from src.services.copy_rewrite_service import CopyRewriteCommand, CopyRewriteService, CopyRewriteResult
 from src.services.detail_page_package_service import DetailPagePackageService, DetailPagePackage, AiEditCommandPayload
 from src.services.page_readiness_service import PageReadiness, inspect_page_readiness
+from src.services.commerce_story_baseline import (
+    BaselineProductResponse,
+    BaselineRegistrationRequest,
+    BaselineRegistrationResponse,
+    CommerceStoryBaselineReport,
+    EVALUATION_ITEMS,
+    get_baseline_product,
+    inspect_commerce_story_baseline,
+    list_baseline_products,
+    serialize_baseline_product,
+)
 from src.services.page_finalization_service import (
     FinalPageNotFoundError,
     PageDraftNotFoundError,
@@ -29,11 +41,13 @@ from src.services.page_finalization_service import (
     get_page_version_for_export,
 )
 from src.services.page_asset_policy import (
+    clear_unconfirmed_low_quality_hero_assignments,
     get_page_eligible_asset,
     get_page_eligible_assets,
 )
 from src.services.visual_contract_backfill import backfill_page_visuals
 from src.services.planning_draft_service import PlanningDraftService
+from src.services.commerce_policy import CONFIRMED_FACT_STATUSES, final_spec_is_last, resolved_asset_usage_status
 
 
 router = APIRouter(tags=["Page Editor"])
@@ -269,14 +283,21 @@ def get_visual_ready_page_or_404(db: Session, project_id: str, workspace_id: str
     page = get_page_or_404(db, project_id, workspace_id)
     report = backfill_page_visuals(db, project_id)
     if report.updated:
-        page = get_page_or_404(db, project_id, workspace_id)
+        # Do not call get_page_or_404 a second time here. That helper repairs
+        # old mock image jobs and would re-attach the same source product photo
+        # after the visual backfill just replaced repeated body photos with
+        # fact-grounded HTML graphics.
+        db.expire_all()
+        page = db.query(ProductPage).filter(ProductPage.project_id == project_id).first()
+        if not page:
+            raise HTTPException(status_code=404, detail="Page draft not found for this project")
     return page
 
 
 def get_unconfirmed_warnings(db: Session, project_id: str) -> List[str]:
     unconfirmed_facts = db.query(ProductFact).filter(
         ProductFact.project_id == project_id,
-        ProductFact.verification_status != "confirmed"
+        ProductFact.verification_status.notin_(CONFIRMED_FACT_STATUSES)
     ).all()
     return [f.fact_text for f in unconfirmed_facts]
 
@@ -313,8 +334,45 @@ def get_image_candidates_for_section(
     if job_records:
         enriched_candidates = []
         for job in job_records:
+            output_asset = None
+            if job.output_asset_id:
+                output_asset = db.query(Asset).filter(Asset.id == job.output_asset_id).first()
+            source_asset = None
+            if (
+                not output_asset
+                and job.error_code == "LOW_QUALITY_HERO_SOURCE"
+                and job.source_asset_ids
+            ):
+                source_asset = (
+                    db.query(Asset)
+                    .filter(
+                        Asset.id == job.source_asset_ids[0],
+                        Asset.project_id == project_id,
+                    )
+                    .first()
+                )
+                # The low-resolution original stays traceable in the job, but
+                # an upload-time local upscale preview is the candidate the
+                # seller should review and explicitly select for HERO.
+                if source_asset:
+                    upscale_preview = (
+                        db.query(Asset)
+                        .filter(
+                            Asset.project_id == project_id,
+                            Asset.source_type == "local_upscaled",
+                            Asset.source_asset_id == source_asset.id,
+                            Asset.quality_status != "rejected",
+                        )
+                        .order_by(Asset.created_at.desc())
+                        .first()
+                    )
+                    if upscale_preview:
+                        source_asset = upscale_preview
+
             if job.output_asset_id:
                 label = "\uc0dd\uc131 \uc774\ubbf8\uc9c0"
+            elif job.error_code == "REFERENCE_IMAGE_REDESIGN_REQUIRED":
+                label = "AI 리디자인 이미지 생성 필요"
             elif job.status == "failed":
                 label = "\uc774\ubbf8\uc9c0 \uc0dd\uc131 \uc2e4\ud328"
             else:
@@ -322,23 +380,40 @@ def get_image_candidates_for_section(
 
             cand_dict = {
                 "candidate_id": job.job_id,
-                "asset_id": job.output_asset_id,
+                "asset_id": job.output_asset_id or (source_asset.id if source_asset else None),
                 "label": label,
                 "source_type": "ai_generated",
-                "status": job.status,
+                "status": (
+                    "awaiting_ai_redesign"
+                    if job.error_code == "REFERENCE_IMAGE_REDESIGN_REQUIRED"
+                    else "quality_review_required" if source_asset else job.status
+                ),
                 "prompt": job.prompt,
                 "error_code": job.error_code,
                 "warnings": job.warnings or [],
                 "provider": job.provider,
                 "model": job.model,
             }
-            if job.output_asset_id:
-                asset = db.query(Asset).filter(Asset.id == job.output_asset_id).first()
-                if asset:
-                    cand_dict["source_asset_id"] = asset.source_asset_id
-                    cand_dict["cutout_status"] = asset.cutout_status
-                    cand_dict["background_removed"] = asset.background_removed
-                    cand_dict["product_identity_preserved"] = asset.product_identity_preserved
+            linked_asset = output_asset or source_asset
+            if linked_asset:
+                # Existing seller images can fulfill a generation job. The
+                # linked Asset is the source of truth for the provenance shown
+                # in the candidate card.
+                cand_dict["source_type"] = linked_asset.source_type or cand_dict["source_type"]
+                if linked_asset.source_type in {
+                    "uploaded",
+                    "self_shot",
+                    "sourced",
+                    "url-extracted",
+                    "url-imported",
+                    "local_upscaled",
+                }:
+                    cand_dict["label"] = linked_asset.filename
+                cand_dict["quality_warnings"] = linked_asset.quality_warnings or []
+                cand_dict["source_asset_id"] = linked_asset.source_asset_id
+                cand_dict["cutout_status"] = linked_asset.cutout_status
+                cand_dict["background_removed"] = linked_asset.background_removed
+                cand_dict["product_identity_preserved"] = linked_asset.product_identity_preserved
             enriched_candidates.append(cand_dict)
         return enriched_candidates
     
@@ -398,7 +473,7 @@ def build_section_response(section: PageSection, db: Session) -> SectionResponse
     project_id = section.page.project_id if section.page else db.query(ProductPage).filter(ProductPage.id == section.page_id).first().project_id
     confirmed_facts = db.query(ProductFact).filter(
         ProductFact.project_id == project_id,
-        ProductFact.verification_status == "confirmed"
+        ProductFact.verification_status.in_(CONFIRMED_FACT_STATUSES)
     ).all()
     facts_list = [f.fact_text for f in confirmed_facts]
     unconfirmed_warnings = get_unconfirmed_warnings(db, project_id)
@@ -438,7 +513,7 @@ def build_section_response(section: PageSection, db: Session) -> SectionResponse
 def build_page_response(page: ProductPage, db: Session) -> PageResponseSchema:
     confirmed_facts = db.query(ProductFact).filter(
         ProductFact.project_id == page.project_id,
-        ProductFact.verification_status == "confirmed"
+        ProductFact.verification_status.in_(CONFIRMED_FACT_STATUSES)
     ).all()
     facts_list = [f.fact_text for f in confirmed_facts]
     unconfirmed_warnings = get_unconfirmed_warnings(db, page.project_id)
@@ -523,7 +598,7 @@ def get_style_candidates(
     else:
         confirmed_facts = db.query(ProductFact).filter(
             ProductFact.project_id == project_id,
-            ProductFact.verification_status == "confirmed"
+            ProductFact.verification_status.in_(CONFIRMED_FACT_STATUSES)
         ).all()
         facts = [f.fact_text for f in confirmed_facts]
 
@@ -568,7 +643,7 @@ def regenerate_style_candidates(
 
     confirmed_facts = db.query(ProductFact).filter(
         ProductFact.project_id == project_id,
-        ProductFact.verification_status == "confirmed"
+        ProductFact.verification_status.in_(CONFIRMED_FACT_STATUSES)
     ).all()
     facts = [f.fact_text for f in confirmed_facts]
 
@@ -653,12 +728,12 @@ def create_page_draft(
     # 1. 확정 및 미확정 사실 구분 수집
     confirmed_facts = db.query(ProductFact).filter(
         ProductFact.project_id == project_id,
-        ProductFact.verification_status == "confirmed"
+        ProductFact.verification_status.in_(CONFIRMED_FACT_STATUSES)
     ).all()
     
     unconfirmed_facts = db.query(ProductFact).filter(
         ProductFact.project_id == project_id,
-        ProductFact.verification_status != "confirmed"
+        ProductFact.verification_status.notin_(CONFIRMED_FACT_STATUSES)
     ).all()
 
     # AI 입력 데이터 준비 (dict 목록)
@@ -719,7 +794,21 @@ def create_page_draft(
         image_assets = get_page_eligible_assets(db, project_id)
         if image_assets:
             sections_data = [{"id": sec.id, "section_type": sec.section_type or ""} for sec in new_page.sections]
-            assets_data = [{"id": a.id, "filename": a.filename, "mime_type": a.mime_type, "source_type": a.source_type} for a in image_assets]
+            assets_data = [
+                {
+                    "id": a.id,
+                    "filename": a.filename,
+                    "mime_type": a.mime_type,
+                    "source_type": a.source_type,
+                    "asset_role": a.asset_role,
+                    "role_confidence": a.role_confidence,
+                    "quality_status": a.quality_status,
+                    "quality_warnings": a.quality_warnings or [],
+                    "ocr_text": a.ocr_text,
+                    "is_representative": a.is_representative,
+                }
+                for a in image_assets
+            ]
             
             from src.services.image_asset_mapper import map_image_assets_to_sections
             assignments = map_image_assets_to_sections(sections_data, assets_data)
@@ -760,6 +849,8 @@ def get_page_details(
     if not page:
         raise HTTPException(status_code=404, detail="Page draft not found for this project")
 
+    clear_unconfirmed_low_quality_hero_assignments(db, project_id)
+    page = get_visual_ready_page_or_404(db, project_id, workspace.id)
     return build_page_response(page, db)
 
 
@@ -771,7 +862,153 @@ def get_page_readiness(
 ):
     workspace = auth_ctx["workspace"]
     page = get_visual_ready_page_or_404(db, project_id, workspace.id)
+    clear_unconfirmed_low_quality_hero_assignments(db, project_id)
+    page = get_visual_ready_page_or_404(db, project_id, workspace.id)
     return inspect_page_readiness(page, db)
+
+
+@router.get("/commerce-story-baselines", response_model=List[BaselineProductResponse])
+def list_commerce_story_baselines(
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """The three fixed Sprint 0 product packs used by later regression checks."""
+    workspace = auth_ctx["workspace"]
+    registrations = {
+        record.baseline_key: record
+        for record in db.query(CommerceStoryBaselineRecord).filter(
+            CommerceStoryBaselineRecord.workspace_id == workspace.id
+        ).all()
+    }
+    return [
+        serialize_baseline_product(product, registrations.get(product.key))
+        for product in list_baseline_products()
+    ]
+
+
+@router.put(
+    "/commerce-story-baselines/{baseline_key}/registration",
+    response_model=BaselineRegistrationResponse,
+)
+def register_commerce_story_baseline(
+    baseline_key: str,
+    request: BaselineRegistrationRequest,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Register the seller-approved evidence for a fixed Sprint 0 baseline."""
+    baseline = get_baseline_product(baseline_key)
+    if not baseline:
+        raise HTTPException(status_code=404, detail="Unknown commerce-story baseline")
+    workspace = auth_ctx["workspace"]
+    user = auth_ctx["user"]
+    project = get_project_or_404(db, request.project_id, workspace.id)
+
+    _validate_baseline_asset(
+        db,
+        request.reference_capture_asset_id,
+        project.id,
+        field_name="reference_capture_asset_id",
+        must_be_jpg=False,
+    )
+    _validate_baseline_asset(
+        db,
+        request.baseline_export_asset_id,
+        project.id,
+        field_name="baseline_export_asset_id",
+        must_be_jpg=True,
+    )
+    invalid_evaluation_keys = set(request.evaluation).difference(EVALUATION_ITEMS)
+    if invalid_evaluation_keys:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown evaluation items: {', '.join(sorted(invalid_evaluation_keys))}",
+        )
+
+    record = (
+        db.query(CommerceStoryBaselineRecord)
+        .filter(
+            CommerceStoryBaselineRecord.workspace_id == workspace.id,
+            CommerceStoryBaselineRecord.baseline_key == baseline.key,
+        )
+        .first()
+    )
+    if record is None:
+        record = CommerceStoryBaselineRecord(
+            workspace_id=workspace.id,
+            baseline_key=baseline.key,
+            project_id=project.id,
+            created_by=user.id,
+        )
+        db.add(record)
+    record.project_id = project.id
+    record.reference_capture_asset_id = request.reference_capture_asset_id
+    record.baseline_export_asset_id = request.baseline_export_asset_id
+    record.evaluation_json = {
+        key: bool(request.evaluation.get(key, False))
+        for key in EVALUATION_ITEMS
+    }
+    db.commit()
+    db.refresh(record)
+    return BaselineRegistrationResponse(
+        baseline_key=record.baseline_key,
+        project_id=record.project_id,
+        reference_capture_asset_id=record.reference_capture_asset_id,
+        baseline_export_asset_id=record.baseline_export_asset_id,
+        evaluation=record.evaluation_json or {},
+    )
+
+
+@router.get(
+    "/projects/{project_id}/commerce-story-baseline",
+    response_model=CommerceStoryBaselineReport,
+)
+def get_commerce_story_baseline(
+    project_id: str,
+    baseline_key: Optional[str] = None,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Sprint 0 quality report used before moving to the commerce-story sprints."""
+    workspace = auth_ctx["workspace"]
+    page = get_visual_ready_page_or_404(db, project_id, workspace.id)
+    try:
+        return inspect_commerce_story_baseline(
+            db,
+            page,
+            baseline_key=baseline_key,
+            workspace_id=workspace.id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def _validate_baseline_asset(
+    db: Session,
+    asset_id: str | None,
+    project_id: str,
+    *,
+    field_name: str,
+    must_be_jpg: bool,
+) -> None:
+    if asset_id is None:
+        return
+    asset = db.query(Asset).filter(Asset.id == asset_id, Asset.project_id == project_id).first()
+    if asset is None:
+        raise HTTPException(status_code=422, detail=f"{field_name} must belong to this project")
+    if not asset.mime_type.startswith("image/"):
+        raise HTTPException(status_code=422, detail=f"{field_name} must reference an image asset")
+    if field_name == "reference_capture_asset_id" and resolved_asset_usage_status(asset) != "reference_only":
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field_name} must be marked reference_only",
+        )
+    if must_be_jpg and not (
+        asset.mime_type == "image/jpeg" or asset.filename.lower().endswith((".jpg", ".jpeg"))
+    ):
+        raise HTTPException(status_code=422, detail=f"{field_name} must reference a JPG export")
+    if must_be_jpg and asset.source_type != "exported_image":
+        raise HTTPException(status_code=422, detail=f"{field_name} must reference an exported JPG asset")
 
 
 @router.post("/projects/{project_id}/page/finalize", response_model=FinalPageVersionResponseSchema)
@@ -850,6 +1087,7 @@ def save_page_details(
                 "EXTREME_ASPECT_RATIO",
                 "DUPLICATE_FILE",
                 "IMAGE_INTEGRITY_WARNING",
+                "SAFE_CROP_REVIEW_REQUIRED",
             }
             if (
                 asset
@@ -860,6 +1098,21 @@ def save_page_details(
                     status_code=409,
                     detail="This image has quality warnings. Confirm before using it as the HERO image.",
                 )
+
+    requested_by_id = {section.id: section for section in req.sections}
+    candidate_sections = [
+        SimpleNamespace(
+            section_type=section.section_type,
+            sort_order=(requested_by_id[section.id].sort_order if section.id in requested_by_id else section.sort_order),
+            is_visible=(requested_by_id[section.id].is_visible if section.id in requested_by_id else section.is_visible),
+        )
+        for section in page.sections
+    ]
+    if not final_spec_is_last(candidate_sections):
+        raise HTTPException(
+            status_code=422,
+            detail="Final product specifications and required notices must be the last visible section.",
+        )
 
     from src.services.page_visual_contract import normalize_visual, validate_visual
 
@@ -880,6 +1133,29 @@ def save_page_details(
                     for key, value in sec.visual_payload.items()
                     if key != "missing_state"
                 }
+            if sec.section_type == "hero":
+                payload = dict(sec.visual_payload or {})
+                selected_asset = (
+                    get_page_eligible_asset(db, project_id, sec.image_asset_id)
+                    if sec.image_asset_id
+                    else None
+                )
+                hero_warning_codes = {
+                    "LOW_RESOLUTION",
+                    "EXTREME_ASPECT_RATIO",
+                    "DUPLICATE_FILE",
+                    "IMAGE_INTEGRITY_WARNING",
+                    "SAFE_CROP_REVIEW_REQUIRED",
+                }
+                if (
+                    selected_asset
+                    and hero_warning_codes.intersection(selected_asset.quality_warnings or [])
+                    and req.confirm_low_quality_hero
+                ):
+                    payload["low_quality_hero_confirmed"] = True
+                else:
+                    payload.pop("low_quality_hero_confirmed", None)
+                sec.visual_payload = payload
         if sec_update.visual_kind is not None:
             sec.visual_kind = sec_update.visual_kind
         if sec_update.visual_payload is not None:
@@ -964,6 +1240,23 @@ def add_page_section(
         sort_order = max_sort_order + 1
     else:
         sort_order = req.sort_order
+
+    candidate_sections = [
+        SimpleNamespace(
+            section_type=existing.section_type,
+            sort_order=existing.sort_order,
+            is_visible=existing.is_visible,
+        )
+        for existing in page.sections
+    ]
+    candidate_sections.append(
+        SimpleNamespace(section_type=req.section_type, sort_order=sort_order, is_visible=True)
+    )
+    if not final_spec_is_last(candidate_sections):
+        raise HTTPException(
+            status_code=422,
+            detail="Final product specifications and required notices must be the last visible section.",
+        )
 
     section = PageSection(
         page_id=page.id,
@@ -1084,6 +1377,20 @@ def restore_page_version_endpoint(
     else:
         sections_data = snapshot
 
+    candidate_sections = [
+        SimpleNamespace(
+            section_type=section.get("section_type") or section.get("key"),
+            sort_order=section.get("sort_order", index),
+            is_visible=section.get("is_visible", True),
+        )
+        for index, section in enumerate(sections_data)
+    ]
+    if not final_spec_is_last(candidate_sections):
+        raise HTTPException(
+            status_code=422,
+            detail="The selected version places final product specifications before another visible section.",
+        )
+
     # 3. 기존 섹션을 모두 제거한 뒤 선택한 버전의 섹션으로 교체한다.
     db.query(PageSection).filter(PageSection.page_id == page.id).delete()
 
@@ -1135,7 +1442,7 @@ def get_page_grounding_review(
     
     confirmed_facts = db.query(ProductFact).filter(
         ProductFact.project_id == project_id,
-        ProductFact.verification_status == "confirmed"
+        ProductFact.verification_status.in_(CONFIRMED_FACT_STATUSES)
     ).all()
     facts_list = [f.fact_text for f in confirmed_facts]
     
@@ -1921,7 +2228,7 @@ def preview_copy_rewrite(
         f.fact_text
         for f in db.query(ProductFact).filter(
             ProductFact.project_id == project_id,
-            ProductFact.verification_status == "confirmed",
+            ProductFact.verification_status.in_(CONFIRMED_FACT_STATUSES),
         ).all()
     ]
 
@@ -1988,7 +2295,7 @@ def create_planning_draft(
 
     confirmed_facts = db.query(ProductFact).filter(
         ProductFact.project_id == project_id,
-        ProductFact.verification_status == "confirmed",
+        ProductFact.verification_status.in_(CONFIRMED_FACT_STATUSES),
     ).all()
 
     draft = PlanningDraftService.generate_draft(project, confirmed_facts, db)

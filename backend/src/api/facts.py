@@ -11,8 +11,14 @@ from src.services.llm_router import LLMRouter
 from src.services.fact_extractor import ExtractedFactCandidate, extract_fact_candidates, normalize_fact_text
 from src.services.source_collector import collect_project_sources
 from src.services.bulk_fact_parser import parse_bulk_fact_text
+from src.services.commerce_policy import CONFIRMED_FACT_STATUSES, fact_status_requires_review
 
 router = APIRouter(prefix="/projects/{project_id}/facts", tags=["facts"])
+
+FactStatus = Literal[
+    "extracted", "source_confirmed", "seller_confirmed", "needs_review",
+    "conflicted", "rejected",
+]
 
 
 # Pydantic Schemas
@@ -26,7 +32,7 @@ class FactUpdateSchema(BaseModel):
     fact_text: Optional[str] = None
     source_text: Optional[str] = None
     source_asset_id: Optional[str] = None
-    verification_status: Optional[Literal["unknown", "confirmed", "needs_revision"]] = None
+    verification_status: Optional[FactStatus] = None
 
 
 class FactResponseSchema(BaseModel):
@@ -55,7 +61,7 @@ class BulkFactInputSchema(BaseModel):
 
 class BulkCreateFactsRequestSchema(BaseModel):
     items: List[BulkFactInputSchema]
-    default_status: Literal["unknown", "confirmed", "needs_revision"]
+    default_status: FactStatus
 
 
 class BulkCreateFactsResponseSchema(BaseModel):
@@ -206,7 +212,7 @@ def list_facts(
 
     query = db.query(ProductFact).filter(ProductFact.project_id == project_id)
     if confirmed_only:
-        query = query.filter(ProductFact.verification_status == "confirmed")
+        query = query.filter(ProductFact.verification_status.in_(CONFIRMED_FACT_STATUSES))
     return query.all()
 
 
@@ -226,7 +232,8 @@ def create_fact(
         fact_text=payload.fact_text,
         source_text=payload.source_text,
         source_asset_id=payload.source_asset_id,
-        verification_status="unknown"
+        verification_status="extracted",
+        needs_review=True,
     )
     db.add(fact)
     db.commit()
@@ -272,7 +279,7 @@ def auto_extract_facts(
             skipped_duplicates += 1
             continue
 
-        verification_status = "needs_revision" if candidate.risk_flags else "unknown"
+        verification_status = "needs_review" if candidate.risk_flags else "extracted"
         fact = ProductFact(
             project_id=project_id,
             fact_text=candidate.fact_text,
@@ -346,6 +353,8 @@ def update_fact(
     # Apply changes
     for key, value in update_data.items():
         setattr(fact, key, value)
+    if "verification_status" in update_data:
+        fact.needs_review = fact_status_requires_review(fact.verification_status)
 
     # Update project updated_at timestamp as well
     project = db.query(ProductProject).filter(ProductProject.id == project_id).first()
@@ -482,6 +491,7 @@ def bulk_create_facts(
             fact_text=trimmed_fact,
             source_text=source_text,
             verification_status=payload.default_status,
+            needs_review=fact_status_requires_review(payload.default_status),
         )
         db.add(fact)
         created_facts.append(fact)

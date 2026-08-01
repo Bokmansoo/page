@@ -4,13 +4,17 @@ from PIL import Image
 
 from src.agents.nodes.image_generation.agent import ImageGenerationAgent
 from src.agents.state import AgentRunState
-from src.db.models import Asset, PageSection, ProductPage, ProductProject
+from src.api.pages import get_image_candidates_for_section
+from src.db.models import Asset, ImageGenerationJobRecord, PageSection, ProductPage, ProductProject
+from src.services.detail_page_orchestrator import DetailPageOrchestrator
 from src.services.image_asset_inspector import (
     apply_asset_inspection,
     backfill_project_asset_metadata,
     refresh_representative_product_asset,
 )
+from src.services.local_image_upscale import create_auto_upscale_preview
 from src.services.image_asset_mapper import map_image_assets_to_sections
+from src.services.page_asset_policy import clear_unconfirmed_low_quality_hero_assignments
 
 
 def _project(db_session, project_id="asset-classification-project"):
@@ -87,6 +91,33 @@ def test_inspector_warns_for_low_resolution_extreme_ratio_and_duplicate(db_sessi
     assert {"LOW_RESOLUTION", "EXTREME_ASPECT_RATIO"}.issubset(first.quality_warnings)
     assert duplicate.quality_status == "warning"
     assert "DUPLICATE_FILE" in duplicate.quality_warnings
+
+
+def test_low_resolution_seller_upload_gets_an_unselected_upscale_preview(db_session, tmp_path, monkeypatch):
+    project = _project(db_session, project_id="auto-upscale-preview-project")
+    source = _image_asset(
+        db_session,
+        project.id,
+        tmp_path,
+        "auto-upscale-source",
+        "small-product-main.png",
+        size=(300, 300),
+    )
+    apply_asset_inspection(source, db_session)
+    refresh_representative_product_asset(project.id, db_session)
+
+    from src.config import settings
+    monkeypatch.setattr(settings, "UPLOAD_DIR", str(tmp_path / "upscaled"))
+    preview = create_auto_upscale_preview(source, db_session)
+    db_session.commit()
+
+    assert preview is not None
+    assert preview.source_type == "local_upscaled"
+    assert preview.source_asset_id == source.id
+    assert (preview.width, preview.height) == (1200, 1200)
+    assert preview.quality_status == "usable"
+    assert preview.is_representative is False
+    assert source.is_representative is True
 
 
 def test_corrupt_file_is_rejected_but_manual_role_is_not_overwritten(db_session, tmp_path):
@@ -305,3 +336,215 @@ def test_agent_run_never_auto_recommends_low_quality_photo_for_hero():
 
     assert next(candidate for candidate in candidates if candidate["asset_id"] == "representative")["is_recommended"] is True
     assert next(candidate for candidate in candidates if candidate["asset_id"] == "low")["is_recommended"] is False
+
+
+def test_auto_upscale_preview_is_visible_but_not_auto_recommended_for_hero():
+    state = AgentRunState(
+        project_id="auto-upscale-preview-project",
+        outputs={
+            "source_collection": {
+                "uploaded_images": [
+                    {
+                        "asset_id": "low-original",
+                        "filename": "small-product.png",
+                        "source_type": "uploaded",
+                        "quality_warnings": ["LOW_RESOLUTION"],
+                        "is_representative": True,
+                    },
+                    {
+                        "asset_id": "upscale-preview",
+                        "filename": "small-product-upscaled.png",
+                        "source_type": "local_upscaled",
+                        "quality_status": "usable",
+                        "quality_warnings": [],
+                    },
+                ],
+                "url_images": [],
+            },
+            "visual_planning": {
+                "visual_slots": [{"slot_id": "hero", "role": "representative_product"}]
+            },
+        },
+    )
+
+    candidates = ImageGenerationAgent().run(state).outputs["image_generation"]["candidates"]["hero"]
+
+    preview = next(candidate for candidate in candidates if candidate["asset_id"] == "upscale-preview")
+    assert preview["source_type"] == "local_upscaled"
+    assert preview["is_recommended"] is False
+
+
+def test_generation_job_candidate_uses_linked_uploaded_asset_provenance(db_session, tmp_path):
+    project = _project(db_session, project_id="candidate-provenance-project")
+    asset = _image_asset(
+        db_session,
+        project.id,
+        tmp_path,
+        "candidate-provenance-asset",
+        "seller-product-photo.png",
+    )
+    job = ImageGenerationJobRecord(
+        project_id=project.id,
+        job_id="candidate-provenance-job",
+        section_id="candidate-provenance-hero",
+        role="hero",
+        prompt="Use the existing seller photo",
+        status="completed",
+        output_asset_id=asset.id,
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    section = type("Section", (), {"id": "candidate-provenance-hero"})()
+    candidates = get_image_candidates_for_section(section, db_session, project.id)
+
+    assert candidates[0]["source_type"] == "uploaded"
+    assert candidates[0]["label"] == "seller-product-photo.png"
+
+
+def test_low_quality_hero_job_keeps_original_photo_visible_for_review(db_session, tmp_path):
+    project = _project(db_session, project_id="low-quality-candidate-project")
+    asset = _image_asset(
+        db_session,
+        project.id,
+        tmp_path,
+        "low-quality-candidate-asset",
+        "small-seller-product-photo.png",
+        size=(300, 300),
+    )
+    apply_asset_inspection(asset, db_session)
+    job = ImageGenerationJobRecord(
+        project_id=project.id,
+        job_id="low-quality-candidate-job",
+        section_id="low-quality-candidate-hero",
+        role="hero",
+        source_asset_ids=[asset.id],
+        prompt="Use the original product photo",
+        status="skipped",
+        provider="source_required",
+        error_code="LOW_QUALITY_HERO_SOURCE",
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    section = type("Section", (), {"id": "low-quality-candidate-hero"})()
+    candidates = get_image_candidates_for_section(section, db_session, project.id)
+
+    assert candidates[0]["asset_id"] == asset.id
+    assert candidates[0]["source_type"] == "uploaded"
+    assert candidates[0]["status"] == "quality_review_required"
+    assert "LOW_RESOLUTION" in candidates[0]["quality_warnings"]
+
+
+def test_low_quality_hero_shows_auto_upscale_as_manual_candidate(db_session, tmp_path, monkeypatch):
+    project = _project(db_session, project_id="auto-upscale-candidate-project")
+    source = _image_asset(
+        db_session,
+        project.id,
+        tmp_path,
+        "auto-upscale-candidate-source",
+        "small-seller-product-photo.png",
+        size=(300, 300),
+    )
+    apply_asset_inspection(source, db_session)
+    from src.config import settings
+    monkeypatch.setattr(settings, "UPLOAD_DIR", str(tmp_path / "upscaled-candidate"))
+    preview = create_auto_upscale_preview(source, db_session)
+    job = ImageGenerationJobRecord(
+        project_id=project.id,
+        job_id="auto-upscale-candidate-job",
+        section_id="auto-upscale-candidate-hero",
+        role="hero",
+        source_asset_ids=[source.id],
+        prompt="Use the seller product photo",
+        status="skipped",
+        provider="source_required",
+        error_code="LOW_QUALITY_HERO_SOURCE",
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    section = type("Section", (), {"id": "auto-upscale-candidate-hero"})()
+    candidates = get_image_candidates_for_section(section, db_session, project.id)
+
+    assert preview is not None
+    assert candidates[0]["asset_id"] == preview.id
+    assert candidates[0]["source_type"] == "local_upscaled"
+    assert candidates[0]["status"] == "quality_review_required"
+
+
+def test_existing_unconfirmed_low_quality_hero_is_cleared_for_review(db_session, tmp_path):
+    project = _project(db_session, project_id="legacy-low-quality-hero-project")
+    page = ProductPage(id="legacy-low-quality-hero-page", project_id=project.id)
+    asset = _image_asset(
+        db_session,
+        project.id,
+        tmp_path,
+        "legacy-low-quality-hero-asset",
+        "small-product-main.png",
+        size=(300, 300),
+    )
+    apply_asset_inspection(asset, db_session)
+    section = PageSection(
+        id="legacy-low-quality-hero-section",
+        page_id=page.id,
+        section_type="hero",
+        title="Hero",
+        body_copy="Body",
+        sort_order=0,
+        is_visible=True,
+        image_asset_id=asset.id,
+    )
+    db_session.add_all([page, section])
+    db_session.commit()
+
+    assert clear_unconfirmed_low_quality_hero_assignments(db_session, project.id) == 1
+    db_session.refresh(section)
+
+    assert section.image_asset_id is None
+    assert section.visual_payload["missing_state"] == "quality_review_required"
+
+
+def test_source_only_hero_job_skips_low_quality_photo_automatically(db_session, tmp_path):
+    project = _project(db_session, project_id="source-only-low-quality-hero-project")
+    page = ProductPage(id="source-only-low-quality-hero-page", project_id=project.id)
+    asset = _image_asset(
+        db_session,
+        project.id,
+        tmp_path,
+        "source-only-low-quality-hero-asset",
+        "small-product-main.png",
+        size=(300, 300),
+    )
+    apply_asset_inspection(asset, db_session)
+    section = PageSection(
+        id="source-only-low-quality-hero-section",
+        page_id=page.id,
+        section_type="hero",
+        title="Hero",
+        body_copy="Body",
+        sort_order=0,
+        is_visible=True,
+        image_asset_id=asset.id,
+    )
+    job = ImageGenerationJobRecord(
+        project_id=project.id,
+        job_id="source-only-low-quality-hero-job",
+        section_id=section.id,
+        role="representative_product",
+        source_asset_ids=[asset.id],
+        prompt="Use the original product photo",
+        cost_tier="standard",
+        status="planned",
+    )
+    db_session.add_all([page, section, job])
+    db_session.commit()
+
+    DetailPageOrchestrator._approve_source_only_jobs(project, db_session)
+    db_session.refresh(job)
+    db_session.refresh(section)
+
+    assert job.status == "skipped"
+    assert job.output_asset_id is None
+    assert section.image_asset_id is None
+    assert section.visual_payload["missing_state"] == "quality_review_required"

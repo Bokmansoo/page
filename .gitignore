@@ -48,6 +48,7 @@ frontend/.pw-test-results*/
 frontend/.e2e-*/
 .pytest-tmp*/
 backend/.pytest-tmp*/
+backend/.pytest-temp*/
 backend/.test-tmp*/
 backend/.pytest_cache_temp/
 

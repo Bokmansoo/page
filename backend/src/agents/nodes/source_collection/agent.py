@@ -1,5 +1,9 @@
 from src.agents.nodes.base import AgentNode
 from src.agents.state import AgentRunState
+from src.services.commerce_policy import (
+    FINAL_OUTPUT_ASSET_STATUSES,
+    initial_asset_usage_status,
+)
 
 class SourceCollectionAgent(AgentNode):
     name = "source_collection"
@@ -9,18 +13,24 @@ class SourceCollectionAgent(AgentNode):
         
         # 1. uploaded_images
         uploaded_images = []
+        # Reference-only supplier captures remain available to later analysis,
+        # but they must never be offered as a final page image candidate.
+        reference_images = []
         uploaded_assets = input_snap.get("uploaded_assets") or []
         for asset in uploaded_assets:
-            uploaded_images.append({
+            source_type = asset.get("source_type") or "uploaded"
+            item = {
                 "asset_id": asset.get("asset_id"),
                 "filename": asset.get("filename"),
-                "source_type": asset.get("source_type") or "uploaded",
+                "source_type": source_type,
+                "usage_status": asset.get("usage_status") or initial_asset_usage_status(source_type),
                 "asset_role": asset.get("asset_role") or "unknown",
                 "role_confidence": asset.get("role_confidence") or 0.0,
                 "quality_status": asset.get("quality_status") or "warning",
                 "quality_warnings": asset.get("quality_warnings") or [],
                 "is_representative": bool(asset.get("is_representative")),
-            })
+            }
+            (uploaded_images if item["usage_status"] in FINAL_OUTPUT_ASSET_STATUSES else reference_images).append(item)
 
         url_images = []
         for idx, image in enumerate(input_snap.get("url_images") or []):
@@ -28,6 +38,7 @@ class SourceCollectionAgent(AgentNode):
                 "asset_id": image.get("asset_id") or f"url-image-{idx + 1}",
                 "filename": image.get("filename") or f"url-image-{idx + 1}.png",
                 "source_type": image.get("source_type") or "url-extracted",
+                "usage_status": "reference_only",
                 "url": image.get("url"),
             })
             
@@ -37,15 +48,29 @@ class SourceCollectionAgent(AgentNode):
                 from src.db.models import Asset
                 db = SessionLocal()
                 try:
-                    assets = db.query(Asset).filter(Asset.id.in_(state.product_input.asset_ids)).all()
+                    requested_asset_ids = list(state.product_input.asset_ids)
+                    assets = db.query(Asset).filter(Asset.id.in_(requested_asset_ids)).all()
+                    # Upload-time low-resolution previews should be available
+                    # as explicit candidates in this generation run.
+                    previews = (
+                        db.query(Asset)
+                        .filter(
+                            Asset.project_id == state.project_id,
+                            Asset.source_type == "local_upscaled",
+                            Asset.source_asset_id.in_(requested_asset_ids),
+                        )
+                        .all()
+                    )
+                    known_ids = {item.id for item in assets}
+                    assets.extend(preview for preview in previews if preview.id not in known_ids)
                     known_asset_ids = {
                         image.get("asset_id")
-                        for image in [*uploaded_images, *url_images]
+                        for image in [*uploaded_images, *url_images, *reference_images]
                         if image.get("asset_id")
                     }
                     for a in assets:
                         if a.id in known_asset_ids:
-                            for image in [*uploaded_images, *url_images]:
+                            for image in [*uploaded_images, *url_images, *reference_images]:
                                 if image.get("asset_id") == a.id:
                                     image.update({
                                         "asset_role": a.asset_role,
@@ -59,6 +84,7 @@ class SourceCollectionAgent(AgentNode):
                             "asset_id": a.id,
                             "filename": a.filename,
                             "source_type": a.source_type or "uploaded",
+                            "usage_status": a.usage_status or initial_asset_usage_status(a.source_type),
                             "url": a.file_path if str(a.file_path).startswith("http") else None,
                             "asset_role": a.asset_role,
                             "role_confidence": a.role_confidence,
@@ -68,8 +94,10 @@ class SourceCollectionAgent(AgentNode):
                         }
                         if a.source_type in {"url-extracted", "url-imported"}:
                             url_images.append(item)
-                        else:
+                        elif item["usage_status"] in FINAL_OUTPUT_ASSET_STATUSES:
                             uploaded_images.append(item)
+                        else:
+                            reference_images.append(item)
                         known_asset_ids.add(a.id)
                 finally:
                     db.close()
@@ -79,7 +107,7 @@ class SourceCollectionAgent(AgentNode):
             # Test-safe fallback for isolated test db sessions
             # Do not reclassify URL-collected assets as uploaded images in an
             # isolated test session. That would bypass the URL approval gate.
-            if not uploaded_images and not url_images:
+            if not uploaded_images and not url_images and not reference_images:
                 for aid in state.product_input.asset_ids:
                     uploaded_images.append({
                         "asset_id": aid,
@@ -130,6 +158,7 @@ class SourceCollectionAgent(AgentNode):
             "reference_urls": reference_urls,
             "uploaded_images": uploaded_images,
             "url_images": url_images,
+            "reference_images": reference_images,
             "reference_text_blocks": reference_text_blocks,
             "source_summary": source_summary
         }

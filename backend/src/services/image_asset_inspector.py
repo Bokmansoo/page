@@ -215,7 +215,15 @@ def refresh_representative_product_asset(project_id: str, db: Session) -> Asset 
     if manual:
         return manual
 
-    candidates = [asset for asset in assets if asset.quality_status != "rejected"]
+    # An upload-time local upscale is a reviewable proposal. It must not
+    # quietly replace the seller's original as the automatic representative.
+    # Once the seller applies it, representative_source becomes manual and the
+    # early return above preserves that explicit choice.
+    candidates = [
+        asset
+        for asset in assets
+        if asset.quality_status != "rejected" and asset.source_type != "local_upscaled"
+    ]
     if not candidates:
         return None
 

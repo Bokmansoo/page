@@ -5,6 +5,7 @@ from src.db.models import (
     Brand,
     ImageGenerationJobRecord,
     PageSection,
+    ProductFact,
     ProductPage,
     ProductProject,
     User,
@@ -39,9 +40,30 @@ def test_readiness_distinguishes_html_visual_from_missing_image():
                 visual_kind="html_graphic",
                 visual_payload={
                     "layout_variant": "comparison_cards",
-                    "cards": [{"title": "무선", "body": "이동"}],
+                    "cards": [{
+                        "title": "무선",
+                        "body": "이동",
+                        "verification_status": "confirmed",
+                        "source_fact_ids": ["fact-wireless"],
+                    }],
                 },
                 image_asset_id=None,
+            ),
+            _section(
+                id="spec",
+                section_type="specifications",
+                visual_kind="html_graphic",
+                visual_payload={
+                    "layout_variant": "spec_table",
+                    "table_rows": [{
+                        "label": "모델",
+                        "value": "기준 모델",
+                        "verification_status": "confirmed",
+                        "source_fact_ids": ["fact-model"],
+                    }],
+                },
+                image_asset_id=None,
+                sort_order=2,
             ),
         ],
         sort_order=lambda: None,
@@ -173,6 +195,14 @@ def test_readiness_allows_jobless_project_generated_image_in_dev_mode(db_session
         file_size=100,
     )
     page = ProductPage(id="readiness-page-jobless", project_id=project.id)
+    fact = ProductFact(
+        id="fact-model",
+        project_id=project.id,
+        fact_text="모델: 기준 모델",
+        source_text="판매자 확인 모델: 기준 모델",
+        verification_status="seller_confirmed",
+        needs_review=False,
+    )
     section = PageSection(
         id="readiness-hero-jobless",
         page_id=page.id,
@@ -184,8 +214,27 @@ def test_readiness_allows_jobless_project_generated_image_in_dev_mode(db_session
         visual_payload={"layout_variant": "hero_overlay"},
         sort_order=0,
     )
-    db_session.add_all([user, workspace, brand, project, asset, page, section])
+    spec = PageSection(
+        id="readiness-spec-jobless",
+        page_id=page.id,
+        section_type="specifications",
+        title="최종 상품 스펙",
+        body_copy="구매 전 상품 정보를 확인하세요.",
+        visual_kind="html_graphic",
+        visual_payload={
+            "layout_variant": "spec_table",
+            "table_rows": [{
+                "label": "모델",
+                "value": "기준 모델",
+                "verification_status": "source_confirmed",
+                "source_fact_ids": ["fact-model"],
+            }],
+        },
+        sort_order=1,
+    )
+    db_session.add_all([user, workspace, brand, project, asset, page, fact, section, spec])
     db_session.commit()
+    db_session.expire(page, ["sections"])
 
     result = inspect_page_readiness(page, db_session)
 
@@ -235,8 +284,27 @@ def test_readiness_blocks_low_quality_composed_hero(db_session):
         },
         sort_order=0,
     )
-    db_session.add_all([user, workspace, brand, project, asset, page, section])
+    spec = PageSection(
+        id="quality-spec",
+        page_id=page.id,
+        section_type="specifications",
+        title="최종 스펙",
+        body_copy="구매 전 상품 정보를 확인하세요.",
+        visual_kind="html_graphic",
+        visual_payload={
+            "layout_variant": "spec_table",
+            "table_rows": [{
+                "label": "모델",
+                "value": "기준 모델",
+                "verification_status": "source_confirmed",
+                "source_fact_ids": ["fact-model"],
+            }],
+        },
+        sort_order=1,
+    )
+    db_session.add_all([user, workspace, brand, project, asset, page, section, spec])
     db_session.commit()
+    db_session.expire(page, ["sections"])
 
     result = inspect_page_readiness(page, db_session)
 
@@ -286,7 +354,25 @@ def test_readiness_requires_confirmed_representative_for_composed_hero(db_sessio
         },
         sort_order=0,
     )
-    db_session.add_all([user, workspace, brand, project, asset, page, section])
+    spec = PageSection(
+        id="readiness-spec-jobless",
+        page_id=page.id,
+        section_type="specifications",
+        title="최종 스펙",
+        body_copy="구매 전 상품 정보를 확인하세요.",
+        visual_kind="html_graphic",
+        visual_payload={
+            "layout_variant": "spec_table",
+            "table_rows": [{
+                "label": "모델",
+                "value": "기준 모델",
+                "verification_status": "confirmed",
+                "source_fact_ids": ["fact-model"],
+            }],
+        },
+        sort_order=1,
+    )
+    db_session.add_all([user, workspace, brand, project, asset, page, section, spec])
     db_session.commit()
 
     result = inspect_page_readiness(page, db_session)

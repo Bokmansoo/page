@@ -6,6 +6,8 @@ from src.services.sales_strategy_service import generate_sales_strategy
 from src.services.ai_cost_policy import AICostPolicy
 from src.services.page_generator import PageGenerationService
 from src.services.page_asset_policy import get_page_eligible_assets
+from src.services.page_asset_policy import has_hero_auto_assign_blocker
+from src.services.commerce_policy import resolved_asset_usage_status
 from src.services.visual_page_renderer import build_visual_sections
 
 logger = logging.getLogger(__name__)
@@ -141,6 +143,7 @@ class DetailPageOrchestrator:
                         dummy_asset = Asset(
                             project_id=project_id,
                             source_type="generated_image",
+                            usage_status="ai_generated",
                             filename=f"gen_{job.section_id}.png",
                             file_path=f"uploads/gen_{job.section_id}.png",
                             mime_type="image/png",
@@ -243,6 +246,7 @@ from src.services.image_generation_service import (
     sync_job_to_project_json,
 )
 from src.services.sales_package_service import SalesPackageService
+from src.services.commerce_policy import is_asset_final_output_eligible
 from src.services.visual_package_planner import VisualPackagePlanner
 from src.config import settings
 
@@ -269,7 +273,7 @@ class DetailPageOrchestrator:
         URL-collected images are deliberately excluded here. Sprint 1 requires an
         explicit user selection before a URL image can become a page visual.
         """
-        return (
+        candidates = (
             db.query(Asset)
             .filter(
                 Asset.project_id == project.id,
@@ -279,17 +283,48 @@ class DetailPageOrchestrator:
             .order_by(Asset.created_at.asc())
             .all()
         )
+        # Supplier captures may be used as a visual reference for generation,
+        # but never reused as the final section image.
+        return [asset for asset in candidates if is_asset_final_output_eligible(asset)]
+
+    @staticmethod
+    def _get_reference_product_assets(project: ProductProject, db: Session) -> list[Asset]:
+        """Return supplier captures that may guide AI redesign, never final output."""
+        candidates = (
+            db.query(Asset)
+            .filter(
+                Asset.project_id == project.id,
+                Asset.mime_type.like("image/%"),
+                Asset.quality_status != "rejected",
+            )
+            .order_by(Asset.created_at.asc())
+            .all()
+        )
+        return [
+            asset
+            for asset in candidates
+            if resolved_asset_usage_status(asset) == "reference_only"
+        ]
 
     @staticmethod
     def _choose_source_asset(
         job: ImageGenerationJobRecord,
         reusable_assets: list[Asset],
+        section: PageSection | None = None,
     ) -> Asset | None:
         assets_by_id = {asset.id: asset for asset in reusable_assets}
+        ordered_assets = []
         for asset_id in job.source_asset_ids or []:
             if asset := assets_by_id.get(asset_id):
-                return asset
-        return reusable_assets[0] if reusable_assets else None
+                ordered_assets.append(asset)
+        ordered_assets.extend(
+            asset for asset in reusable_assets if asset.id not in {item.id for item in ordered_assets}
+        )
+        if section and section.section_type == "hero":
+            ordered_assets = [
+                asset for asset in ordered_assets if not has_hero_auto_assign_blocker(asset)
+            ]
+        return ordered_assets[0] if ordered_assets else None
 
     @staticmethod
     def repair_mock_visual_assets(project: ProductProject, db: Session) -> int:
@@ -301,6 +336,7 @@ class DetailPageOrchestrator:
         small, idempotent repair for projects generated before this guard existed.
         """
         reusable_assets = DetailPageOrchestrator._get_reusable_product_assets(project, db)
+        reference_assets = DetailPageOrchestrator._get_reference_product_assets(project, db)
         updated = 0
 
         for job in DetailPageOrchestrator._load_jobs(project, db):
@@ -310,11 +346,28 @@ class DetailPageOrchestrator:
                 and job.cost_tier in AICostPolicy.HIGH_COST_TIERS
                 and job.status in MOCK_REPLACEMENT_STATUSES
             )
-            if not legacy_mock_output and not mock_mode_pending:
+            section = db.query(PageSection).filter(PageSection.id == job.section_id).first()
+            automatic_source_output = (
+                job.provider == "source_asset"
+                and job.model == "original-product-photo"
+            )
+            prior_missing_reference_output = (
+                job.provider == "source_required"
+                and job.error_code == "MISSING_PRODUCT_IMAGE"
+            )
+            if not legacy_mock_output and not mock_mode_pending and not automatic_source_output and not prior_missing_reference_output:
+                continue
+            if (
+                section
+                and (section.visual_payload or {}).get("low_quality_hero_confirmed")
+            ):
                 continue
 
-            source_asset = DetailPageOrchestrator._choose_source_asset(job, reusable_assets)
-            section = db.query(PageSection).filter(PageSection.id == job.section_id).first()
+            source_asset = DetailPageOrchestrator._choose_source_asset(
+                job,
+                reusable_assets,
+                section,
+            )
 
             if source_asset:
                 job.output_asset_id = source_asset.id
@@ -336,14 +389,31 @@ class DetailPageOrchestrator:
                 job.status = "skipped"
                 job.provider = "source_required"
                 job.model = None
-                job.error_code = "MISSING_PRODUCT_IMAGE"
-                job.warnings = [
-                    "No approved product photo is available. Upload a product photo to add this visual."
-                ]
+                if section and section.section_type == "hero" and reusable_assets:
+                    job.error_code = "LOW_QUALITY_HERO_SOURCE"
+                    job.warnings = [
+                        "The available product photo has quality warnings and needs seller confirmation or replacement before HERO use."
+                    ]
+                elif reference_assets:
+                    job.error_code = "REFERENCE_IMAGE_REDESIGN_REQUIRED"
+                    job.warnings = [
+                        "Supplier reference photos are available, but they are not eligible for final output. Generate and review an AI-redesigned visual before export."
+                    ]
+                else:
+                    job.error_code = "MISSING_PRODUCT_IMAGE"
+                    job.warnings = [
+                        "No approved product photo is available. Upload a product photo to add this visual."
+                    ]
                 if section:
                     section.image_asset_id = None
                     payload = dict(section.visual_payload or {})
-                    payload["missing_state"] = "product_photo_required"
+                    payload["missing_state"] = (
+                        "quality_review_required"
+                        if job.error_code == "LOW_QUALITY_HERO_SOURCE"
+                        else "ai_redesign_required"
+                        if job.error_code == "REFERENCE_IMAGE_REDESIGN_REQUIRED"
+                        else "product_photo_required"
+                    )
                     section.visual_payload = payload
 
             sync_job_to_project_json(project.id, job.job_id, db)
@@ -528,14 +598,33 @@ class DetailPageOrchestrator:
 
     @staticmethod
     def _approve_source_only_jobs(project: ProductProject, db: Session) -> None:
+        reusable_assets = DetailPageOrchestrator._get_reusable_product_assets(project, db)
         for job in DetailPageOrchestrator._load_jobs(project, db):
             if (
                 job.cost_tier not in AICostPolicy.HIGH_COST_TIERS
                 and job.status in SOURCE_ONLY_STATUSES
                 and job.source_asset_ids
             ):
-                job.output_asset_id = job.source_asset_ids[0]
-                job.status = "approved"
+                section = db.query(PageSection).filter(PageSection.id == job.section_id).first()
+                source_asset = DetailPageOrchestrator._choose_source_asset(
+                    job,
+                    reusable_assets,
+                    section,
+                )
+                job.output_asset_id = source_asset.id if source_asset else None
+                job.status = "approved" if source_asset else "skipped"
+                job.provider = "source_asset" if source_asset else "source_required"
+                job.model = "original-product-photo" if source_asset else None
+                if not source_asset:
+                    job.error_code = "LOW_QUALITY_HERO_SOURCE"
+                    job.warnings = [
+                        "The available product photo has quality warnings and needs seller confirmation or replacement before HERO use."
+                    ]
+                    if section:
+                        section.image_asset_id = None
+                        payload = dict(section.visual_payload or {})
+                        payload["missing_state"] = "quality_review_required"
+                        section.visual_payload = payload
                 sync_job_to_project_json(project.id, job.job_id, db)
         db.commit()
 
