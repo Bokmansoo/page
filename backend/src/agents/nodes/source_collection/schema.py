@@ -8,6 +8,11 @@ class CollectedImageSource(BaseModel):
     filename: str = ""
     source_type: Literal["uploaded", "url-extracted", "url-imported"] = "uploaded"
     url: str | None = None
+    asset_role: str = "unknown"
+    role_confidence: float = 0.0
+    quality_status: str = "warning"
+    quality_warnings: list[str] = Field(default_factory=list)
+    is_representative: bool = False
 
 
 class SourceSummary(BaseModel):

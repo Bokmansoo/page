@@ -14,8 +14,10 @@ def build_scene_plan(
 ) -> dict:
     mood_text = ", ".join(desired_mood) if desired_mood else "clean commerce"
     primary_assets = asset_ids[:1]
+    secondary_assets = asset_ids[1:2]
     generated_strategy = "cutout_composite" if primary_assets else "generated_scene"
     identity_risk = "medium" if primary_assets else "high"
+    product_introduction_strategy = generated_strategy if secondary_assets else "html_graphic"
 
     sections = [
         {
@@ -31,14 +33,20 @@ def build_scene_plan(
             "identity_risk": identity_risk,
         },
         {
-            "section_id": "pain_points",
+            "section_id": "product_introduction" if secondary_assets else "pain_points",
             "target_slot_id": "comparison",
-            "section_type": "pain_points",
-            "visual_strategy": "html_graphic",
-            "source_asset_ids": [],
-            "image_prompt": "",
+            "section_type": "product_introduction" if secondary_assets else "pain_points",
+            "visual_strategy": product_introduction_strategy,
+            "source_asset_ids": secondary_assets,
+            "image_prompt": (
+                _prompt(
+                    f"Second product photo for {product_name}, showing a complementary angle or key detail."
+                )
+                if secondary_assets
+                else ""
+            ),
             "text_free_required": True,
-            "identity_risk": "low",
+            "identity_risk": "medium" if secondary_assets else "low",
         },
         {
             "section_id": "benefits",

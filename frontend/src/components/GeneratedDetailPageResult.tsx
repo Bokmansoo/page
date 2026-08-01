@@ -63,6 +63,20 @@ interface ProjectAsset {
   cutout_status?: string | null;
   background_removed?: boolean | null;
   product_identity_preserved?: boolean | null;
+  asset_role?: string;
+  role_confidence?: number;
+  role_source?: string;
+  quality_status?: "usable" | "warning" | "rejected";
+  identity_status?: "confirmed" | "needs_review";
+  width?: number | null;
+  height?: number | null;
+  image_format?: string | null;
+  quality_warnings?: string[];
+  ocr_text?: string | null;
+  safe_crop_status?: "safe" | "needs_review" | "not_recommended";
+  is_representative?: boolean;
+  representative_source?: "auto" | "manual";
+  classification_version?: number;
 }
 
 interface ProjectData {
@@ -106,6 +120,11 @@ function downloadBlob(blob: Blob, filename: string) {
   window.setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
 }
 
+interface UpscaleComparison {
+  source: ProjectAsset;
+  enhanced: ProjectAsset;
+}
+
 const MOCK_HEADERS = {
   "X-Mock-User-Id": "00000000-0000-0000-0000-000000000001",
   "X-Mock-Workspace-Id": "00000000-0000-0000-0000-000000000002",
@@ -115,10 +134,14 @@ const MOCK_HEADERS = {
 function sourceLabel(sourceType: string): string {
   switch (sourceType) {
     case "uploaded":
+    case "sourced":
+    case "self_shot":
       return "직접 업로드";
     case "url-extracted":
     case "url-imported":
       return "URL 추출";
+    case "missing-image":
+      return "사진 필요";
     case "mock-generated":
       return "AI 모의 생성";
     case "real-generated":
@@ -140,12 +163,17 @@ function readableSourceLabel(sourceType: string): string {
   switch (sourceType) {
     case "self_shot":
     case "uploaded":
+    case "sourced":
       return "직접 업로드";
     case "url-extracted":
     case "url-imported":
       return "URL 추출";
+    case "missing-image":
+      return "사진 필요";
     case "ai_corrected":
       return "실제 상품 누끼 사용";
+    case "local_upscaled":
+      return "로컬 고화질 보정";
     case "mock-generated":
       return "AI 모의 생성";
     case "real-generated":
@@ -164,7 +192,7 @@ function readableSourceLabel(sourceType: string): string {
 }
 
 function assetSourceLabel(asset?: ProjectAsset | null): string {
-  if (!asset) return readableSourceLabel("ai-generated");
+  if (!asset) return "사진 필요";
   if (asset.background_removed || asset.cutout_status === "completed" || asset.source_type === "ai_corrected") {
     return "실제 상품 누끼 사용";
   }
@@ -260,6 +288,9 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
   const [exportBlockers, setExportBlockers] = useState<Array<{ section_id: string; code: string; message: string }>>([]);
   const [imageActionError, setImageActionError] = useState<string | null>(null);
   const [regeneratingCandidateId, setRegeneratingCandidateId] = useState<string | null>(null);
+  const [upscalingAssetId, setUpscalingAssetId] = useState<string | null>(null);
+  const [applyingUpscale, setApplyingUpscale] = useState(false);
+  const [upscaleComparison, setUpscaleComparison] = useState<UpscaleComparison | null>(null);
 
   useEffect(() => {
     const loadData = async () => {
@@ -345,6 +376,23 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
   const handleSelectImageCandidate = async (sectionId: string, candidate: ImageCandidate) => {
     if (!pageData || !candidate.asset_id) return;
     try {
+      const targetSection = pageData.sections.find((section) => section.id === sectionId);
+      const targetAsset = assets.find((asset) => asset.id === candidate.asset_id);
+      const heroQualityWarnings = new Set([
+        "LOW_RESOLUTION",
+        "EXTREME_ASPECT_RATIO",
+        "DUPLICATE_FILE",
+        "IMAGE_INTEGRITY_WARNING",
+      ]);
+      const requiresHeroQualityConfirmation =
+        targetSection?.section_type === "hero" &&
+        Boolean(targetAsset?.quality_warnings?.some((warning) => heroQualityWarnings.has(warning)));
+      if (
+        requiresHeroQualityConfirmation &&
+        !window.confirm("이 이미지는 해상도·비율 등 품질 경고가 있습니다. 그래도 HERO 이미지로 사용할까요?")
+      ) {
+        return;
+      }
       const updatedSections = pageData.sections.map((sec) => {
         if (sec.id === sectionId) {
           return {
@@ -374,6 +422,7 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
         },
         body: JSON.stringify({
           sections: updatedSections,
+          confirm_low_quality_hero: requiresHeroQualityConfirmation,
         }),
       });
 
@@ -511,6 +560,86 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
     } finally {
       setExporting(false);
       setExportStage("idle");
+    }
+  };
+
+  const updateAssetClassification = async (
+    assetId: string,
+    payload: { asset_role?: string; is_representative?: boolean }
+  ) => {
+    try {
+      const response = await fetch(
+        apiUrl(`/api/v1/projects/${projectId}/assets/${assetId}/classification`),
+        {
+          method: "PATCH",
+          headers: { ...MOCK_HEADERS, "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        }
+      );
+      if (!response.ok) throw new Error("이미지 역할을 저장하지 못했습니다.");
+      const updatedAsset = await response.json();
+      if (payload.is_representative) {
+        await refreshPageAndAssets();
+      } else {
+        setAssets((current) => current.map((asset) => (asset.id === assetId ? updatedAsset : asset)));
+      }
+    } catch (err) {
+      setImageActionError(err instanceof Error ? err.message : "이미지 역할 변경 중 오류가 발생했습니다.");
+    }
+  };
+
+  const handleAssetRoleChange = async (assetId: string, assetRole: string) => {
+    await updateAssetClassification(assetId, { asset_role: assetRole });
+  };
+
+  const responseErrorMessage = async (response: Response, fallback: string) => {
+    try {
+      const payload = await response.json();
+      return typeof payload.detail === "string" ? payload.detail : fallback;
+    } catch {
+      return fallback;
+    }
+  };
+
+  const handleCreateUpscale = async (source: ProjectAsset) => {
+    setImageActionError(null);
+    setUpscalingAssetId(source.id);
+    try {
+      const response = await fetch(apiUrl(`/api/v1/files/assets/${source.id}/upscale`), {
+        method: "POST",
+        headers: MOCK_HEADERS,
+      });
+      if (!response.ok) {
+        throw new Error(await responseErrorMessage(response, "고화질 보정본을 만들지 못했습니다."));
+      }
+      const enhanced = (await response.json()) as ProjectAsset;
+      setUpscaleComparison({ source, enhanced });
+    } catch (err) {
+      setImageActionError(err instanceof Error ? err.message : "고화질 보정 중 오류가 발생했습니다.");
+    } finally {
+      setUpscalingAssetId(null);
+    }
+  };
+
+  const handleApplyUpscale = async () => {
+    if (!upscaleComparison) return;
+    setApplyingUpscale(true);
+    setImageActionError(null);
+    try {
+      const response = await fetch(
+        apiUrl(`/api/v1/files/assets/${upscaleComparison.enhanced.id}/upscale/apply`),
+        { method: "POST", headers: MOCK_HEADERS }
+      );
+      if (!response.ok) {
+        throw new Error(await responseErrorMessage(response, "고화질 보정본을 적용하지 못했습니다."));
+      }
+      await refreshPageAndAssets();
+      setExportBlockers([]);
+      setUpscaleComparison(null);
+    } catch (err) {
+      setImageActionError(err instanceof Error ? err.message : "고화질 보정본 적용 중 오류가 발생했습니다.");
+    } finally {
+      setApplyingUpscale(false);
     }
   };
 
@@ -762,11 +891,90 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
             <h2 className="text-base font-extrabold text-slate-950">섹션별 이미지 후보</h2>
             <p className="mt-1 text-xs leading-5 text-slate-500">각 상황에 맞는 이미지를 확인하고 교체하세요.</p>
           </div>
+          <details className="mb-5 rounded-lg border border-slate-200 bg-slate-50 p-3">
+            <summary className="cursor-pointer text-xs font-extrabold text-slate-800">상품 이미지 분류 · 품질 확인</summary>
+            <div className="mt-3 space-y-3">
+              {assets.filter((asset) => asset.mime_type.startsWith("image/")).map((asset) => (
+                <div key={asset.id} className="rounded border border-slate-200 bg-white p-2">
+                  <div className="flex gap-2">
+                    <img
+                      src={assetUrl(asset)}
+                      alt={asset.filename}
+                      className="h-14 w-14 shrink-0 rounded border border-slate-100 bg-slate-50 object-cover"
+                    />
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-[11px] font-bold text-slate-700">{asset.filename}</p>
+                      <p className="mt-1 text-[10px] text-slate-500">
+                        {asset.width && asset.height ? `${asset.width} × ${asset.height}` : "크기 확인 필요"}
+                        {asset.quality_status === "warning" ? " · 품질 확인 필요" : " · 사용 가능"}
+                      </p>
+                      <p className="mt-1 text-[10px] text-slate-500">
+                        역할: {asset.asset_role || "unknown"} · 신뢰도 {Math.round((asset.role_confidence || 0) * 100)}%
+                      </p>
+                      <p className="mt-1 text-[10px] text-slate-500">
+                        안전 크롭: {asset.safe_crop_status === "safe" ? "가능" : "검수 필요"}
+                      </p>
+                    </div>
+                  </div>
+                  {asset.is_representative ? (
+                    <p className="mt-2 rounded bg-emerald-50 px-2 py-1 text-[10px] font-bold text-emerald-700">
+                      현재 대표 이미지 {asset.representative_source === "manual" ? "(직접 선택)" : "(자동 추천)"}
+                    </p>
+                  ) : null}
+                  {asset.quality_warnings?.length ? (
+                    <p className="mt-1 text-[10px] font-semibold text-amber-700">{asset.quality_warnings.join(", ")}</p>
+                  ) : null}
+                  <p className="mt-1 text-[10px] text-slate-500">
+                    사용 섹션: {pageData.sections
+                      .filter((section) => section.image_asset_id === asset.id)
+                      .map((section) => section.section_type)
+                      .join(", ") || "아직 없음"}
+                  </p>
+                  <div className="mt-2 grid grid-cols-2 gap-2">
+                    <select
+                      aria-label={`${asset.filename} 이미지 역할`}
+                      value={asset.asset_role || "unknown"}
+                      onChange={(event) => handleAssetRoleChange(asset.id, event.target.value)}
+                      className="rounded border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold text-slate-700"
+                    >
+                      <option value="unknown">역할 미확인</option>
+                      <option value="product_main">대표 상품</option>
+                      <option value="product_detail">상품 디테일</option>
+                      <option value="usage_scene">사용 장면</option>
+                      <option value="components">구성품</option>
+                      <option value="package">패키지</option>
+                      <option value="spec_reference">스펙 참고</option>
+                    </select>
+                    <button
+                      type="button"
+                      disabled={asset.is_representative}
+                      onClick={() => updateAssetClassification(asset.id, { is_representative: true })}
+                      className="rounded bg-slate-900 px-2 py-1 text-[10px] font-bold text-white disabled:bg-emerald-600"
+                    >
+                      {asset.is_representative ? "대표 선택됨" : "대표로 선택"}
+                    </button>
+                    {asset.quality_warnings?.includes("LOW_RESOLUTION") && asset.source_type !== "local_upscaled" ? (
+                      <button
+                        type="button"
+                        disabled={upscalingAssetId === asset.id}
+                        onClick={() => handleCreateUpscale(asset)}
+                        className="col-span-2 rounded bg-amber-600 px-2 py-2 text-[10px] font-bold text-white hover:bg-amber-700 disabled:bg-slate-300"
+                      >
+                        {upscalingAssetId === asset.id ? "고화질 보정 중..." : "고화질로 보정"}
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </details>
           <div className="max-h-[calc(100vh-190px)] space-y-6 overflow-y-auto pr-2">
             {visibleSections
               .filter((section) => section.section_type !== "product_information")
               .map((section) => {
-                const cands = section.image_candidates || [];
+                const cands = (section.image_candidates || []).filter(
+                  (candidate) => candidate.source_type !== "mock-generated"
+                );
                 return (
                   <div key={section.id} className="space-y-3 border-b border-slate-100 pb-5 last:border-0">
                     <div className="flex items-center justify-between">
@@ -775,13 +983,17 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
                     </div>
                     {cands.length === 0 ? (
                       <p className="rounded-lg bg-amber-50 px-3 py-2 text-[11px] font-semibold text-amber-700">
-                        생성된 후보가 없습니다. 이미지 생성 상태를 확인해 주세요.
+                        상품 사진을 추가해 주세요.
                       </p>
                     ) : (
                       <div className="grid grid-cols-2 gap-2">
                         {cands.map((cand) => {
                           const isSelected = Boolean(cand.asset_id) && section.image_asset_id === cand.asset_id;
-                          const candThumbnail = cand.asset_id ? assetUrl({ id: cand.asset_id }) : null;
+                          const requiresUrlApproval = ["url-extracted", "url-imported"].includes(cand.source_type);
+                          const candAsset = assets.find((asset) => asset.id === cand.asset_id);
+                          const candThumbnail = cand.asset_id
+                            ? assetUrl(candAsset || { id: cand.asset_id })
+                            : null;
                           return (
                             <div
                               key={cand.candidate_id}
@@ -796,7 +1008,7 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
                                   <img src={candThumbnail} alt={cand.label} className="h-full w-full object-cover" />
                                 ) : (
                                   <span className="flex h-full items-center justify-center text-[10px] font-bold text-amber-600">
-                                    재생성 필요
+                                    {cand.source_type === "missing-image" ? "상품 사진 필요" : "재생성 필요"}
                                   </span>
                                 )}
                                 <span className="absolute right-1.5 top-1.5 rounded-full bg-slate-900/80 px-1.5 py-0.5 text-[8px] font-bold text-white">
@@ -804,9 +1016,17 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
                                 </span>
                               </div>
                               <p className="mt-2 truncate text-[10px] font-bold text-slate-700">{cand.label}</p>
+                              {requiresUrlApproval && !isSelected ? (
+                                <p className="mt-1 text-[10px] font-bold text-amber-700">선택 후 적용</p>
+                              ) : null}
                               {candidateWarningLabel(cand) ? (
                                 <p className="mt-1 text-[10px] font-bold text-amber-700">
                                   {candidateWarningLabel(cand)}
+                                </p>
+                              ) : null}
+                              {candAsset?.quality_warnings?.length ? (
+                                <p className="mt-1 text-[10px] font-bold text-amber-700">
+                                  {candAsset.quality_warnings.join(", ")}
                                 </p>
                               ) : null}
                               {cand.status === "failed" && cand.warnings?.length ? (
@@ -836,7 +1056,7 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
                                     : "bg-slate-900 text-white disabled:bg-slate-200 disabled:text-slate-400"
                                 }`}
                               >
-                                {isSelected ? "적용됨" : "이 이미지 사용"}
+                                {isSelected ? "적용됨" : requiresUrlApproval ? "이 URL 이미지 승인" : "이 이미지 사용"}
                               </button>
                             </div>
                           );
@@ -849,6 +1069,63 @@ export default function GeneratedDetailPageResult({ projectId }: GeneratedDetail
           </div>
         </aside>
       </main>
+
+      {upscaleComparison ? (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/70 p-4" role="dialog" aria-modal="true" aria-label="고화질 보정 전후 비교">
+          <div className="w-full max-w-3xl rounded-2xl bg-white p-5 shadow-2xl sm:p-7">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 className="text-lg font-extrabold text-slate-950">고화질 보정 전후 비교</h2>
+                <p className="mt-1 text-xs leading-5 text-slate-500">제품 모양을 바꾸지 않고 로컬에서 확대·선명도 보정을 적용했습니다.</p>
+              </div>
+              <button
+                type="button"
+                disabled={applyingUpscale}
+                onClick={() => setUpscaleComparison(null)}
+                className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-bold text-slate-600"
+              >
+                닫기
+              </button>
+            </div>
+            <div className="mt-5 grid gap-4 sm:grid-cols-2">
+              <figure className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                <div className="aspect-square overflow-hidden rounded-lg bg-white">
+                  <img src={assetUrl(upscaleComparison.source)} alt="보정 전 원본" className="h-full w-full object-contain" />
+                </div>
+                <figcaption className="mt-3 text-xs font-bold text-slate-700">
+                  보정 전 · {upscaleComparison.source.width} × {upscaleComparison.source.height}
+                </figcaption>
+              </figure>
+              <figure className="rounded-xl border-2 border-emerald-500 bg-emerald-50 p-3">
+                <div className="aspect-square overflow-hidden rounded-lg bg-white">
+                  <img src={assetUrl(upscaleComparison.enhanced)} alt="보정 후 고화질 이미지" className="h-full w-full object-contain" />
+                </div>
+                <figcaption className="mt-3 text-xs font-extrabold text-emerald-800">
+                  보정 후 · {upscaleComparison.enhanced.width} × {upscaleComparison.enhanced.height}
+                </figcaption>
+              </figure>
+            </div>
+            <div className="mt-5 flex justify-end gap-3">
+              <button
+                type="button"
+                disabled={applyingUpscale}
+                onClick={() => setUpscaleComparison(null)}
+                className="rounded-lg border border-slate-200 px-5 py-3 text-sm font-bold text-slate-700"
+              >
+                원본 유지
+              </button>
+              <button
+                type="button"
+                disabled={applyingUpscale}
+                onClick={handleApplyUpscale}
+                className="rounded-lg bg-emerald-600 px-5 py-3 text-sm font-bold text-white hover:bg-emerald-700 disabled:bg-slate-300"
+              >
+                {applyingUpscale ? "적용 중..." : "보정본 적용"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       <footer className="sticky bottom-0 border-t border-slate-200 bg-white px-6 py-4">
         <ExportReadinessWarning blockers={exportBlockers} projectId={projectId} />

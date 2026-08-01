@@ -1,4 +1,4 @@
-export type VisualKind = "image" | "html_graphic";
+export type VisualKind = "image" | "html_graphic" | "composed_product";
 
 export interface VisualCard {
   icon_key?: string;
@@ -16,6 +16,8 @@ export interface VisualTableRow {
 export interface VisualPayload {
   layout_variant:
     | "hero_overlay"
+    | "hero_product_right"
+    | "hero_product_center"
     | "image_text"
     | "comparison_cards"
     | "benefit_cards"
@@ -25,6 +27,10 @@ export interface VisualPayload {
   cards?: VisualCard[];
   table_rows?: VisualTableRow[];
   palette?: { surface?: string; accent?: string; text?: string };
+  product_fit?: "contain";
+  text_safe_area?: "left" | "bottom";
+  background_token?: "surface_mint" | "surface_ink" | "surface_sand";
+  decoration_tokens?: string[];
 }
 
 export interface DetailPageSectionVisual {
@@ -49,11 +55,14 @@ export function validateSectionVisual(
   const validKinds: Array<VisualKind | null | undefined> = [
     "image",
     "html_graphic",
+    "composed_product",
     null,
     undefined,
   ];
   const validLayouts = new Set([
     "hero_overlay",
+    "hero_product_right",
+    "hero_product_center",
     "image_text",
     "comparison_cards",
     "benefit_cards",
@@ -66,6 +75,22 @@ export function validateSectionVisual(
   }
   if (kind === "image" && !section.image_asset_id) {
     issues.push("image_asset_required");
+  }
+  if (kind === "composed_product") {
+    if (!section.image_asset_id) issues.push("image_asset_required");
+    if (!new Set(["hero_product_right", "hero_product_center"]).has(payload.layout_variant as string)) {
+      issues.push("invalid_composed_product_layout");
+    }
+    if (payload.product_fit !== "contain") issues.push("invalid_product_fit");
+    if (!new Set(["left", "bottom"]).has(payload.text_safe_area as string)) {
+      issues.push("invalid_text_safe_area");
+    }
+    if (!new Set(["surface_mint", "surface_ink", "surface_sand"]).has(payload.background_token as string)) {
+      issues.push("invalid_background_token");
+    }
+    if (!Array.isArray(payload.decoration_tokens)) {
+      issues.push("decoration_tokens_required");
+    }
   }
   if (kind === "html_graphic") {
     const layout = payload.layout_variant as string | undefined;

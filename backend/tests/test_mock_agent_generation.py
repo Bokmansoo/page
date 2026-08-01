@@ -22,10 +22,12 @@ def test_mock_page_assembly_has_copy_and_visual_slots():
 def test_mock_page_assembly_references_assets_with_all_source_types():
     assets = build_mock_generated_assets(product_name="유아 자전거")["images"]
     assembly = build_mock_page_assembly(product_name="유아 자전거")
-    asset_ids = {asset["id"] for asset in assets}
 
-    assert {section["image_id"] for section in assembly["sections"]} <= asset_ids
-    assert {asset["source_type"] for asset in assets} == {"mock-generated"}
+    assert assets == []
+    assert {section["image_id"] for section in assembly["sections"]} == {None}
+    assert {
+        section["visual_slot"]["source_type"] for section in assembly["sections"]
+    } == {"missing-image"}
 
 
 def test_mock_graph_runs_to_qa_review():

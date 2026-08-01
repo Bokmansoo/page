@@ -29,7 +29,7 @@
 | `backend/src/api/exports.py` | Export 시 readiness check 추가 |
 | `backend/src/services/visual_package_planner.py` | `plan_visual_package()`에 `scene_plan` 파라미터 추가, html_graphic skip |
 | `backend/tests/test_visual_package_planner.py` | scene_plan html_graphic skip 테스트 추가 |
-| `docs/runbooks/2026-07-03-sellform-server-start-and-llm-mode-guide.md` | 포트 표, readiness 확인 명령 추가 |
+| `docs/runbooks/실행가이드.md` | 포트 표, readiness 확인 명령 추가 |
 
 ---
 

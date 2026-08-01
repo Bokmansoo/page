@@ -113,6 +113,23 @@ class Asset(Base):
     background_removed = Column(Boolean, default=False)
     product_identity_preserved = Column(Boolean, default=True)
 
+    # Sprint 2: persistent product-visual classification contract.
+    asset_role = Column(String(50), nullable=False, default="unknown")
+    role_confidence = Column(Float, nullable=False, default=0.0)
+    role_source = Column(String(20), nullable=False, default="auto")
+    quality_status = Column(String(20), nullable=False, default="warning")
+    identity_status = Column(String(20), nullable=False, default="needs_review")
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    image_format = Column(String(20), nullable=True)
+    quality_warnings = Column(JSON, nullable=False, default=list)
+    content_hash = Column(String(64), nullable=True)
+    ocr_text = Column(Text, nullable=True)
+    safe_crop_status = Column(String(30), nullable=False, default="needs_review")
+    is_representative = Column(Boolean, nullable=False, default=False)
+    representative_source = Column(String(20), nullable=False, default="auto")
+    classification_version = Column(Integer, nullable=False, default=0)
+
     project = relationship("ProductProject", back_populates="assets")
 
 

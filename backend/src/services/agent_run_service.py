@@ -68,21 +68,28 @@ class AgentRunService:
 
     @staticmethod
     def _ensure_input_asset_ids(run: AgentRun, db: Session) -> list[str]:
+        from src.services.image_asset_inspector import backfill_project_asset_metadata
+        backfill_project_asset_metadata(run.project_id, db)
         snapshot = dict(run.input_snapshot or {})
-        asset_ids = [asset_id for asset_id in snapshot.get("asset_ids") or [] if asset_id]
-        if asset_ids:
-            return asset_ids
-
         project_assets = (
             db.query(Asset)
-            .filter(Asset.project_id == run.project_id, Asset.mime_type.like("image/%"))
-            .order_by(Asset.created_at.asc())
+            .filter(
+                Asset.project_id == run.project_id,
+                Asset.mime_type.like("image/%"),
+                Asset.quality_status != "rejected",
+            )
+            .order_by(Asset.is_representative.desc(), Asset.created_at.asc())
             .all()
         )
         if not project_assets:
             return []
 
-        source_assets = [asset for asset in project_assets if asset.source_type != "real-generated"]
+        source_assets = [
+            asset
+            for asset in project_assets
+            if asset.source_type
+            in {"uploaded", "self_shot", "sourced", "url-extracted", "url-imported"}
+        ]
         selected_assets = source_assets or project_assets
         asset_ids = [asset.id for asset in selected_assets]
         snapshot["asset_ids"] = asset_ids

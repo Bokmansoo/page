@@ -1,6 +1,5 @@
 from src.agents.nodes.base import AgentNode
 from src.agents.state import AgentRunState
-from src.agents.mock_outputs import build_mock_generated_assets
 
 class ImageGenerationAgent(AgentNode):
     name = "image_generation"
@@ -61,7 +60,6 @@ class ImageGenerationAgent(AgentNode):
             return None
 
     def run(self, state: AgentRunState) -> AgentRunState:
-        pname = state.product_input.product_name or "무명 상품"
         uploaded_list = []
         asset_paths = {}
         try:
@@ -77,7 +75,8 @@ class ImageGenerationAgent(AgentNode):
                     uploaded_list.append({
                         "id": a.id,
                         "filename": a.filename,
-                        "url": f"/api/assets/{a.id}/file"
+                        "url": a.file_path if str(a.file_path).startswith("http") else f"/api/v1/files/assets/{a.id}",
+                        "source_type": a.source_type,
                     })
                     if a.file_path:
                         asset_paths[a.id] = a.file_path
@@ -90,9 +89,18 @@ class ImageGenerationAgent(AgentNode):
         visual_plan = state.outputs.get("visual_planning") or {}
         image_jobs = visual_plan.get("image_jobs") or []
 
+        # Existing seller/URL photos never require image-generation cost approval.
+        source_col = state.outputs.get("source_collection") or {}
+        uploaded_imgs = source_col.get("uploaded_images") or []
+        url_imgs = source_col.get("url_images") or []
+        has_existing_product_image = any(
+            image.get("asset_id") and not str(image.get("asset_id")).startswith("mock-")
+            for image in [*uploaded_imgs, *url_imgs]
+        )
+
         # If real mode and cost is not approved, block before spending credits.
         cost_approved = self._is_cost_approved(state)
-        if self.mode == "real" and not cost_approved:
+        if self.mode == "real" and not cost_approved and not has_existing_product_image:
             jobs_report = []
             candidates = {}
             for job in image_jobs:
@@ -114,12 +122,7 @@ class ImageGenerationAgent(AgentNode):
             }
             return state
 
-        # 1. Collect existing uploaded/url candidates from Sprint 55
-        source_col = state.outputs.get("source_collection") or {}
-        uploaded_imgs = source_col.get("uploaded_images") or []
-        url_imgs = source_col.get("url_images") or []
-
-        # 2. Build candidates per slot
+        # Build candidates per slot.
         slots_data = visual_plan.get("visual_slots")
         if not slots_data and image_jobs:
             slots_data = [
@@ -185,42 +188,150 @@ class ImageGenerationAgent(AgentNode):
                 (job for job in image_jobs if job.get("slot_id") == slot_id),
                 None,
             )
-            prefer_generated_candidate = matching_job is not None and self.mode == "real"
+            # Sprint 1: use seller-provided product photos before any generated
+            # candidate. Uploads always win over URL-collected images; a filename
+            # that suggests a main/front/hero product cut wins within the same
+            # source group. URL images remain candidates until the user selects
+            # one, which is the explicit approval step for collected images.
+            def source_sort_key(img):
+                filename = str(img.get("filename") or "").lower()
+                is_main_product_cut = any(
+                    keyword in filename
+                    for keyword in ("hero", "main", "front", "대표", "정면")
+                )
+                return (0 if img.get("is_representative") else 1,
+                        0 if img.get("source_type") in {"uploaded", "self_shot", "sourced"} else 1,
+                        0 if is_main_product_cut else 1,
+                        filename)
 
-            # A. Add uploaded candidates
-            for idx, img in enumerate(uploaded_imgs):
-                asset_id = img.get("asset_id")
-                if not asset_id:
-                    continue
+            real_source_images = sorted(
+                [
+                    img
+                    for img in [*uploaded_imgs, *url_imgs]
+                    if (
+                        img.get("asset_id")
+                        and not str(img.get("asset_id")).startswith("mock-")
+                        and img.get("quality_status") != "rejected"
+                    )
+                ],
+                key=source_sort_key,
+            )
+            for idx, img in enumerate(real_source_images):
+                asset_id = img["asset_id"]
+                source_type = img.get("source_type") or "uploaded"
                 slot_candidates.append({
-                    "candidate_id": f"candidate-{slot_id}-uploaded-{asset_id}",
+                    "candidate_id": f"candidate-{slot_id}-{source_type}-{asset_id}",
                     "slot_id": slot_id,
                     "asset_id": asset_id,
-                    "source_type": "uploaded",
-                    "label": img.get("filename") or "업로드 이미지",
-                    "is_recommended": not prefer_generated_candidate and idx == 0,
+                    "source_type": source_type,
+                    "label": img.get("filename") or "상품 사진",
+                    "is_recommended": False,
                     "needs_identity_review": False,
+                    "quality_warnings": img.get("quality_warnings") or [],
+                    "identity_check": {"status": "not_required"},
                 })
 
-            # B. Add URL candidates
-            uploaded_count = len(slot_candidates)
-            for idx, img in enumerate(url_imgs):
-                asset_id = img.get("asset_id") or f"url-image-{idx + 1}"
-                slot_candidates.append({
-                    "candidate_id": f"candidate-{slot_id}-url-{asset_id}",
+            uploaded_candidate_indexes = [
+                index
+                for index, candidate in enumerate(slot_candidates)
+                if candidate["source_type"] in {"uploaded", "self_shot", "sourced"}
+                and not (
+                    slot_id == "hero"
+                    and {"LOW_RESOLUTION", "EXTREME_ASPECT_RATIO", "DUPLICATE_FILE", "IMAGE_INTEGRITY_WARNING"}.intersection(candidate.get("quality_warnings") or [])
+                )
+            ]
+            selected_candidate_id = state.selected_image_candidates.get(slot_id)
+            selected_candidate = next(
+                (
+                    candidate
+                    for candidate in slot_candidates
+                    if candidate["candidate_id"] == selected_candidate_id
+                ),
+                None,
+            )
+
+            for candidate in slot_candidates:
+                candidate["requires_approval"] = candidate["source_type"] in {
+                    "url-extracted",
+                    "url-imported",
+                }
+
+            if slot_candidates and (uploaded_candidate_indexes or selected_candidate):
+                # HERO uses the main product image. The product-introduction slot
+                # uses a second photo when one is available, while preserving the
+                # original asset id if only one uploaded photo was supplied.
+                # A selected URL candidate is the user's explicit approval.
+                if selected_candidate:
+                    preferred_index = slot_candidates.index(selected_candidate)
+                elif slot_id == "hero":
+                    preferred_index = uploaded_candidate_indexes[0]
+                else:
+                    preferred_index = uploaded_candidate_indexes[min(1, len(uploaded_candidate_indexes) - 1)]
+                slot_candidates[preferred_index]["is_recommended"] = True
+                selected = slot_candidates[preferred_index]
+                jobs_report.append({
+                    "job_id": matching_job.get("job_id") if matching_job else None,
                     "slot_id": slot_id,
-                    "asset_id": asset_id,
-                    "source_type": img.get("source_type") or "url-extracted",
-                    "label": img.get("filename") or "URL 추출 이미지",
-                    "is_recommended": (
-                        not prefer_generated_candidate
-                        and uploaded_count == 0
-                        and idx == 0
-                    ),
-                    "needs_identity_review": False,
+                    "status": "skipped_existing_product_image",
+                    "visual_strategy": visual_strategy,
+                    "source_asset_ids": [candidate["asset_id"] for candidate in slot_candidates],
                 })
+                if not any(image.get("id") == selected["asset_id"] for image in generated_images):
+                    source = next(
+                        (img for img in real_source_images if img.get("asset_id") == selected["asset_id"]),
+                        {},
+                    )
+                    generated_images.append({
+                        "id": selected["asset_id"],
+                        "role": role,
+                        "url": source.get("url") or f"/api/v1/files/assets/{selected['asset_id']}",
+                        "filename": selected["label"],
+                        "source_type": selected["source_type"],
+                        "slot_id": slot_id,
+                        "label": selected["label"],
+                    })
+                candidates[slot_id] = slot_candidates
+                continue
 
-            # C. Generate real/mock candidate based on image_jobs
+            if slot_candidates:
+                # URL-derived assets are not silently applied. Keep their real
+                # asset ids in the candidate panel so the user can approve one.
+                candidates[slot_id] = slot_candidates
+                jobs_report.append({
+                    "job_id": matching_job.get("job_id") if matching_job else None,
+                    "slot_id": slot_id,
+                    "status": "awaiting_source_approval",
+                    "visual_strategy": visual_strategy,
+                    "source_asset_ids": [candidate["asset_id"] for candidate in slot_candidates],
+                })
+                continue
+
+            # In mock mode, an absent product photo is a structured missing
+            # state, never a red mock/generated image.
+            if self.mode != "real":
+                candidates[slot_id] = [
+                    {
+                        "candidate_id": f"candidate-{slot_id}-photo-required",
+                        "slot_id": slot_id,
+                        "asset_id": None,
+                        "source_type": "missing-image",
+                        "label": "상품 사진을 추가해 주세요",
+                        "is_recommended": True,
+                        "needs_identity_review": False,
+                        "identity_check": {"status": "not_required"},
+                    }
+                ]
+                jobs_report.append({
+                    "job_id": matching_job.get("job_id") if matching_job else None,
+                    "slot_id": slot_id,
+                    "status": "missing_product_image",
+                    "visual_strategy": visual_strategy,
+                    "source_asset_ids": [],
+                })
+                continue
+
+            # C. Generate real candidate only when the real image provider is
+            # explicitly selected and no seller/URL product image exists.
             if matching_job:
                 # Call provider router
                 reference_asset_ids = matching_job.get("reference_asset_ids") or state.product_input.asset_ids or []
@@ -303,8 +414,6 @@ class ImageGenerationAgent(AgentNode):
                         job_id=matching_job.get("job_id") or f"{slot_id}-1",
                         result=res,
                     )
-                if not asset_id and self.mode != "real":
-                    asset_id = f"mock-{slot_id}-visual"
                 if not asset_id:
                     jobs_report[-1]["status"] = "asset_persist_failed"
                     candidates[slot_id] = slot_candidates
@@ -365,38 +474,17 @@ class ImageGenerationAgent(AgentNode):
                     "usage_metadata": res.usage_metadata,
                 })
             else:
-                has_recommended = any(c["is_recommended"] for c in slot_candidates)
                 slot_candidates.append({
-                    "candidate_id": f"candidate-{slot_id}-mock-generated",
+                    "candidate_id": f"candidate-{slot_id}-photo-required",
                     "slot_id": slot_id,
-                    "asset_id": f"mock-{slot_id}-visual",
-                    "source_type": "mock-generated",
-                    "label": "목업 이미지",
-                    "is_recommended": not has_recommended,
-                    "needs_identity_review": False
+                    "asset_id": None,
+                    "source_type": "missing-image",
+                    "label": "상품 사진을 추가해 주세요",
+                    "is_recommended": True,
+                    "needs_identity_review": False,
                 })
 
             candidates[slot_id] = slot_candidates
-
-        if not generated_images and self.mode != "real":
-            generated_images = build_mock_generated_assets(
-                pname,
-                uploaded_assets=uploaded_list,
-                product_url=state.product_input.product_url,
-            ).get("images", [])
-        else:
-            for image in url_imgs:
-                asset_id = image.get("asset_id")
-                if asset_id and not any(item.get("id") == asset_id for item in generated_images):
-                    generated_images.append(
-                        {
-                            "id": asset_id,
-                            "role": "url_reference",
-                            "url": image.get("url") or state.product_input.product_url or "",
-                            "filename": image.get("filename") or "url-image.png",
-                            "source_type": image.get("source_type") or "url-extracted",
-                        }
-                    )
 
         state.outputs[self.name] = {
             "jobs": jobs_report,

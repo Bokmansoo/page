@@ -8,6 +8,7 @@ class PageAssemblyAgent(AgentNode):
     def run(self, state: AgentRunState) -> AgentRunState:
         pname = state.product_input.product_name or "상품"
         uploaded_list = []
+        assets_by_id = {}
         try:
             from src.db.database import SessionLocal
             from src.db.models import Asset
@@ -18,11 +19,20 @@ class PageAssemblyAgent(AgentNode):
                 else:
                     assets = db.query(Asset).filter(Asset.project_id == state.project_id).all()
                 for a in assets:
-                    uploaded_list.append({
+                    item = {
                         "id": a.id,
                         "filename": a.filename,
-                        "url": f"/api/assets/{a.id}/file"
-                    })
+                        "url": a.file_path if str(a.file_path).startswith("http") else f"/api/v1/files/assets/{a.id}",
+                        "source_type": a.source_type,
+                        "mime_type": a.mime_type,
+                        "asset_role": getattr(a, "asset_role", "unknown"),
+                        "quality_status": getattr(a, "quality_status", "warning"),
+                        "quality_warnings": getattr(a, "quality_warnings", []) or [],
+                        "safe_crop_status": getattr(a, "safe_crop_status", "needs_review"),
+                        "is_representative": getattr(a, "is_representative", False),
+                    }
+                    uploaded_list.append(item)
+                    assets_by_id[a.id] = item
             finally:
                 db.close()
         except Exception:
@@ -121,12 +131,21 @@ class PageAssemblyAgent(AgentNode):
                         break
             
             generation_status = job_status_by_slot.get(slot_id)
-            generation_failed = generation_status not in {None, "success"}
+            generation_failed = generation_status in {
+                "failed",
+                "provider_error",
+                "asset_persist_failed",
+                "missing_reference_asset",
+            }
 
-            if not target_cand and slot_cand_list and not generation_failed:
+            awaiting_source_approval = bool(slot_cand_list) and all(
+                candidate.get("requires_approval")
+                for candidate in slot_cand_list
+            )
+            if not target_cand and slot_cand_list and not generation_failed and not awaiting_source_approval:
                 target_cand = slot_cand_list[0]
                 
-            if target_cand:
+            if target_cand and target_cand.get("asset_id"):
                 section["visual_slot"] = {
                     "asset_id": target_cand.get("asset_id"),
                     "source_type": target_cand.get("source_type"),
@@ -136,18 +155,50 @@ class PageAssemblyAgent(AgentNode):
                     "identity_check": target_cand.get("identity_check"),
                 }
 
-                if "image_asset_id" in section:
-                    section["image_asset_id"] = target_cand.get("asset_id")
+                section["image_asset_id"] = target_cand.get("asset_id")
+                if slot_id == "hero":
+                    from src.services.hero_composition import build_composed_product_payload
+
+                    composed_payload = build_composed_product_payload(
+                        assets_by_id.get(target_cand.get("asset_id")),
+                        getattr(state, "selected_style", None),
+                    )
+                    if composed_payload:
+                        section["visual_kind"] = "composed_product"
+                        section["visual_payload"] = composed_payload
+                    else:
+                        section["visual_kind"] = "image"
+                        section["visual_payload"] = {"layout_variant": "hero_overlay"}
+                else:
+                    section["visual_kind"] = "image"
+                    section["visual_payload"] = section.get("visual_payload") or {
+                        "layout_variant": "image_text"
+                    }
             else:
                 section["visual_slot"] = {
                     "asset_id": None,
-                    "source_type": None,
-                    "status": "generation_failed" if generation_failed else "missing_image",
-                    "label": "이미지 누락",
-                    "candidate_id": None,
+                    "source_type": target_cand.get("source_type") if target_cand else None,
+                    "status": (
+                        "generation_failed"
+                        if generation_failed
+                        else "awaiting_source_approval"
+                        if awaiting_source_approval
+                        else "missing_image"
+                    ),
+                    "label": (
+                        "URL 상품 사진을 선택해 주세요"
+                        if awaiting_source_approval
+                        else "상품 사진을 추가해 주세요"
+                    ),
+                    "candidate_id": target_cand.get("candidate_id") if target_cand else None,
                     "identity_check": None,
                     "error_code": generation_status if generation_failed else None,
                 }
                 section["image_asset_id"] = None
+                section["visual_kind"] = "image"
+                section["visual_payload"] = {
+                    "layout_variant": "hero_overlay" if slot_id == "hero" else "image_text",
+                    "missing_state": "source_approval_required" if awaiting_source_approval else "photo_required",
+                }
 
         return state

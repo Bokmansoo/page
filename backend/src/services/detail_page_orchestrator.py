@@ -244,6 +244,7 @@ from src.services.image_generation_service import (
 )
 from src.services.sales_package_service import SalesPackageService
 from src.services.visual_package_planner import VisualPackagePlanner
+from src.config import settings
 
 
 IMAGE_REVIEW_PENDING_STATUSES = {"needs_review"}
@@ -251,9 +252,107 @@ IMAGE_ACTIVE_STATUSES = {"awaiting_cost_approval", "generating"}
 IMAGE_NOT_REVIEWED_STATUSES = {"planned", "needs_generation", "awaiting_cost_approval", "generating", "needs_review"}
 IMAGE_REVIEWED_STATUSES = {"approved", "rejected", "skipped", "failed"}
 SOURCE_ONLY_STATUSES = {"planned"}
+PRODUCT_PHOTO_SOURCE_TYPES = {"uploaded", "self_shot", "sourced", "ai_corrected"}
+MOCK_REPLACEMENT_STATUSES = {
+    "awaiting_cost_approval",
+    "planned",
+    "needs_generation",
+    "generating",
+}
 
 
 class DetailPageOrchestrator:
+    @staticmethod
+    def _get_reusable_product_assets(project: ProductProject, db: Session) -> list[Asset]:
+        """Return user-supplied product photos that are safe to reuse as-is.
+
+        URL-collected images are deliberately excluded here. Sprint 1 requires an
+        explicit user selection before a URL image can become a page visual.
+        """
+        return (
+            db.query(Asset)
+            .filter(
+                Asset.project_id == project.id,
+                Asset.source_type.in_(PRODUCT_PHOTO_SOURCE_TYPES),
+                Asset.mime_type.like("image/%"),
+            )
+            .order_by(Asset.created_at.asc())
+            .all()
+        )
+
+    @staticmethod
+    def _choose_source_asset(
+        job: ImageGenerationJobRecord,
+        reusable_assets: list[Asset],
+    ) -> Asset | None:
+        assets_by_id = {asset.id: asset for asset in reusable_assets}
+        for asset_id in job.source_asset_ids or []:
+            if asset := assets_by_id.get(asset_id):
+                return asset
+        return reusable_assets[0] if reusable_assets else None
+
+    @staticmethod
+    def repair_mock_visual_assets(project: ProductProject, db: Session) -> int:
+        """Replace legacy red Mock-provider outputs with a real uploaded photo.
+
+        The older project orchestration route used to call the image provider even
+        when the app was in ``mock`` mode. Its provider writes a red/blue test
+        bitmap, so it must never be shown as a product image.  This is also a
+        small, idempotent repair for projects generated before this guard existed.
+        """
+        reusable_assets = DetailPageOrchestrator._get_reusable_product_assets(project, db)
+        updated = 0
+
+        for job in DetailPageOrchestrator._load_jobs(project, db):
+            legacy_mock_output = job.provider == "mock"
+            mock_mode_pending = (
+                settings.SELLFORM_IMAGE_GENERATION_MODE == "mock"
+                and job.cost_tier in AICostPolicy.HIGH_COST_TIERS
+                and job.status in MOCK_REPLACEMENT_STATUSES
+            )
+            if not legacy_mock_output and not mock_mode_pending:
+                continue
+
+            source_asset = DetailPageOrchestrator._choose_source_asset(job, reusable_assets)
+            section = db.query(PageSection).filter(PageSection.id == job.section_id).first()
+
+            if source_asset:
+                job.output_asset_id = source_asset.id
+                job.status = "approved"
+                job.provider = "source_asset"
+                job.model = "original-product-photo"
+                job.error_code = None
+                job.warnings = [
+                    "Mock image generation is disabled. The original product photo is used instead."
+                ]
+                if section:
+                    section.image_asset_id = source_asset.id
+                    section.visual_kind = "image"
+                    payload = dict(section.visual_payload or {})
+                    payload.pop("missing_state", None)
+                    section.visual_payload = payload
+            else:
+                job.output_asset_id = None
+                job.status = "skipped"
+                job.provider = "source_required"
+                job.model = None
+                job.error_code = "MISSING_PRODUCT_IMAGE"
+                job.warnings = [
+                    "No approved product photo is available. Upload a product photo to add this visual."
+                ]
+                if section:
+                    section.image_asset_id = None
+                    payload = dict(section.visual_payload or {})
+                    payload["missing_state"] = "product_photo_required"
+                    section.visual_payload = payload
+
+            sync_job_to_project_json(project.id, job.job_id, db)
+            updated += 1
+
+        if updated:
+            db.commit()
+        return updated
+
     @staticmethod
     def run_orchestration_pipeline(
         project_id: str,
@@ -381,6 +480,8 @@ class DetailPageOrchestrator:
 
     @staticmethod
     def _ensure_visual_jobs(project: ProductProject, page: ProductPage, db: Session) -> list[ImageGenerationJobRecord]:
+        from src.services.image_asset_inspector import backfill_project_asset_metadata
+        backfill_project_asset_metadata(project.id, db)
         if not project.visual_package_jobs:
             assets = db.query(Asset).filter(Asset.project_id == project.id).all()
             snapshot = project.intake_snapshot if isinstance(project.intake_snapshot, dict) else {}
@@ -440,6 +541,10 @@ class DetailPageOrchestrator:
 
     @staticmethod
     def _handle_images(project: ProductProject, db: Session) -> str:
+        # In local/mock mode product photos are reused instead of creating the
+        # red/blue placeholder bitmap. This includes old jobs if the project is
+        # resumed after an earlier run.
+        DetailPageOrchestrator.repair_mock_visual_assets(project, db)
         DetailPageOrchestrator._approve_source_only_jobs(project, db)
         jobs = DetailPageOrchestrator._load_jobs(project, db)
         generated_any = False

@@ -91,55 +91,17 @@ def build_mock_generated_assets(
 
     images = []
 
-    # 1. Map uploaded assets first
+    # Sprint 1: mock mode must not fabricate product-image assets. Preserve only
+    # real seller/URL assets passed by the caller; an empty list means that the
+    # page should request a photo instead of rendering a fake visual.
     for idx, asset in enumerate(uploaded_assets):
         images.append({
             "id": asset["id"],
             "role": f"uploaded_asset_{idx}",
             "url": asset["url"],
-            "source_type": "uploaded",
+            "source_type": asset.get("source_type") or "uploaded",
             "label": asset["filename"]
         })
-
-    # 2. Add URL extracted asset if product_url exists
-    if product_url:
-        images.append({
-            "id": "mock-url-extracted-image",
-            "role": "extracted",
-            "url": _mock_placeholder_url("url-extracted", product_name),
-            "source_type": "url-extracted",
-            "label": "url-extracted-image.png"
-        })
-
-    # 3. Add default mock generated assets
-    images.append({
-        "id": "mock-hero-visual",
-        "role": "hero",
-        "url": _mock_placeholder_url("hero", product_name),
-        "source_type": "mock-generated",
-        "label": "hero-placeholder.png"
-    })
-    images.append({
-        "id": "mock-detail-1-visual",
-        "role": "detail_1",
-        "url": _mock_placeholder_url("detail_1", product_name),
-        "source_type": "mock-generated",
-        "label": "detail-1-placeholder.png"
-    })
-    images.append({
-        "id": "mock-detail-2-visual",
-        "role": "detail_2",
-        "url": _mock_placeholder_url("detail_2", product_name),
-        "source_type": "mock-generated",
-        "label": "detail-2-placeholder.png"
-    })
-    images.append({
-        "id": "mock-guarantee-visual",
-        "role": "guarantee",
-        "url": _mock_placeholder_url("guarantee", product_name),
-        "source_type": "mock-generated",
-        "label": "guarantee-placeholder.png"
-    })
 
     return {"images": images}
 
@@ -293,6 +255,18 @@ def build_mock_page_assembly(
             "visual_slot": guar_visual
         }
     ]
+
+    # Legacy callers still use this helper directly. Do not leak its historical
+    # mock ids into a page: a missing real photo is an explicit input request.
+    for section in sections:
+        visual_slot = section.get("visual_slot") or {}
+        if str(visual_slot.get("asset_id") or "").startswith("mock-"):
+            section["image_id"] = None
+            section["visual_slot"] = {
+                "source_type": "missing-image",
+                "asset_id": None,
+                "label": "상품 사진을 추가해 주세요",
+            }
 
     return {"sections": sections}
 

@@ -1,13 +1,14 @@
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+from urllib.parse import urlparse
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from src.api.auth import get_current_user_and_workspace
 from src.db.database import get_db
-from src.db.models import AgentRun, AgentRunStep, Brand, ProductProject
+from src.db.models import AgentRun, AgentRunStep, Asset, Brand, ProductProject
 from src.services.intake_structuring_service import structure_intake
 from src.services.url_evidence_collector import collect_url_evidence
 from src.services.generation_status_service import GenerationStatusService
@@ -31,6 +32,54 @@ def _extract_url_image_text(image_url: str) -> str:
         return "\n".join(fact.fact_text for fact in response.data.facts)
     except Exception:
         return ""
+
+
+def _image_mime_type_from_url(image_url: str) -> str:
+    suffix = urlparse(image_url).path.rsplit(".", 1)[-1].lower() if "." in urlparse(image_url).path else ""
+    return {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "webp": "image/webp",
+        "gif": "image/gif",
+    }.get(suffix, "image/jpeg")
+
+
+def _persist_collected_url_images(
+    db: Session,
+    project_id: str,
+    collected_images: list[dict[str, str]],
+    ocr_text: str = "",
+) -> list[dict[str, str]]:
+    """Keep URL-derived product photos as project assets without generating a copy.
+
+    The browser and export renderer can load an http(s) ``file_path`` directly.
+    This preserves the original URL and gives the image a stable Asset id for page
+    sections, candidates, and future provenance work.
+    """
+    persisted: list[dict[str, str]] = []
+    for image in collected_images:
+        image_url = image.get("url") or ""
+        if not image_url.startswith(("https://", "http://")):
+            continue
+        filename = image.get("filename") or urlparse(image_url).path.rsplit("/", 1)[-1] or "url-image"
+        asset = Asset(
+            project_id=project_id,
+            source_type="url-extracted",
+            filename=filename[:255],
+            file_path=image_url,
+            mime_type=_image_mime_type_from_url(image_url),
+            file_size=0,
+            ocr_text=ocr_text or None,
+        )
+        db.add(asset)
+        db.flush()
+        persisted.append({
+            **image,
+            "asset_id": asset.id,
+            "source_type": "url-extracted",
+        })
+    return persisted
 
 
 # Pydantic Schemas
@@ -69,7 +118,7 @@ class AgentRunResponseSchema(BaseModel):
     mode: str
     current_stage: str
     product_input: ProductInputSchema
-    outputs: Dict[str, Any] = {}
+    outputs: Dict[str, Any] = Field(default_factory=dict)
     planning_mode: Optional[str] = "quality"
 
 
@@ -193,6 +242,7 @@ def create_agent_run(
     collected_images: list[dict[str, str]] = []
     collected_specs: list[dict[str, str]] = []
     collected_text: list[str] = []
+    collected_ocr_text: list[str] = []
     collection_warnings: list[str] = []
     collected_product_name = ""
 
@@ -227,6 +277,7 @@ def create_agent_run(
                     *evidence.ocr_text_blocks,
                 ]
             )
+            collected_ocr_text.extend(evidence.ocr_text_blocks)
         except Exception as exc:
             collection_warnings.append(f"{source_url}: {exc}")
 
@@ -281,6 +332,19 @@ def create_agent_run(
     db.commit()
     db.refresh(project)
 
+    # Preserve URL-collected product photos as first-class assets. They are later
+    # preferred after uploads and can be linked to a page section by id.
+    collected_images = _persist_collected_url_images(
+        db,
+        project.id,
+        collected_images,
+        ocr_text="\n".join(collected_ocr_text),
+    )
+    db.commit()
+    input_asset_ids = list(
+        dict.fromkeys([*(req.asset_ids or []), *(image["asset_id"] for image in collected_images)])
+    )
+
     # 3. Create AgentRun
     run_id = str(uuid.uuid4())
     run = AgentRun(
@@ -295,7 +359,7 @@ def create_agent_run(
             "description": req.description,
             "product_url": req.product_url,
             "freeform_input": req.freeform_input,
-            "asset_ids": req.asset_ids,
+            "asset_ids": input_asset_ids,
             "reference_urls": req.reference_urls,
             "selling_points": req.selling_points,
             "price": req.price,
@@ -325,7 +389,7 @@ def create_agent_run(
             description=req.description,
             product_url=req.product_url,
             freeform_input=req.freeform_input,
-            asset_ids=req.asset_ids,
+            asset_ids=input_asset_ids,
             reference_urls=req.reference_urls,
             selling_points=req.selling_points,
             price=req.price,

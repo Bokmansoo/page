@@ -1,7 +1,11 @@
 from typing import Any
 
-VISUAL_KINDS = {"image", "html_graphic"}
+VISUAL_KINDS = {"image", "html_graphic", "composed_product"}
 HTML_LAYOUTS = {"comparison_cards", "benefit_cards", "spec_table", "image_text", "hero_overlay"}
+COMPOSED_PRODUCT_LAYOUTS = {"hero_product_right", "hero_product_center"}
+PRODUCT_FITS = {"contain"}
+TEXT_SAFE_AREAS = {"left", "bottom"}
+BACKGROUND_TOKENS = {"surface_mint", "surface_ink", "surface_sand"}
 
 _SECTION_DEFAULT_LAYOUT = {
     "comparison": "comparison_cards",
@@ -42,6 +46,20 @@ def validate_visual(visual: dict[str, Any]) -> list[str]:
 
     if kind == "image" and not visual.get("image_asset_id"):
         issues.append("image_asset_required")
+
+    if kind == "composed_product":
+        if not visual.get("image_asset_id"):
+            issues.append("image_asset_required")
+        if payload.get("layout_variant") not in COMPOSED_PRODUCT_LAYOUTS:
+            issues.append("invalid_composed_product_layout")
+        if payload.get("product_fit") not in PRODUCT_FITS:
+            issues.append("invalid_product_fit")
+        if payload.get("text_safe_area") not in TEXT_SAFE_AREAS:
+            issues.append("invalid_text_safe_area")
+        if payload.get("background_token") not in BACKGROUND_TOKENS:
+            issues.append("invalid_background_token")
+        if not isinstance(payload.get("decoration_tokens"), list):
+            issues.append("decoration_tokens_required")
 
     if kind == "html_graphic":
         layout = payload.get("layout_variant")

@@ -124,5 +124,21 @@ def backfill_page_visuals(db: Session, project_id: str) -> BackfillReport:
 
         updated += 1
 
+    # Ensure Sprint 2 classification/representative metadata exists before
+    # Sprint 3 evaluates a legacy HERO.  The result page requests page/assets
+    # concurrently, so relying on the assets endpoint would create a race.
+    from src.services.image_asset_inspector import backfill_project_asset_metadata
+    backfill_project_asset_metadata(project_id, db)
+
+    # Sprint 3: a legacy default HERO can safely become a composed product
+    # visual.  Custom image layouts remain compatible and are not overwritten.
+    from src.services.hero_composition import apply_composed_product_hero
+    if apply_composed_product_hero(
+        page,
+        db,
+        getattr(page.project, "selected_style", None) if page.project else None,
+    ):
+        updated += 1
+
     db.commit()
     return BackfillReport(project_id=project_id, updated=updated)

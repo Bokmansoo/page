@@ -5,6 +5,7 @@ import { apiUrl } from "@/lib/api";
 import { waitForExportAssets } from "@/lib/exportReadiness";
 import ImageSectionVisual from "@/components/detail-page/ImageSectionVisual";
 import HtmlGraphicVisual from "@/components/detail-page/HtmlGraphicVisual";
+import ComposedProductVisual from "@/components/detail-page/ComposedProductVisual";
 import { validateSectionVisual } from "@/components/detail-page/types";
 import type { VisualKind, DetailPageSectionVisual } from "@/components/detail-page/types";
 
@@ -57,6 +58,8 @@ interface DetailPageDocumentProps {
 function sourceLabel(sourceType: string): string {
   switch (sourceType) {
     case "uploaded":
+    case "sourced":
+    case "self_shot":
       return "직접 업로드";
     case "url-extracted":
     case "url-imported":
@@ -64,6 +67,8 @@ function sourceLabel(sourceType: string): string {
     case "real-generated":
     case "ai-generated":
       return "AI 생성";
+    case "local_upscaled":
+      return "로컬 고화질 보정";
     case "generation-skipped":
       return "생성 생략";
     case "blocked_cost_approval":
@@ -214,7 +219,12 @@ export default function DetailPageDocument({ page, assets, exportMode = false }:
       ) : null}
       {visibleSections.map((section, index) => {
         const matchedAsset = assets.find((asset) => asset.id === section.image_asset_id);
-        const imageSrc = matchedAsset
+        const isLegacyMockVisual =
+          matchedAsset?.source_type === "mock-generated" ||
+          Boolean(section.image_asset_id?.startsWith("mock-"));
+        const imageSrc = isLegacyMockVisual
+          ? null
+          : matchedAsset
           ? detailAssetUrl(matchedAsset)
           : section.image_asset_id
             ? detailAssetUrl({ id: section.image_asset_id })
@@ -226,6 +236,7 @@ export default function DetailPageDocument({ page, assets, exportMode = false }:
         const visualKind = section.visual_kind;
         const isHtmlGraphic = visualKind === "html_graphic";
         const isImage = visualKind === "image";
+        const isComposedProduct = visualKind === "composed_product";
         const visualIssues = validateSectionVisual(section as unknown as DetailPageSectionVisual);
 
         return (
@@ -234,17 +245,28 @@ export default function DetailPageDocument({ page, assets, exportMode = false }:
             className={theme.section}
             data-detail-page-section="true"
           >
-            <p className={`text-[11px] font-extrabold uppercase ${theme.eyebrow}`}>
-              {section.section_type.replace("_", " ")}
-            </p>
-            <h3 className={`mx-auto mt-3 max-w-2xl text-2xl font-extrabold leading-snug sm:text-3xl ${theme.title}`}>
-              {title}
-            </h3>
-            <FormattedBodyCopy body={body} className={theme.body} />
+            {!isComposedProduct ? (
+              <>
+                <p className={`text-[11px] font-extrabold uppercase ${theme.eyebrow}`}>
+                  {section.section_type.replace("_", " ")}
+                </p>
+                <h3 className={`mx-auto mt-3 max-w-2xl text-2xl font-extrabold leading-snug sm:text-3xl ${theme.title}`}>
+                  {title}
+                </h3>
+                <FormattedBodyCopy body={body} className={theme.body} />
+              </>
+            ) : null}
             {section.section_type !== "product_information" ? (
-              isHtmlGraphic ? (
+              isComposedProduct ? (
+                <ComposedProductVisual
+                  section={section as unknown as DetailPageSectionVisual}
+                  imageSrc={imageSrc}
+                  matchedAssetLabel={matchedAsset ? sourceLabel(matchedAsset.source_type) : undefined}
+                  exportMode={exportMode}
+                />
+              ) : isHtmlGraphic ? (
                 <HtmlGraphicVisual section={section as unknown as DetailPageSectionVisual} />
-              ) : isImage || imageSrc ? (
+              ) : isImage || imageSrc || isLegacyMockVisual ? (
                 <ImageSectionVisual
                   section={section as unknown as DetailPageSectionVisual}
                   imageSrc={imageSrc}

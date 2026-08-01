@@ -231,3 +231,70 @@ def test_compliance_warning_and_successful_export(
         exports_folder = os.path.join("uploads", "exports")
         if os.path.exists(exports_folder):
             shutil.rmtree(exports_folder, ignore_errors=True)
+
+
+@patch("src.api.exports.get_current_user_and_workspace", Depends=mock_auth)
+def test_failed_export_job_keeps_actionable_playwright_error_without_outputs(
+    mock_dep,
+    client,
+    db_session,
+    test_setup,
+    testing_session_local,
+):
+    from src.api.auth import get_current_user_and_workspace
+    from src.db.models import DetailPageVersion
+    from src.services.export_service import PlaywrightChromiumUnavailableError
+
+    project = test_setup["project"]
+    page = test_setup["page"]
+    section = PageSection(
+        page_id=page.id,
+        section_type="features",
+        title="검증된 상품 정보",
+        body_copy=(
+            "원재료: 사과 99.9%. 알레르기 정보: 본 제품은 메밀을 사용한 제품과 같은 "
+            "시설에서 제조되었습니다. 보관방법: 실온 보관."
+        ),
+        sort_order=1,
+        is_visible=True,
+    )
+    db_session.add(section)
+    db_session.flush()
+    version = DetailPageVersion(
+        project_id=project.id,
+        name="최종본",
+        style_key="modern",
+        sections_json=[
+            {"key": "features", "title": section.title, "body": section.body_copy}
+        ],
+        is_final=True,
+    )
+    db_session.add(version)
+    db_session.commit()
+    client.app.dependency_overrides[get_current_user_and_workspace] = mock_auth
+
+    with patch("src.api.exports.SessionLocal", testing_session_local), patch(
+        "src.services.export_service.capture_next_render_export",
+        side_effect=PlaywrightChromiumUnavailableError(),
+    ):
+        response = client.post(
+            f"/api/v1/projects/{project.id}/page/export",
+            json={
+                "preset_name": "smartstore",
+                "output_format": "jpg",
+                "export_target": "local_download",
+                "final_version_id": version.id,
+            },
+        )
+
+    assert response.status_code == 202
+    job_id = response.json()["id"]
+    job_response = client.get(
+        f"/api/v1/projects/{project.id}/page/export/jobs/{job_id}"
+    )
+    assert job_response.status_code == 200
+    payload = job_response.json()
+    assert payload["status"] == "failed"
+    assert payload["output_images"] in (None, [])
+    assert payload["zip_asset_id"] is None
+    assert "uv run playwright install chromium" in payload["error_message"]

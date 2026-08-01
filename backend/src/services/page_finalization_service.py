@@ -39,6 +39,11 @@ def build_final_page_snapshot(db: Session, page: ProductPage) -> dict[str, Any]:
                     if section.image_asset_id in eligible_asset_ids
                     else None
                 ),
+                # Preserve the same visual contract consumed by the draft
+                # renderer.  This makes the export route render Sprint 3's
+                # composed HERO instead of falling back to the legacy image.
+                "visual_kind": section.visual_kind,
+                "visual_payload": section.visual_payload or {},
                 "sort_order": section.sort_order,
                 "is_visible": section.is_visible,
             }

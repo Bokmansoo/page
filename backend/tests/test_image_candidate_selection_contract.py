@@ -33,7 +33,8 @@ def test_image_generation_returns_candidates_per_visual_slot():
     assert candidates["hero"][0].asset_id == "asset-1"
     assert candidates["hero"][0].is_recommended is True
     assert any(candidate.source_type == "url-extracted" for candidate in candidates["usage"])
-    assert any(candidate.source_type == "mock-generated" for candidate in candidates["usage"])
+    assert not any(candidate.source_type == "mock-generated" for candidate in candidates["usage"])
+    assert all(candidate.asset_id is not None for candidate in candidates["usage"])
 
 
 def test_page_assembly_uses_selected_image_candidate():

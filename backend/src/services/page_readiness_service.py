@@ -68,7 +68,7 @@ def inspect_page_readiness(
             )
 
         # --- Asset eligibility ---
-        if section.visual_kind == "image" and section.image_asset_id:
+        if section.visual_kind in {"image", "composed_product"} and section.image_asset_id:
             if db is not None:
                 from src.services.page_asset_policy import get_page_eligible_asset
 
@@ -89,14 +89,41 @@ def inspect_page_readiness(
                             message="Generated product image must pass identity review before export",
                         )
                     )
-                elif not get_page_eligible_asset(db, project_id, section.image_asset_id):
-                    blockers.append(
-                        ReadinessIssue(
-                            section_id=sec_id,
-                            code="asset_not_eligible",
-                            message=f"Image asset {section.image_asset_id} is not eligible for this project",
+                else:
+                    asset = get_page_eligible_asset(db, project_id, section.image_asset_id)
+                    if not asset:
+                        blockers.append(
+                            ReadinessIssue(
+                                section_id=sec_id,
+                                code="asset_not_eligible",
+                                message=f"Image asset {section.image_asset_id} is not eligible for this project",
+                            )
                         )
-                    )
+                    else:
+                        from src.services.hero_composition import HERO_BLOCKING_WARNINGS
+
+                        quality_warnings = set(asset.quality_warnings or [])
+                        if (
+                            section.section_type == "hero"
+                            and HERO_BLOCKING_WARNINGS.intersection(quality_warnings)
+                        ):
+                            blockers.append(
+                                ReadinessIssue(
+                                    section_id=sec_id,
+                                    code="hero_asset_quality_blocking",
+                                    message="HERO image has blocking quality warnings",
+                                )
+                            )
+                        if section.visual_kind == "composed_product" and (
+                            not asset.is_representative or asset.asset_role != "product_main"
+                        ):
+                            blockers.append(
+                                ReadinessIssue(
+                                    section_id=sec_id,
+                                    code="representative_product_required",
+                                    message="Composed HERO requires the confirmed representative product image",
+                                )
+                            )
 
         # --- AI edit marker check ---
         combined = f"{section.title or ''} {section.body_copy or ''}"

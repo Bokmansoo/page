@@ -99,6 +99,26 @@ def ensure_runtime_schema_compatibility() -> None:
                 connection.execute(text("ALTER TABLE assets ADD COLUMN background_removed BOOLEAN DEFAULT FALSE"))
             if "product_identity_preserved" not in existing_assets_columns:
                 connection.execute(text("ALTER TABLE assets ADD COLUMN product_identity_preserved BOOLEAN DEFAULT TRUE"))
+            asset_column_ddls = {
+                "asset_role": "ALTER TABLE assets ADD COLUMN asset_role VARCHAR(50) NOT NULL DEFAULT 'unknown'",
+                "role_confidence": "ALTER TABLE assets ADD COLUMN role_confidence FLOAT NOT NULL DEFAULT 0",
+                "role_source": "ALTER TABLE assets ADD COLUMN role_source VARCHAR(20) NOT NULL DEFAULT 'auto'",
+                "quality_status": "ALTER TABLE assets ADD COLUMN quality_status VARCHAR(20) NOT NULL DEFAULT 'warning'",
+                "identity_status": "ALTER TABLE assets ADD COLUMN identity_status VARCHAR(20) NOT NULL DEFAULT 'needs_review'",
+                "width": "ALTER TABLE assets ADD COLUMN width INTEGER",
+                "height": "ALTER TABLE assets ADD COLUMN height INTEGER",
+                "image_format": "ALTER TABLE assets ADD COLUMN image_format VARCHAR(20)",
+                "quality_warnings": "ALTER TABLE assets ADD COLUMN quality_warnings JSON",
+                "content_hash": "ALTER TABLE assets ADD COLUMN content_hash VARCHAR(64)",
+                "ocr_text": "ALTER TABLE assets ADD COLUMN ocr_text TEXT",
+                "safe_crop_status": "ALTER TABLE assets ADD COLUMN safe_crop_status VARCHAR(30) NOT NULL DEFAULT 'needs_review'",
+                "is_representative": "ALTER TABLE assets ADD COLUMN is_representative BOOLEAN NOT NULL DEFAULT FALSE",
+                "representative_source": "ALTER TABLE assets ADD COLUMN representative_source VARCHAR(20) NOT NULL DEFAULT 'auto'",
+                "classification_version": "ALTER TABLE assets ADD COLUMN classification_version INTEGER NOT NULL DEFAULT 0",
+            }
+            for column_name, ddl in asset_column_ddls.items():
+                if column_name not in existing_assets_columns:
+                    connection.execute(text(ddl))
 
     if "agent_runs" not in table_names or "agent_run_steps" not in table_names:
         Base.metadata.create_all(bind=engine)

@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from src.api.auth import get_current_user_and_workspace
 from src.config import settings
 from src.db.database import get_db
-from src.db.models import ProductProject, Asset, AuditLog
+from src.db.models import ProductProject, ProductPage, PageSection, Asset, AuditLog
 from src.services.validation import validate_file_upload
 
 router = APIRouter(prefix="/files", tags=["files"])
@@ -26,6 +26,20 @@ class AssetResponseSchema(BaseModel):
     cutout_status: Optional[str] = None
     background_removed: bool = False
     product_identity_preserved: bool = True
+    asset_role: str = "unknown"
+    role_confidence: float = 0.0
+    role_source: str = "auto"
+    quality_status: str = "warning"
+    identity_status: str = "needs_review"
+    width: Optional[int] = None
+    height: Optional[int] = None
+    image_format: Optional[str] = None
+    quality_warnings: list[str] = []
+    ocr_text: Optional[str] = None
+    safe_crop_status: str = "needs_review"
+    is_representative: bool = False
+    representative_source: str = "auto"
+    classification_version: int = 0
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -83,6 +97,11 @@ async def upload_file(
         file_size=file_size
     )
     db.add(asset)
+    db.flush()
+    if asset.mime_type.startswith("image/"):
+        from src.services.image_asset_inspector import apply_asset_inspection, refresh_representative_product_asset
+        apply_asset_inspection(asset, db)
+        refresh_representative_product_asset(project_id, db)
     db.commit()
     db.refresh(asset)
 
@@ -98,6 +117,107 @@ async def upload_file(
     db.commit()
 
     return asset
+
+
+def _workspace_asset_or_404(asset_id: str, workspace_id: str, db: Session) -> Asset:
+    asset = (
+        db.query(Asset)
+        .join(ProductProject, ProductProject.id == Asset.project_id)
+        .filter(Asset.id == asset_id, ProductProject.workspace_id == workspace_id)
+        .first()
+    )
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    return asset
+
+
+@router.post("/assets/{asset_id}/upscale", response_model=AssetResponseSchema, status_code=status.HTTP_201_CREATED)
+def create_upscaled_asset(
+    asset_id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Create an identity-safe local enlargement while retaining the source."""
+    source = _workspace_asset_or_404(asset_id, auth_ctx["workspace"].id, db)
+    from src.services.local_image_upscale import ImageUpscaleError, create_local_upscaled_asset
+
+    try:
+        enhanced = create_local_upscaled_asset(source, db)
+    except ImageUpscaleError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    db.add(
+        AuditLog(
+            workspace_id=auth_ctx["workspace"].id,
+            user_id=auth_ctx["user"].id,
+            action="asset_local_upscale_created",
+            entity_type="asset",
+            entity_id=enhanced.id,
+            payload={"source_asset_id": source.id, "width": enhanced.width, "height": enhanced.height},
+        )
+    )
+    db.commit()
+    db.refresh(enhanced)
+    return enhanced
+
+
+@router.post("/assets/{asset_id}/upscale/apply", response_model=AssetResponseSchema)
+def apply_upscaled_asset(
+    asset_id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Confirm an enlarged asset and replace related low-resolution page uses."""
+    enhanced = _workspace_asset_or_404(asset_id, auth_ctx["workspace"].id, db)
+    if enhanced.source_type != "local_upscaled" or not enhanced.source_asset_id:
+        raise HTTPException(status_code=422, detail="This asset is not a local upscale preview")
+    if "LOW_RESOLUTION" in (enhanced.quality_warnings or []):
+        raise HTTPException(status_code=422, detail="Enhanced image still does not meet the resolution target")
+
+    project_assets = db.query(Asset).filter(Asset.project_id == enhanced.project_id).all()
+    source = next((item for item in project_assets if item.id == enhanced.source_asset_id), None)
+    lineage_root_id = source.source_asset_id if source and source.source_asset_id else enhanced.source_asset_id
+    related_ids = {
+        item.id
+        for item in project_assets
+        if item.id in {enhanced.source_asset_id, lineage_root_id}
+        or item.source_asset_id in {enhanced.source_asset_id, lineage_root_id}
+    }
+
+    for item in project_assets:
+        item.is_representative = item.id == enhanced.id
+        item.representative_source = "manual" if item.id == enhanced.id else "auto"
+    enhanced.asset_role = "product_main"
+    enhanced.role_confidence = 1.0
+    enhanced.role_source = "manual"
+    enhanced.identity_status = "confirmed"
+
+    page = db.query(ProductPage).filter(ProductPage.project_id == enhanced.project_id).first()
+    if page:
+        from src.services.hero_composition import build_composed_product_payload
+
+        hero_payload = build_composed_product_payload(enhanced, page.project.selected_style if page.project else None)
+        for section in page.sections:
+            if section.image_asset_id not in related_ids:
+                continue
+            section.image_asset_id = enhanced.id
+            if section.section_type == "hero" and hero_payload:
+                section.visual_kind = "composed_product"
+                section.visual_payload = hero_payload
+
+    db.add(
+        AuditLog(
+            workspace_id=auth_ctx["workspace"].id,
+            user_id=auth_ctx["user"].id,
+            action="asset_local_upscale_applied",
+            entity_type="asset",
+            entity_id=enhanced.id,
+            payload={"source_asset_id": enhanced.source_asset_id, "replaced_asset_ids": sorted(related_ids)},
+        )
+    )
+    db.commit()
+    db.refresh(enhanced)
+    return enhanced
 
 
 @router.get("/assets/{asset_id}")

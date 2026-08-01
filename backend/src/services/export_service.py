@@ -28,6 +28,41 @@ class ExportRenderNotReadyError(RuntimeError):
     """Raised when the render page reports asset loading failure."""
 
 
+PLAYWRIGHT_CHROMIUM_INSTALL_COMMAND = "uv run playwright install chromium"
+
+
+class PlaywrightChromiumUnavailableError(RuntimeError):
+    """Raised when the Playwright package exists but Chromium is not installed."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "JPG/PNG 내보내기에 필요한 Chromium이 설치되지 않았습니다. "
+            "백엔드 폴더에서 다음 명령을 실행한 뒤 다시 시도해 주세요: "
+            f"{PLAYWRIGHT_CHROMIUM_INSTALL_COMMAND}"
+        )
+
+
+def ensure_playwright_chromium_available(playwright) -> None:
+    """Fail before export work starts when Playwright's Chromium is missing.
+
+    BrowserType.executable_path is available on real Playwright instances. Test
+    doubles that intentionally omit it remain supported and are validated by
+    their launch implementation instead.
+    """
+    executable_path = getattr(playwright.chromium, "executable_path", None)
+    if executable_path and not os.path.isfile(executable_path):
+        raise PlaywrightChromiumUnavailableError()
+
+
+def _is_missing_playwright_browser_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "executable doesn't exist" in message
+        or "playwright install" in message
+        or "browser executable" in message and "not found" in message
+    )
+
+
 def capture_next_render_export(
     *,
     project_id: str,
@@ -82,7 +117,13 @@ def capture_next_render_export(
             playwright = playwright_manager.start()
             owned_playwright = playwright
 
-        browser = playwright.chromium.launch(headless=True)
+        ensure_playwright_chromium_available(playwright)
+        try:
+            browser = playwright.chromium.launch(headless=True)
+        except Exception as exc:
+            if _is_missing_playwright_browser_error(exc):
+                raise PlaywrightChromiumUnavailableError() from exc
+            raise
         page = browser.new_page(
             viewport={"width": 900, "height": 1200},
             extra_http_headers=auth_headers,

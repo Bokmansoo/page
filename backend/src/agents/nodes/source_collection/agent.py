@@ -14,7 +14,12 @@ class SourceCollectionAgent(AgentNode):
             uploaded_images.append({
                 "asset_id": asset.get("asset_id"),
                 "filename": asset.get("filename"),
-                "source_type": "uploaded"
+                "source_type": asset.get("source_type") or "uploaded",
+                "asset_role": asset.get("asset_role") or "unknown",
+                "role_confidence": asset.get("role_confidence") or 0.0,
+                "quality_status": asset.get("quality_status") or "warning",
+                "quality_warnings": asset.get("quality_warnings") or [],
+                "is_representative": bool(asset.get("is_representative")),
             })
 
         url_images = []
@@ -26,26 +31,55 @@ class SourceCollectionAgent(AgentNode):
                 "url": image.get("url"),
             })
             
-        if not uploaded_images and state.product_input and state.product_input.asset_ids:
+        if state.product_input and state.product_input.asset_ids:
             try:
                 from src.db.database import SessionLocal
                 from src.db.models import Asset
                 db = SessionLocal()
                 try:
                     assets = db.query(Asset).filter(Asset.id.in_(state.product_input.asset_ids)).all()
+                    known_asset_ids = {
+                        image.get("asset_id")
+                        for image in [*uploaded_images, *url_images]
+                        if image.get("asset_id")
+                    }
                     for a in assets:
-                        uploaded_images.append({
+                        if a.id in known_asset_ids:
+                            for image in [*uploaded_images, *url_images]:
+                                if image.get("asset_id") == a.id:
+                                    image.update({
+                                        "asset_role": a.asset_role,
+                                        "role_confidence": a.role_confidence,
+                                        "quality_status": a.quality_status,
+                                        "quality_warnings": a.quality_warnings or [],
+                                        "is_representative": a.is_representative,
+                                    })
+                            continue
+                        item = {
                             "asset_id": a.id,
                             "filename": a.filename,
-                            "source_type": "uploaded"
-                        })
+                            "source_type": a.source_type or "uploaded",
+                            "url": a.file_path if str(a.file_path).startswith("http") else None,
+                            "asset_role": a.asset_role,
+                            "role_confidence": a.role_confidence,
+                            "quality_status": a.quality_status,
+                            "quality_warnings": a.quality_warnings or [],
+                            "is_representative": a.is_representative,
+                        }
+                        if a.source_type in {"url-extracted", "url-imported"}:
+                            url_images.append(item)
+                        else:
+                            uploaded_images.append(item)
+                        known_asset_ids.add(a.id)
                 finally:
                     db.close()
             except Exception:
                 pass
                 
             # Test-safe fallback for isolated test db sessions
-            if not uploaded_images:
+            # Do not reclassify URL-collected assets as uploaded images in an
+            # isolated test session. That would bypass the URL approval gate.
+            if not uploaded_images and not url_images:
                 for aid in state.product_input.asset_ids:
                     uploaded_images.append({
                         "asset_id": aid,
@@ -62,16 +96,6 @@ class SourceCollectionAgent(AgentNode):
         reference_urls = input_snap.get("reference_urls") or (
             state.product_input.reference_urls if state.product_input else []
         ) or []
-        if product_url and not url_images:
-            url_images.append(
-                {
-                    "asset_id": "mock-url-extracted-image",
-                    "filename": "product-url-image.png",
-                    "source_type": "url-extracted",
-                    "url": product_url,
-                }
-            )
-        
         # 3. reference_text_blocks
         reference_text_blocks = input_snap.get("reference_text_blocks") or []
         confirmed_material = [

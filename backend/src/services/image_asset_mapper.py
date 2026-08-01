@@ -6,6 +6,20 @@ from typing import Any
 
 PRIMARY_IMAGE_SECTION_TYPES = {"header", "hero", "problem_statement", "main_claim"}
 MAX_REUSE_PER_ASSET = 2
+AUTO_HERO_BLOCKING_WARNINGS = {
+    "LOW_RESOLUTION",
+    "EXTREME_ASPECT_RATIO",
+    "DUPLICATE_FILE",
+    "IMAGE_INTEGRITY_WARNING",
+}
+PERSISTED_ROLE_TO_MAPPER_ROLE = {
+    "product_main": "product_main",
+    "product_detail": "detail_closeup",
+    "usage_scene": "lifestyle_scene",
+    "components": "package_or_components",
+    "package": "package_or_components",
+    "spec_reference": "certification",
+}
 
 IMAGE_ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "product_main": (
@@ -131,6 +145,14 @@ def classify_image_asset(
     enriched = dict(asset)
     if metadata:
         enriched["metadata"] = {**(asset.get("metadata") or {}), **metadata}
+    persisted_role = PERSISTED_ROLE_TO_MAPPER_ROLE.get(str(enriched.get("asset_role") or ""))
+    if persisted_role:
+        return ClassifiedImageAsset(
+            asset_id=str(asset.get("id") or ""),
+            primary_role=persisted_role,
+            confidence=float(enriched.get("role_confidence") or 0.5),
+            signals=("persisted_asset_role",),
+        )
     text, available_signals = _asset_text(enriched)
 
     role_hits: dict[str, int] = {}
@@ -173,6 +195,8 @@ def _match_score(
         return 0
 
     score = max(20, 60 - preference_index * 20)
+    if section_type.lower() in PRIMARY_IMAGE_SECTION_TYPES and asset.get("is_representative"):
+        score += 40
     if classified.confidence >= 0.7:
         score += 20
     if used_count == 0:
@@ -192,6 +216,7 @@ def map_image_assets_to_sections(
         asset
         for asset in assets
         if str(asset.get("mime_type") or "").startswith("image/")
+        and asset.get("quality_status") != "rejected"
     ]
     if not image_assets:
         return []
@@ -213,6 +238,13 @@ def map_image_assets_to_sections(
         for asset_index, asset in enumerate(image_assets):
             asset_id = str(asset["id"])
             if used_counts[asset_id] >= MAX_REUSE_PER_ASSET:
+                continue
+            if (
+                section_type.lower() in PRIMARY_IMAGE_SECTION_TYPES
+                and AUTO_HERO_BLOCKING_WARNINGS.intersection(asset.get("quality_warnings") or [])
+            ):
+                # A seller can still select it manually after seeing the warning,
+                # but low-quality images are never automatic HERO candidates.
                 continue
             classified = classified_by_id[asset_id]
             score = _match_score(

@@ -191,3 +191,105 @@ def test_readiness_allows_jobless_project_generated_image_in_dev_mode(db_session
 
     assert result.ready is True
     assert result.blockers == []
+
+
+def test_readiness_blocks_low_quality_composed_hero(db_session):
+    user = User(id="quality-user", email="quality@test.com", name="Quality User")
+    workspace = Workspace(id="quality-ws", name="Quality WS", owner_id=user.id)
+    brand = Brand(id="quality-brand", workspace_id=workspace.id, name="Quality Brand")
+    project = ProductProject(
+        id="quality-project",
+        workspace_id=workspace.id,
+        brand_id=brand.id,
+        name="Quality Project",
+    )
+    asset = Asset(
+        id="quality-asset",
+        project_id=project.id,
+        source_type="uploaded",
+        filename="hero.jpg",
+        file_path="hero.jpg",
+        mime_type="image/jpeg",
+        file_size=100,
+        asset_role="product_main",
+        is_representative=True,
+        quality_status="warning",
+        quality_warnings=["LOW_RESOLUTION"],
+        classification_version=2,
+    )
+    page = ProductPage(id="quality-page", project_id=project.id)
+    section = PageSection(
+        id="quality-hero",
+        page_id=page.id,
+        section_type="hero",
+        title="상품 제목",
+        body_copy="상품 설명",
+        image_asset_id=asset.id,
+        visual_kind="composed_product",
+        visual_payload={
+            "layout_variant": "hero_product_right",
+            "product_fit": "contain",
+            "text_safe_area": "left",
+            "background_token": "surface_mint",
+            "decoration_tokens": ["soft_circle", "accent_line"],
+        },
+        sort_order=0,
+    )
+    db_session.add_all([user, workspace, brand, project, asset, page, section])
+    db_session.commit()
+
+    result = inspect_page_readiness(page, db_session)
+
+    assert result.ready is False
+    assert any(item.code == "hero_asset_quality_blocking" for item in result.blockers)
+
+
+def test_readiness_requires_confirmed_representative_for_composed_hero(db_session):
+    user = User(id="rep-user", email="rep@test.com", name="Rep User")
+    workspace = Workspace(id="rep-ws", name="Rep WS", owner_id=user.id)
+    brand = Brand(id="rep-brand", workspace_id=workspace.id, name="Rep Brand")
+    project = ProductProject(
+        id="rep-project",
+        workspace_id=workspace.id,
+        brand_id=brand.id,
+        name="Representative Project",
+    )
+    asset = Asset(
+        id="rep-asset",
+        project_id=project.id,
+        source_type="uploaded",
+        filename="detail.jpg",
+        file_path="detail.jpg",
+        mime_type="image/jpeg",
+        file_size=100,
+        asset_role="product_detail",
+        is_representative=False,
+        quality_status="usable",
+        quality_warnings=[],
+        classification_version=2,
+    )
+    page = ProductPage(id="rep-page", project_id=project.id)
+    section = PageSection(
+        id="rep-hero",
+        page_id=page.id,
+        section_type="hero",
+        title="상품 제목",
+        body_copy="상품 설명",
+        image_asset_id=asset.id,
+        visual_kind="composed_product",
+        visual_payload={
+            "layout_variant": "hero_product_right",
+            "product_fit": "contain",
+            "text_safe_area": "left",
+            "background_token": "surface_mint",
+            "decoration_tokens": ["soft_circle", "accent_line"],
+        },
+        sort_order=0,
+    )
+    db_session.add_all([user, workspace, brand, project, asset, page, section])
+    db_session.commit()
+
+    result = inspect_page_readiness(page, db_session)
+
+    assert result.ready is False
+    assert any(item.code == "representative_product_required" for item in result.blockers)

@@ -1,11 +1,17 @@
-import sys
 from sqlalchemy.orm import Session
 
 from src.db.models import Asset, ImageGenerationJobRecord
 from src.config import settings
 
 
-ORIGINAL_IMAGE_SOURCE_TYPES = {"uploaded", "sourced", "self_shot"}
+ORIGINAL_IMAGE_SOURCE_TYPES = {
+    "uploaded",
+    "sourced",
+    "self_shot",
+    "url-extracted",
+    "url-imported",
+    "local_upscaled",
+}
 MOCK_MODE_ELIGIBLE_TYPES = {"mock-generated", "real-generated", "ai-generated", "url-extracted"}
 GENERATED_IMAGE_SOURCE_TYPES = {
     "ai_generated",
@@ -51,6 +57,7 @@ def get_page_eligible_assets(
         for asset in assets
         if asset.mime_type
         and asset.mime_type.startswith("image/")
+        and asset.quality_status != "rejected"
         and (
             asset.source_type in ORIGINAL_IMAGE_SOURCE_TYPES
             or asset.id in approved_output_ids
@@ -58,12 +65,10 @@ def get_page_eligible_assets(
                 asset.source_type in GENERATED_IMAGE_SOURCE_TYPES
                 and asset.id not in tracked_output_ids
                 and settings.SELLFORM_GENERATION_MODE != "production"
-                and "pytest" not in sys.modules
             )
             or (
                 settings.SELLFORM_GENERATION_MODE == "mock"
                 and asset.source_type in MOCK_MODE_ELIGIBLE_TYPES
-                and "pytest" not in sys.modules
             )
         )
     ]

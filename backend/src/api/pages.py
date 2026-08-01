@@ -76,6 +76,7 @@ class UpdatePageRequest(BaseModel):
     theme_color: Optional[str] = None
     font_family: Optional[str] = None
     sections: List[SectionUpdateSchema]
+    confirm_low_quality_hero: bool = False
 
 class RegenerateSectionRequest(BaseModel):
     user_instruction: str = Field(..., description="AI에게 내릴 섹션 수정 요구사항")
@@ -251,7 +252,12 @@ def get_project_or_404(db: Session, project_id: str, workspace_id: str) -> Produ
 
 
 def get_page_or_404(db: Session, project_id: str, workspace_id: str) -> ProductPage:
-    get_project_or_404(db, project_id, workspace_id)
+    project = get_project_or_404(db, project_id, workspace_id)
+    # Repair pages created by the old visual-job route. It produced a red/blue
+    # mock bitmap in local mode; replace that persisted output with the user's
+    # original product photo before a page is displayed or exported.
+    from src.services.detail_page_orchestrator import DetailPageOrchestrator
+    DetailPageOrchestrator.repair_mock_visual_assets(project, db)
     page = db.query(ProductPage).filter(ProductPage.project_id == project_id).first()
     if not page:
         raise HTTPException(status_code=404, detail="Page draft not found for this project")
@@ -837,6 +843,23 @@ def save_page_details(
                 status_code=400,
                 detail="Image asset is not eligible for page rendering",
             )
+        if sec_update.image_asset_id and sections_dict[sec_update.id].section_type == "hero":
+            asset = get_page_eligible_asset(db, project_id, sec_update.image_asset_id)
+            hero_warning_codes = {
+                "LOW_RESOLUTION",
+                "EXTREME_ASPECT_RATIO",
+                "DUPLICATE_FILE",
+                "IMAGE_INTEGRITY_WARNING",
+            }
+            if (
+                asset
+                and hero_warning_codes.intersection(asset.quality_warnings or [])
+                and not req.confirm_low_quality_hero
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="This image has quality warnings. Confirm before using it as the HERO image.",
+                )
 
     from src.services.page_visual_contract import normalize_visual, validate_visual
 
@@ -848,6 +871,15 @@ def save_page_details(
             sec.body_copy = sec_update.body_copy
         if sec_update.image_asset_id is not None:
             sec.image_asset_id = sec_update.image_asset_id or None
+            # Selecting a real candidate resolves the temporary Sprint 1
+            # photo/source-approval placeholder. Keep the visual payload from
+            # advertising a missing image after the asset has been applied.
+            if sec.image_asset_id and sec.visual_payload:
+                sec.visual_payload = {
+                    key: value
+                    for key, value in sec.visual_payload.items()
+                    if key != "missing_state"
+                }
         if sec_update.visual_kind is not None:
             sec.visual_kind = sec_update.visual_kind
         if sec_update.visual_payload is not None:
@@ -1157,6 +1189,8 @@ def auto_map_images_endpoint(
 
     # Fetch sections and image assets
     sections = page.sections
+    from src.services.image_asset_inspector import backfill_project_asset_metadata
+    backfill_project_asset_metadata(project_id, db)
     assets = get_page_eligible_assets(db, project_id)
 
     # Convert SQLAlchemy objects to dicts for mapper
@@ -1174,7 +1208,13 @@ def auto_map_images_endpoint(
             "id": asset.id,
             "filename": asset.filename,
             "mime_type": asset.mime_type,
-            "source_type": asset.source_type
+            "source_type": asset.source_type,
+            "asset_role": asset.asset_role,
+            "role_confidence": asset.role_confidence,
+            "quality_status": asset.quality_status,
+            "quality_warnings": asset.quality_warnings or [],
+            "ocr_text": asset.ocr_text,
+            "is_representative": asset.is_representative,
         })
 
     from src.services.image_asset_mapper import (
@@ -1216,7 +1256,12 @@ def auto_map_images_endpoint(
             reason=assignment["reason"]
         ))
 
+    # A mapped primary photo can now be rendered by the shared Sprint 3 HERO
+    # component.  Do this before snapshotting so preview and export agree.
+    from src.services.hero_composition import apply_composed_product_hero
+    apply_composed_product_hero(page, db, project.selected_style)
     db.commit()
+    db.refresh(page)
 
     # Create new snapshot and version
     from src.services.page_version_service import create_page_version

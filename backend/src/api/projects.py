@@ -53,6 +53,20 @@ class AssetResponseSchema(BaseModel):
     cutout_status: Optional[str] = None
     background_removed: bool = False
     product_identity_preserved: bool = True
+    asset_role: str = "unknown"
+    role_confidence: float = 0.0
+    role_source: str = "auto"
+    quality_status: str = "warning"
+    identity_status: str = "needs_review"
+    width: Optional[int] = None
+    height: Optional[int] = None
+    image_format: Optional[str] = None
+    quality_warnings: List[str] = []
+    ocr_text: Optional[str] = None
+    safe_crop_status: str = "needs_review"
+    is_representative: bool = False
+    representative_source: str = "auto"
+    classification_version: int = 0
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -442,6 +456,20 @@ class ProjectAssetResponse(BaseModel):
     cutout_status: Optional[str] = None
     background_removed: bool = False
     product_identity_preserved: bool = True
+    asset_role: str = "unknown"
+    role_confidence: float = 0.0
+    role_source: str = "auto"
+    quality_status: str = "warning"
+    identity_status: str = "needs_review"
+    width: Optional[int] = None
+    height: Optional[int] = None
+    image_format: Optional[str] = None
+    quality_warnings: List[str] = []
+    ocr_text: Optional[str] = None
+    safe_crop_status: str = "needs_review"
+    is_representative: bool = False
+    representative_source: str = "auto"
+    classification_version: int = 0
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -461,8 +489,76 @@ def list_project_assets(
         raise HTTPException(status_code=404, detail="Project not found")
 
     from src.db.models import Asset
+    from src.services.image_asset_inspector import backfill_project_asset_metadata
+    backfill_project_asset_metadata(project_id, db)
     assets = db.query(Asset).filter(Asset.project_id == project_id).all()
     return assets
+
+
+class AssetClassificationUpdate(BaseModel):
+    asset_role: Optional[Literal[
+        "product_main",
+        "product_detail",
+        "usage_scene",
+        "components",
+        "package",
+        "spec_reference",
+        "unknown",
+    ]] = None
+    is_representative: Optional[bool] = None
+
+
+@router.patch("/{project_id}/assets/{asset_id}/classification", response_model=ProjectAssetResponse)
+def update_asset_classification(
+    project_id: str,
+    asset_id: str,
+    payload: AssetClassificationUpdate,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Apply a seller-selected image role; manual choices outrank auto hints."""
+    workspace = auth_ctx["workspace"]
+    project = db.query(ProductProject).filter(
+        ProductProject.id == project_id,
+        ProductProject.workspace_id == workspace.id,
+    ).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    asset = db.query(Asset).filter(Asset.id == asset_id, Asset.project_id == project_id).first()
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    if payload.asset_role is not None:
+        asset.asset_role = payload.asset_role
+        asset.role_confidence = 1.0
+        asset.role_source = "manual"
+    if payload.is_representative is True:
+        for project_asset in db.query(Asset).filter(Asset.project_id == project_id).all():
+            project_asset.is_representative = project_asset.id == asset.id
+            if project_asset.id != asset.id and project_asset.representative_source == "manual":
+                project_asset.representative_source = "auto"
+        asset.is_representative = True
+        asset.representative_source = "manual"
+        # A confirmed representative is the product's primary visual by
+        # definition.  Keep the two signals in sync even when the asset was
+        # previously classified as a detail/package image.
+        asset.asset_role = "product_main"
+        asset.role_confidence = 1.0
+        asset.role_source = "manual"
+    elif payload.is_representative is False:
+        asset.is_representative = False
+        asset.representative_source = "auto"
+    db.add(AuditLog(
+        workspace_id=workspace.id,
+        user_id=auth_ctx["user"].id,
+        action="asset_visual_role_updated",
+        entity_type="asset",
+        entity_id=asset.id,
+        payload={"asset_role": payload.asset_role, "is_representative": payload.is_representative},
+    ))
+    db.commit()
+    db.refresh(asset)
+    return asset
 
 
 @router.post("/{project_id}/intake", response_model=ProjectResponseSchema)
