@@ -28,6 +28,7 @@ from src.db.models import (
     ScenePromptVersion,
 )
 from src.services.api_ready_generation_service import get_generation_plan, is_safe_generation_reference
+from src.services.channel_export_service import image_sha256
 from src.services.commerce_policy import CONFIRMED_FACT_STATUSES, resolved_asset_usage_status
 from src.services.image_generation_service import execute_image_generation
 from src.services.storyboard_service import record_storyboard_revision
@@ -1043,6 +1044,9 @@ def attach_manual_storyboard_output(
     if asset.identity_status == "rejected" or asset.quality_status == "rejected":
         raise StoryboardImageGenerationError("품질 또는 상품 정체성 검사에서 제외된 이미지는 사용할 수 없습니다.")
 
+    if not asset.content_hash:
+        asset.content_hash = image_sha256(asset.file_path)
+
     job.output_asset_id = asset.id
     job.provider = "manual_upload"
     job.model = "seller_final_asset"
@@ -1105,6 +1109,9 @@ def approve_storyboard_job(project: ProductProject, job_id: str, db: Session, id
         raise StoryboardImageGenerationError("Generated output file is unavailable for review.")
     if asset.identity_status == "rejected" or asset.quality_status == "rejected":
         raise StoryboardImageGenerationError("안전 또는 정체성 검사에서 제외된 결과는 사용할 수 없습니다.")
+
+    if not asset.content_hash:
+        asset.content_hash = image_sha256(asset.file_path)
 
     draft = deepcopy(project.planning_draft or {})
     matched = next((card for card in draft.get("cards") or [] if card.get("id") == job.section_id), None)

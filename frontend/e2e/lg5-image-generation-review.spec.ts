@@ -48,11 +48,15 @@ const view = (stage: "generation_pending" | "provider_wait" | "image_review", jo
 });
 
 const reviewJobs = [
-  { job_id: "job-hero", scene_id: "hero", role: "representative_product", status: "needs_review", output_asset_id: "generated-hero", generation_attempt: 1, outbox_status: "completed", estimated_cost: 1 },
+  {
+    job_id: "job-hero", scene_id: "hero", role: "representative_product", status: "needs_review", output_asset_id: "generated-hero", generation_attempt: 1, outbox_status: "completed", estimated_cost: 1,
+    source_asset_ids: ["source-hero"],
+    validation: { schema_version: "lg9-image-validation-v1", status: "needs_review", checks: { identity: "passed", ocr: "passed", crop: "needs_review", resolution: "needs_review", safety: "passed", rights: "passed" }, warnings: ["LOW_RESOLUTION"] },
+  },
   { job_id: "job-usage", scene_id: "usage", role: "lifestyle_scene", status: "needs_review", output_asset_id: "generated-usage", generation_attempt: 1, outbox_status: "completed", estimated_cost: 1 },
 ];
 
-test("LG-5R restores cost, worker wait and per-scene review across refresh without duplicate requests", async ({ page }) => {
+test("LG-9 fake provider restores cost, worker wait and per-scene review across refresh without duplicate requests", async ({ page }) => {
   let state: Record<string, unknown> = view("generation_pending");
   let providerGetCount = 0;
   let assetRole = "unknown";
@@ -118,6 +122,10 @@ test("LG-5R restores cost, worker wait and per-scene review across refresh witho
   await expect(page.getByTestId("lg5r-scene-hero")).toBeVisible({ timeout: 8_000 });
   await expect(page.getByTestId("lg5r-scene-preview-hero")).toBeVisible();
   await expect(page.getByTestId("lg5r-scene-preview-hero")).toHaveAttribute("src", /\/api\/v1\/files\/assets\/generated-hero$/);
+  await expect(page.getByTestId("lg9-scene-comparison-hero")).toBeVisible();
+  await expect(page.getByTestId("lg9-reference-hero-source-hero")).toHaveAttribute("src", /\/api\/v1\/files\/assets\/source-hero$/);
+  await expect(page.getByTestId("lg9-validation-hero")).toContainText("자동 검사 보고서 · 판매자 확인 필요");
+  await expect(page.getByTestId("lg9-validation-hero")).toContainText("해상도 · 확인 필요");
   expect(resumeBodies).toHaveLength(1);
   expect(resumeBodies[0]).toMatchObject({
     thread_id: runId,
@@ -139,6 +147,118 @@ test("LG-5R restores cost, worker wait and per-scene review across refresh witho
   await expect(page.getByTestId("lg5r-completed-gallery").getByRole("img")).toHaveCount(2);
 });
 
+test("LG-9 fake provider regenerates only the rejected scene through a new cost approval", async ({ page }) => {
+  const rejectedHero = { ...reviewJobs[0], status: "rejected" };
+  const regeneratedHero = {
+    ...reviewJobs[0],
+    job_id: "job-hero-retry",
+    output_asset_id: "generated-hero-retry",
+    generation_attempt: 2,
+  };
+  const approvedRegeneratedHero = { ...regeneratedHero, status: "approved" };
+  let state: Record<string, unknown> = view("image_review", reviewJobs);
+  const resumeBodies: Array<Record<string, unknown>> = [];
+
+  await page.route(`**/api/v1/projects/${projectId}/planning-draft`, (route) => route.fulfill({ status: 404, body: "{}" }));
+  await page.route(`**/api/v1/projects/${projectId}/assets`, (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
+  await page.route(`**/api/v1/projects/${projectId}/source-captures`, (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
+  await page.route(`**/api/v1/graph-runs/${runId}**`, async (route) => {
+    if (route.request().url().endsWith("/resume")) {
+      const body = route.request().postDataJSON() as Record<string, unknown>;
+      resumeBodies.push(body);
+      const response = body.response as { decision?: string; job_id?: string };
+      if (response.decision === "reject" && response.job_id === "job-hero") {
+        state = view("image_review", [rejectedHero, reviewJobs[1]]);
+      } else if (response.decision === "regenerate" && response.job_id === "job-hero") {
+        state = view("generation_pending", [rejectedHero, reviewJobs[1]]);
+      } else if (response.decision === "approve" && response.job_id === "job-hero-retry") {
+        state = view("image_review", [approvedRegeneratedHero, reviewJobs[1]]);
+      } else if (response.decision === "approve" && response.job_id === "job-usage") {
+        const completed = view("image_review", [approvedRegeneratedHero, { ...reviewJobs[1], status: "approved" }]);
+        completed.status = "completed";
+        completed.current_stage = "finalize_run";
+        completed.values.review.pending = null as never;
+        Object.assign(completed.values.generation, {
+          all_required_scenes_approved: true,
+          approved_asset_manifest: {
+            schema_version: "lg9-approved-asset-manifest-v1",
+            run_id: runId,
+            project_id: projectId,
+            assets: [
+              { scene_id: "hero", asset_id: "generated-hero-retry", asset_content_hash: "a".repeat(64) },
+              { scene_id: "usage", asset_id: "generated-usage", asset_content_hash: "b".repeat(64) },
+            ],
+          },
+        });
+        state = completed;
+      } else if (response.decision === "approve") {
+        state = view("provider_wait", [rejectedHero, reviewJobs[1]]);
+      }
+    } else if ((state as { current_stage?: string }).current_stage === "provider_wait") {
+      state = view("image_review", [regeneratedHero, reviewJobs[1]]);
+    }
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(state) });
+  });
+
+  await page.goto(`/workspace/projects/${projectId}/planning?runId=${runId}`);
+  await page.getByTestId("lg5r-scene-hero").getByRole("button", { name: "거절" }).click();
+  await expect(page.getByTestId("lg5r-scene-hero")).toContainText("rejected");
+  await page.getByTestId("lg5r-scene-hero").getByRole("button", { name: "이 장면 재생성" }).click();
+  await expect(page.getByTestId("lg5r-cost-plan")).toBeVisible();
+  await page.getByRole("button", { name: "비용 승인 후 이미지 생성" }).click();
+  await expect(page.getByTestId("lg5r-scene-hero")).toContainText("시도 2", { timeout: 8_000 });
+  await expect(page.getByTestId("lg5r-scene-preview-hero")).toHaveAttribute("src", /generated-hero-retry$/);
+  await expect(page.getByTestId("lg5r-scene-preview-usage")).toHaveAttribute("src", /generated-usage$/);
+  await page.getByTestId("lg5r-scene-hero").getByRole("button", { name: "이 장면 승인" }).click();
+  await expect(page.getByTestId("lg5r-scene-usage")).toContainText("needs_review");
+  await page.getByTestId("lg5r-scene-usage").getByRole("button", { name: "이 장면 승인" }).click();
+  await expect(page.getByTestId("lg5r-completed-gallery")).toBeVisible();
+  expect(state).toMatchObject({
+    status: "completed",
+    values: { generation: { all_required_scenes_approved: true, approved_asset_manifest: {
+      schema_version: "lg9-approved-asset-manifest-v1",
+      assets: [
+        { scene_id: "hero", asset_id: "generated-hero-retry", asset_content_hash: "a".repeat(64) },
+        { scene_id: "usage", asset_id: "generated-usage", asset_content_hash: "b".repeat(64) },
+      ],
+    } } },
+  });
+  expect(resumeBodies).toHaveLength(5);
+  expect(resumeBodies[0]).toMatchObject({ response: { decision: "reject", job_id: "job-hero" } });
+  expect(resumeBodies[1]).toMatchObject({ response: { decision: "regenerate", job_id: "job-hero" } });
+  expect(resumeBodies[2]).toMatchObject({ response: { decision: "approve", cost_plan_hash: costPlan.cost_plan_hash } });
+  expect(resumeBodies[3]).toMatchObject({ response: { decision: "approve", job_id: "job-hero-retry" } });
+  expect(resumeBodies[4]).toMatchObject({ response: { decision: "approve", job_id: "job-usage" } });
+});
+
+test("LG-9 provider polling keeps the current review content visible", async ({ page }) => {
+  let delayBackgroundPoll = false;
+
+  await page.route(`**/api/v1/projects/${projectId}/planning-draft`, (route) => route.fulfill({ status: 404, body: "{}" }));
+  await page.route(`**/api/v1/projects/${projectId}/assets`, (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
+  await page.route(`**/api/v1/projects/${projectId}/source-captures`, (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
+  await page.route("**/api/v1/files/assets/*", (route) => route.fulfill({
+    status: 200,
+    contentType: "image/svg+xml",
+    body: '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"/>',
+  }));
+  await page.route(`**/api/v1/graph-runs/${runId}**`, async (route) => {
+    if (!route.request().url().endsWith("/resume") && delayBackgroundPoll) {
+      await new Promise((resolve) => setTimeout(resolve, 800));
+    }
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(view("provider_wait", reviewJobs)) });
+  });
+
+  await page.goto(`/workspace/projects/${projectId}/planning?runId=${runId}`);
+  await expect(page.getByTestId("lg5r-scene-preview-hero")).toBeVisible();
+  delayBackgroundPoll = true;
+
+  // The next 1.5s poll is intentionally held open. The preview must remain
+  // mounted instead of being replaced by a full-panel loading placeholder.
+  await page.waitForTimeout(1_700);
+  await expect(page.getByTestId("lg5r-scene-preview-hero")).toBeVisible();
+});
+
 test("LG-5R renders every actionable provider and quality error separately", async ({ page }) => {
   const failures = [
     ["API_KEY_MISSING", "API 키가 없습니다"],
@@ -157,6 +277,9 @@ test("LG-5R renders every actionable provider and quality error separately", asy
     error_code,
     generation_attempt: 1,
     outbox_status: "dead_letter",
+    ...(error_code === "IDENTITY_MISMATCH" ? {
+      validation: { schema_version: "lg9-image-validation-v1", status: "blocked", checks: { identity: "blocked", ocr: "not_run", crop: "not_run", resolution: "not_run", safety: "not_run", rights: "not_run" } },
+    } : {}),
   }));
 
   await page.route(`**/api/v1/projects/${projectId}/planning-draft`, (route) => route.fulfill({ status: 404, body: "{}" }));
@@ -172,6 +295,8 @@ test("LG-5R renders every actionable provider and quality error separately", asy
   for (const [, userMessage] of failures) {
     await expect(page.getByText(userMessage, { exact: false })).toBeVisible();
   }
+  await expect(page.getByTestId("lg9-validation-failed-scene-4")).toContainText("자동 검사 보고서 · 차단");
+  await expect(page.getByTestId("lg9-validation-failed-scene-4")).toContainText("상품 정체성 · 차단");
 });
 
 test("LG-5R refreshes rights-owned upload choices after a graph resume", async ({ page }) => {

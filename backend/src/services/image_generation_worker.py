@@ -190,6 +190,7 @@ def _provider_wait_is_ready(run: AgentRun, db: Session) -> tuple[bool, dict[str,
 
     if run.status != "awaiting_review" or _review_stage(run) != "provider_wait":
         return False, {}
+    _recover_completed_delivery_results(run.id, db)
     from src.services.langgraph_image_generation_service import collect_graph_image_results
 
     try:
@@ -198,6 +199,44 @@ def _provider_wait_is_ready(run: AgentRun, db: Session) -> tuple[bool, dict[str,
         logger.exception("Could not collect image generation readiness for run %s", run.id)
         return False, {}
     return int(summary.get("pending_count") or 0) == 0, summary
+
+
+def _recover_completed_delivery_results(run_id: str, db: Session) -> None:
+    """Repair a crash-window row before deciding whether a graph wait is ready.
+
+    A provider delivery can be durably marked completed after the generated
+    asset is saved, while its job row remains in a pending status if that
+    process is interrupted before its final state is observed.  Treat only
+    the newest attempt for each scene as recoverable and never redispatch it:
+    the existing output asset makes it a seller-review candidate.
+    """
+
+    rows = (
+        db.query(ImageGenerationJobRecord, ImageGenerationOutboxRecord)
+        .join(ImageGenerationOutboxRecord, ImageGenerationOutboxRecord.image_job_id == ImageGenerationJobRecord.id)
+        .filter(ImageGenerationOutboxRecord.run_id == run_id)
+        .order_by(ImageGenerationJobRecord.created_at.asc(), ImageGenerationJobRecord.job_id.asc())
+        .all()
+    )
+    latest: dict[str, tuple[ImageGenerationJobRecord, ImageGenerationOutboxRecord]] = {}
+    for job, delivery in rows:
+        scene_id = str(job.scene_id or job.section_id)
+        current = latest.get(scene_id)
+        if current is None or int(job.generation_attempt or 1) > int(current[0].generation_attempt or 1):
+            latest[scene_id] = (job, delivery)
+
+    recovered = False
+    for job, delivery in latest.values():
+        if (
+            delivery.status == "completed"
+            and job.status in {"queued", "leased", "running", "generating"}
+            and job.output_asset_id
+        ):
+            validation = dict(job.validation_result or {})
+            job.status = "blocked" if validation.get("status") == "blocked" else "needs_review"
+            recovered = True
+    if recovered:
+        db.commit()
 
 
 def _mark_generation_wave_resumed(run_id: str, job_ids: list[str], db: Session) -> None:
@@ -388,8 +427,12 @@ def retry_dead_letter(delivery_id: str, db: Session) -> ImageGenerationOutboxRec
         raise ValueError("이미지 worker 작업을 찾을 수 없습니다.")
     if delivery.status != "dead_letter":
         raise ValueError("dead-letter 작업만 운영자가 다시 시도할 수 있습니다.")
-    if delivery.last_error_code == "PROVIDER_OUTCOME_UNKNOWN":
-        raise ValueError("유료 provider 결과를 먼저 확인해야 중복 비용 없이 재시도할 수 있습니다.")
+    # Real-provider deliveries may already have incurred a charge even when
+    # the provider returned a concrete error. They must return through
+    # scene-level cost approval or a seller-owned upload instead of bypassing
+    # that gate through the worker retry endpoint.
+    if delivery.provider_mode != "mock":
+        raise ValueError("유료 provider 작업은 worker 재시도를 지원하지 않습니다. 장면 재생성 또는 판매자 사진 업로드를 사용해 주세요.")
     delivery.status = "queued"
     delivery.available_at = datetime.datetime.utcnow()
     delivery.dead_lettered_at = None

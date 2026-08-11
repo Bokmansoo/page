@@ -9,10 +9,12 @@ from src.db.models import ProductProject, Asset, ImageGenerationJobRecord
 from src.services.image_generation_provider import ImageGenerationRequest, ImageGenerationResult
 from src.services.commerce_content_quality_service import auto_placement_risk_codes
 from src.services.generation_provider_adapter import get_image_generation_adapter
+from src.services.image_asset_inspector import inspect_asset
 from src.services.product_identity_validator import ProductIdentityValidator, ProductIdentityValidationError
 
 logger = logging.getLogger(__name__)
 RETRYABLE_PROVIDER_ERRORS = {"RATE_LIMIT_EXCEEDED", "TIMEOUT"}
+LG9_VALIDATION_SCHEMA_VERSION = "lg9-image-validation-v1"
 
 
 def _record_provider_attempt(
@@ -44,6 +46,106 @@ def _split_provider_error(error: Exception) -> tuple[str, str]:
     detail = " ".join(str(error).split())[:500]
     code = detail.split(":", 1)[0].strip() or "PROVIDER_ERROR"
     return code, detail
+
+
+def _is_production_langgraph_job(record: ImageGenerationJobRecord) -> bool:
+    """Keep LG-9 reporting on the production LangGraph execution path only."""
+
+    return bool((record.usage_metadata or {}).get("langgraph_run_id"))
+
+
+def _scene_prompt_rights_status(record: ImageGenerationJobRecord) -> tuple[str, list[dict[str, Any]]]:
+    """Evaluate the immutable LG-8 reference-rights snapshot for generation."""
+
+    scene_prompt = dict((record.input_snapshot or {}).get("scene_prompt") or {})
+    rights_snapshot = list(scene_prompt.get("rights_snapshot") or [])
+    states = {str(item.get("rights_status") or "unverified") for item in rights_snapshot if isinstance(item, dict)}
+    if "blocked" in states:
+        return "blocked", rights_snapshot
+    if not rights_snapshot or states.intersection({"unverified", "needs_review"}):
+        return "needs_review", rights_snapshot
+    return "passed", rights_snapshot
+
+
+def _lg9_validation_report(
+    record: ImageGenerationJobRecord,
+    output_asset: Asset,
+    db: Session,
+    *,
+    identity_warnings: list[str],
+    identity_report: dict[str, Any] | None,
+    ocr_text: str,
+    ocr_source: str,
+    risk_codes: list[str],
+    revised_prompt: str | None,
+) -> dict[str, Any]:
+    """Aggregate existing deterministic checks for one generated scene candidate."""
+
+    inspection = inspect_asset(output_asset, db)
+    inspection_warnings = list(inspection.quality_warnings or [])
+    resolution = "needs_review" if "LOW_RESOLUTION" in inspection_warnings else "passed"
+    crop = "passed" if inspection.safe_crop_status == "safe" else "needs_review"
+    ocr_unavailable = ocr_source in {
+        "ocr_check_failed", "ocr_engine_not_configured", "ocr_image_not_available", "ocr_image_not_local",
+    }
+    ocr = "needs_review" if ocr_text or ocr_unavailable else "passed"
+    rights, rights_snapshot = _scene_prompt_rights_status(record)
+    identity_status = str((identity_report or {}).get("status") or (
+        "needs_review" if identity_warnings else "passed"
+    ))
+    checks = {
+        "identity": identity_status,
+        "ocr": ocr,
+        "crop": crop,
+        "resolution": resolution,
+        "safety": "blocked" if risk_codes else "passed",
+        "rights": rights,
+        # Preserve the fields consumed by the existing review payload.
+        "image_quality": "passed",
+        "supplier_text": ocr,
+        "supplier_layout": "passed",
+    }
+    statuses = set(checks.values())
+    status = "blocked" if "blocked" in statuses else "needs_review" if "needs_review" in statuses else "passed"
+    return {
+        "schema_version": LG9_VALIDATION_SCHEMA_VERSION,
+        "status": status,
+        "checks": checks,
+        "warnings": [*identity_warnings, *inspection_warnings],
+        "risk_codes": list(risk_codes),
+        "ocr_source": ocr_source,
+        "ocr_text": ocr_text[:500],
+        "details": {
+            "identity": identity_report or {
+                "status": identity_status,
+                "checks": {},
+            },
+            "crop": {"safe_crop_status": inspection.safe_crop_status},
+            "resolution": {"width": inspection.width, "height": inspection.height},
+            "rights_snapshot": rights_snapshot,
+        },
+        "revised_prompt": revised_prompt,
+    }
+
+
+def _lg9_pre_asset_failure_report(error: ProductIdentityValidationError) -> dict[str, Any]:
+    reason = str(error)[:500]
+    identity = "blocked" if "output rejected" in reason.lower() else "not_run"
+    resolution = "blocked" if "dimension" in reason.lower() else "not_run"
+    return {
+        "schema_version": LG9_VALIDATION_SCHEMA_VERSION,
+        "status": "blocked",
+        "checks": {
+            "identity": identity,
+            "ocr": "not_run",
+            "crop": "not_run",
+            "resolution": resolution,
+            "safety": "not_run",
+            "rights": "not_run",
+        },
+        "warnings": [reason],
+        "risk_codes": [],
+    }
 
 
 def get_or_create_job_record(project_id: str, job_id: str, db: Session) -> ImageGenerationJobRecord:
@@ -145,6 +247,7 @@ def execute_image_generation(
 ) -> ImageGenerationJobRecord:
     # 1. Get or create job record
     record = get_or_create_job_record(project_id, job_id, db)
+    is_production_langgraph = _is_production_langgraph_job(record)
 
     # 2. Idempotency check: if already generating/needs_review/approved, don't trigger new calls
     if record.status in ["generating", "needs_review", "approved"]:
@@ -209,8 +312,17 @@ def execute_image_generation(
             from src.services.image_generation_provider import MockImageGenerationProvider
             provider = MockImageGenerationProvider()
 
+    # A real provider request in the durable LangGraph flow can have an
+    # unknown paid outcome once dispatched.  Do not silently retry or fail
+    # over to another provider here: the worker dead-letters the one scene so
+    # the seller can explicitly approve a targeted retry or upload instead.
+    provider_attempt_limit = (
+        1
+        if is_production_langgraph and settings.SELLFORM_IMAGE_GENERATION_MODE == "real"
+        else 2
+    )
     result = None
-    for provider_attempt in range(2):
+    for provider_attempt in range(provider_attempt_limit):
         record.attempt_count += 1
         _record_provider_attempt(record, status="running")
         db.commit()
@@ -221,7 +333,10 @@ def execute_image_generation(
             error_code, error_detail = _split_provider_error(e)
             logger.error(f"Image generation provider failed: {error_detail}")
             _record_provider_attempt(record, status="failed", error_code=error_code)
-            if error_code not in RETRYABLE_PROVIDER_ERRORS or provider_attempt == 1:
+            if (
+                error_code not in RETRYABLE_PROVIDER_ERRORS
+                or provider_attempt == provider_attempt_limit - 1
+            ):
                 record.status = "failed"
                 record.provider = settings.SELLFORM_IMAGE_PROVIDER
                 record.model = settings.SELLFORM_IMAGE_MODEL
@@ -247,13 +362,27 @@ def execute_image_generation(
         
         # Validate identity preservation & exclusions
         warnings = []
+        identity_report: dict[str, Any] | None = None
         if record.preserve_product_identity:
-            warnings = ProductIdentityValidator.validate_identity_preservation(
-                img=img,
-                source_asset_paths=source_asset_paths,
-                prompt=record.prompt,
-                role=record.role
-            )
+            if is_production_langgraph:
+                scene_prompt = dict((record.input_snapshot or {}).get("scene_prompt") or {})
+                identity_report = ProductIdentityValidator.inspect_identity_preservation(
+                    img=img,
+                    source_asset_paths=source_asset_paths,
+                    prompt=record.prompt,
+                    role=record.role,
+                    identity_constraints=dict(scene_prompt.get("identity_constraints") or {}),
+                )
+                warnings = list(identity_report.get("warnings") or [])
+            else:
+                warnings = ProductIdentityValidator.validate_identity_preservation(
+                    img=img,
+                    source_asset_paths=source_asset_paths,
+                    prompt=record.prompt,
+                    role=record.role
+                )
+        elif is_production_langgraph:
+            identity_report = {"status": "not_run", "checks": {}, "warnings": []}
 
     except ProductIdentityValidationError as e:
         logger.warning(f"Product identity validation failed for job '{job_id}': {e}")
@@ -264,7 +393,11 @@ def execute_image_generation(
             record.error_code = "IDENTITY_GATE_REJECTED"
         else:
             record.error_code = "QUALITY_GATE_FAILED"
-        record.validation_result = {"status": "blocked", "reason": err_msg[:500]}
+        record.validation_result = (
+            _lg9_pre_asset_failure_report(e)
+            if is_production_langgraph
+            else {"status": "blocked", "reason": err_msg[:500]}
+        )
         db.commit()
         sync_job_to_project_json(project_id, job_id, db)
         return record
@@ -319,14 +452,29 @@ def execute_image_generation(
 
     db.flush()
     output_risks = auto_placement_risk_codes(output_asset, db)
-    if output_risks:
+    lg9_validation = (
+        _lg9_validation_report(
+            record,
+            output_asset,
+            db,
+            identity_warnings=warnings,
+            identity_report=identity_report,
+            ocr_text=ocr_text,
+            ocr_source=ocr_source,
+            risk_codes=output_risks,
+            revised_prompt=result.revised_prompt,
+        )
+        if is_production_langgraph
+        else None
+    )
+    if output_risks or (lg9_validation and lg9_validation["status"] == "blocked"):
         output_asset.quality_status = "rejected"
         output_asset.identity_status = "rejected"
         record.output_asset_id = output_asset.id
         record.provider = result.provider
         record.model = result.model
         record.status = "blocked"
-        record.error_code = "UNSAFE_GENERATED_CONTENT_DETECTED"
+        record.error_code = "UNSAFE_GENERATED_CONTENT_DETECTED" if output_risks else "RIGHTS_BLOCKED"
         risk_labels = {
             "foreign_text_exposed": "외국어 문구",
             "phone_number_exposed": "전화번호",
@@ -336,8 +484,12 @@ def execute_image_generation(
             "supplier_text_exposed": "공급처 문구",
         }
         detected = ", ".join(risk_labels.get(code, code) for code in output_risks)
-        record.warnings = [f"생성 결과에서 금지 요소({detected})가 감지되어 최종 사용을 차단했습니다."]
-        record.validation_result = {
+        record.warnings = (
+            [f"생성 결과에서 금지 요소({detected})가 감지되어 최종 사용을 차단했습니다."]
+            if output_risks
+            else ["장면 프롬프트의 기준 이미지 권리 상태가 차단되어 후보를 승인할 수 없습니다."]
+        )
+        record.validation_result = lg9_validation or {
             "status": "blocked",
             "checks": {"content_safety": "blocked", "identity": "not_approved", "rights": "passed"},
             "risk_codes": output_risks,
@@ -371,7 +523,7 @@ def execute_image_generation(
     }
     _record_provider_attempt(record, status="needs_review")
     record.seed = (result.usage_metadata or {}).get("seed") if isinstance(result.usage_metadata, dict) else None
-    record.validation_result = {
+    record.validation_result = lg9_validation or {
         "status": "needs_review" if (warnings or ocr_text) else "passed",
         "checks": {
             "image_quality": "passed",

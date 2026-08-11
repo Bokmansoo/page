@@ -231,6 +231,15 @@ class AgentRunGraphProjector:
                     **commerce_delta,
                 },
             }
+        generation_delta = update.get("generation")
+        if isinstance(generation_delta, dict):
+            projected_run.outputs_json = {
+                **projected_run.outputs_json,
+                "langgraph_generation": {
+                    **((projected_run.outputs_json or {}).get("langgraph_generation") or {}),
+                    **generation_delta,
+                },
+            }
         prompt_delta = update.get("prompt_intelligence")
         if isinstance(prompt_delta, dict):
             projected_run.outputs_json = {
@@ -432,6 +441,7 @@ class LangGraphRunService:
                         "events": [events[-1]],
                         "discovery": dict((snapshot.values or {}).get("discovery") or {}),
                         "commerce": dict((snapshot.values or {}).get("commerce") or {}),
+                        "generation": dict((snapshot.values or {}).get("generation") or {}),
                     },
                 )
         return run

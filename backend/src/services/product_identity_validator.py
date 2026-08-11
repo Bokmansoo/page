@@ -1,7 +1,7 @@
 import io
 import re
 from PIL import Image
-from typing import List, Optional
+from typing import Any, List
 
 
 class ProductIdentityValidationError(Exception):
@@ -9,6 +9,8 @@ class ProductIdentityValidationError(Exception):
 
 
 class ProductIdentityValidator:
+    STRUCTURAL_IDENTITY_ELEMENTS = ("buttons", "ports", "components", "logo")
+
     @staticmethod
     def _positive_prompt_text(prompt: str) -> str:
         sentences = re.split(r"(?<=[.!?])\s+", prompt.lower())
@@ -162,3 +164,135 @@ class ProductIdentityValidator:
             )
 
         return warnings
+
+    @staticmethod
+    def _normalized_crop(image: Image.Image, box: object) -> Image.Image | None:
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            return None
+        try:
+            left, top, right, bottom = (float(value) for value in box)
+        except (TypeError, ValueError):
+            return None
+        if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
+            return None
+        width, height = image.size
+        pixels = (
+            int(round(left * width)),
+            int(round(top * height)),
+            int(round(right * width)),
+            int(round(bottom * height)),
+        )
+        if pixels[0] >= pixels[2] or pixels[1] >= pixels[3]:
+            return None
+        return image.crop(pixels).convert("L").resize((16, 16))
+
+    @staticmethod
+    def _region_difference(source: Image.Image, output: Image.Image) -> float:
+        source_pixels = list(source.getdata())
+        output_pixels = list(output.getdata())
+        return sum(abs(int(a) - int(b)) for a, b in zip(source_pixels, output_pixels)) / max(
+            1, len(source_pixels)
+        )
+
+    @staticmethod
+    def inspect_identity_preservation(
+        img: Image.Image,
+        source_asset_paths: List[str],
+        prompt: str,
+        role: str,
+        identity_constraints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return an evidence-aware LG-9 identity report.
+
+        The existing color/silhouette validator remains the baseline. Fine
+        product features can only pass when the immutable scene prompt carries
+        normalized reference/output regions for them. Missing or malformed
+        evidence is reported as ``needs_review`` instead of being guessed as a
+        pass. Region entries use ``reference_box`` and ``output_box`` values in
+        normalized ``[left, top, right, bottom]`` coordinates.
+        """
+
+        warnings = ProductIdentityValidator.validate_identity_preservation(
+            img=img,
+            source_asset_paths=source_asset_paths,
+            prompt=prompt,
+            role=role,
+        )
+        checks: dict[str, dict[str, Any]] = {
+            "color": {
+                "status": "needs_review" if any("color drift" in item.lower() for item in warnings) else "passed"
+            },
+            "silhouette": {
+                "status": "needs_review" if any("silhouette" in item.lower() for item in warnings) else "passed"
+            },
+        }
+        constraints = identity_constraints or {}
+        feature_regions = constraints.get("feature_regions") or {}
+        sources: list[Image.Image | None] = []
+        for source_path in source_asset_paths:
+            try:
+                with Image.open(source_path) as source_image:
+                    sources.append(source_image.convert("RGB"))
+            except (OSError, ValueError):
+                sources.append(None)
+
+        insufficient: list[str] = []
+        for element in ProductIdentityValidator.STRUCTURAL_IDENTITY_ELEMENTS:
+            regions = feature_regions.get(element) if isinstance(feature_regions, dict) else None
+            if not isinstance(regions, list) or not regions:
+                checks[element] = {
+                    "status": "needs_review",
+                    "reason": "structured_reference_unavailable",
+                }
+                insufficient.append(element)
+                continue
+
+            differences: list[float] = []
+            invalid_region = False
+            for region in regions:
+                if not isinstance(region, dict):
+                    invalid_region = True
+                    break
+                reference_index = region.get("reference_index", 0)
+                if (
+                    not isinstance(reference_index, int)
+                    or isinstance(reference_index, bool)
+                    or reference_index < 0
+                    or reference_index >= len(sources)
+                    or sources[reference_index] is None
+                ):
+                    invalid_region = True
+                    break
+                source = sources[reference_index]
+                assert source is not None
+                source_crop = ProductIdentityValidator._normalized_crop(source, region.get("reference_box"))
+                output_crop = ProductIdentityValidator._normalized_crop(img, region.get("output_box"))
+                if source_crop is None or output_crop is None:
+                    invalid_region = True
+                    break
+                differences.append(ProductIdentityValidator._region_difference(source_crop, output_crop))
+            if invalid_region or not differences:
+                checks[element] = {
+                    "status": "needs_review",
+                    "reason": "structured_reference_invalid",
+                }
+                insufficient.append(element)
+                continue
+            max_difference = max(differences)
+            checks[element] = {
+                "status": "passed" if max_difference <= 45.0 else "needs_review",
+                "reason": "region_match" if max_difference <= 45.0 else "region_mismatch",
+                "max_mean_absolute_difference": round(max_difference, 2),
+                "region_count": len(differences),
+            }
+            if max_difference > 45.0:
+                warnings.append(
+                    f"{element} preservation requires review (region difference: {max_difference:.1f})."
+                )
+
+        if insufficient:
+            warnings.append(
+                "Structured identity evidence is unavailable for: " + ", ".join(insufficient) + "."
+            )
+        status = "passed" if checks and all(item["status"] == "passed" for item in checks.values()) else "needs_review"
+        return {"status": status, "checks": checks, "warnings": warnings}

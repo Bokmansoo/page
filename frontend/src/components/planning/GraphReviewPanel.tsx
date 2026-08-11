@@ -21,7 +21,15 @@ export type GraphView = {
         output_asset_id?: string | null;
         error_code?: string | null;
         warnings?: string[];
-        validation?: { status?: string; warnings?: string[] };
+        source_asset_ids?: string[];
+        validation?: {
+          schema_version?: string;
+          status?: string;
+          checks?: Record<string, string>;
+          warnings?: string[];
+          risk_codes?: string[];
+          ocr_text?: string;
+        };
         estimated_cost?: number | null;
         actual_cost?: number | null;
         generation_attempt?: number;
@@ -90,6 +98,28 @@ type Props = {
   onStateChange?: (view: GraphView | null) => void;
 };
 
+const validationStatusLabel: Record<string, string> = {
+  passed: "통과",
+  needs_review: "판매자 확인 필요",
+  blocked: "차단",
+};
+
+const validationCheckLabel: Record<string, string> = {
+  identity: "상품 정체성",
+  ocr: "문구/OCR",
+  crop: "잘림 안전성",
+  resolution: "해상도",
+  safety: "안전성",
+  rights: "사용 권리",
+};
+
+const validationCheckStatusLabel: Record<string, string> = {
+  passed: "통과",
+  needs_review: "확인 필요",
+  blocked: "차단",
+  not_run: "실행 전 중단",
+};
+
 export default function GraphReviewPanel({ projectId, runId, hidePlanningAction = false, onStateChange }: Props) {
   const [view, setView] = useState<GraphView | null>(null);
   const [loading, setLoading] = useState(true);
@@ -111,8 +141,8 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     resolvedRunIdRef.current = runId ?? null;
   }, [runId]);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (showLoading = true) => {
+    if (showLoading) setLoading(true);
     try {
       setLoadIssue(null);
       const requestedRunId = resolvedRunIdRef.current;
@@ -164,7 +194,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "승인 대기 상태를 불러오지 못했습니다.");
     } finally {
-      setLoading(false);
+      if (showLoading) setLoading(false);
     }
   }, [projectId, onStateChange, recoveryStorageKey]);
 
@@ -172,7 +202,10 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
 
   useEffect(() => {
     if (view?.current_stage !== "provider_wait") return;
-    const timer = window.setInterval(() => { void load(); }, 1500);
+    // Keep the current review card mounted during background polling.  A
+    // provider wait may last several seconds; replacing the whole panel with
+    // a loading placeholder on every poll makes images appear to vanish.
+    const timer = window.setInterval(() => { void load(false); }, 1500);
     return () => window.clearInterval(timer);
   }, [view?.current_stage, load]);
 
@@ -356,6 +389,29 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
           />
           <figcaption className="border-t border-slate-200 bg-white px-3 py-2 text-[11px] text-slate-500">생성 결과 미리보기 · 이미지를 확인한 뒤 승인해 주세요.</figcaption>
         </figure> : imageReview && job.status === "needs_review" ? <p className="mt-3 rounded bg-rose-50 px-3 py-2 text-rose-700">검수할 이미지 파일을 불러오지 못했습니다. 이 장면을 승인하지 말고 상태를 새로고침해 주세요.</p> : null}
+        {job.output_asset_id && job.source_asset_ids?.length ? <section className="mt-3 rounded-lg border border-violet-100 bg-violet-50/50 p-3" data-testid={`lg9-scene-comparison-${job.scene_id || job.job_id}`}>
+          <p className="text-[11px] font-bold text-violet-900">생성 결과와 기준 사진 비교</p>
+          <p className="mt-1 text-[10px] leading-4 text-slate-600">기준 사진은 생성 참고용이며, 최종 사용 여부는 생성 결과와 검사 보고서를 함께 확인해 결정합니다.</p>
+          <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3">
+            {job.source_asset_ids.map((assetId, index) => <figure key={assetId} className="overflow-hidden rounded border border-violet-100 bg-white">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={apiUrl(`/api/v1/files/assets/${assetId}`)} alt={`${job.role || job.section_id || "장면"} 기준 사진 ${index + 1}`} className="aspect-square w-full object-contain" loading="lazy" data-testid={`lg9-reference-${job.scene_id || job.job_id}-${assetId}`} />
+              <figcaption className="px-2 py-1 text-[10px] text-slate-600">기준 사진 {index + 1}</figcaption>
+            </figure>)}
+          </div>
+        </section> : null}
+        {job.validation?.status && job.validation.status !== "pending" ? <section className={`mt-3 rounded-lg border p-3 text-[11px] ${job.validation.status === "blocked" ? "border-rose-200 bg-rose-50 text-rose-900" : job.validation.status === "needs_review" ? "border-amber-200 bg-amber-50 text-amber-950" : "border-emerald-200 bg-emerald-50 text-emerald-950"}`} data-testid={`lg9-validation-${job.scene_id || job.job_id}`}>
+          <p className="font-bold">자동 검사 보고서 · {validationStatusLabel[job.validation.status] || job.validation.status}</p>
+          {job.validation.checks ? <div className="mt-2 grid gap-1 sm:grid-cols-2">
+            {Object.entries(validationCheckLabel).map(([key, label]) => {
+              const status = job.validation?.checks?.[key];
+              return <p key={key}><b>{label}</b> · {status ? (validationCheckStatusLabel[status] || status) : "미확인"}</p>;
+            })}
+          </div> : null}
+          {job.validation.risk_codes?.length ? <p className="mt-2">감지 항목: {job.validation.risk_codes.join(", ")}</p> : null}
+          {job.validation.ocr_text ? <p className="mt-2">감지 문구: {job.validation.ocr_text}</p> : null}
+          {job.validation.warnings?.length ? <p className="mt-2">검사 메모: {job.validation.warnings.join(" · ")}</p> : null}
+        </section> : null}
         {job.error_code ? <p className="mt-2 text-rose-700">{errorLabel(job.error_code)}</p> : null}
         {imageReview ? <div className="mt-3 flex flex-wrap gap-2">
           {job.status === "needs_review" ? <><button type="button" onClick={() => void resume("approve", { jobId: job.job_id })} disabled={working} className="rounded bg-emerald-600 px-2 py-1 font-bold text-white disabled:opacity-50">이 장면 승인</button><button type="button" onClick={() => void resume("reject", { jobId: job.job_id })} disabled={working} className="rounded border border-rose-300 px-2 py-1 font-bold text-rose-700 disabled:opacity-50">거절</button></> : null}

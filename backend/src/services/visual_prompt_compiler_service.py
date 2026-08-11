@@ -35,6 +35,24 @@ from src.services.commerce_policy import CONFIRMED_FACT_STATUSES, resolved_asset
 
 COMPILER_VERSION = "lg8-visual-prompt-compiler-v1"
 PROMPT_SCHEMA_VERSION = "scene-prompt-v1"
+IDENTITY_FEATURE_REGION_SCHEMA_VERSION = "identity-feature-regions-v1"
+IDENTITY_FEATURE_KEYWORDS = {
+    "buttons": (
+        "button", "buttons", "control", "controls", "switch", "dial",
+        "버튼", "조작", "컨트롤", "스위치", "다이얼", "按键",
+    ),
+    "ports": (
+        "port", "ports", "connector", "connectors", "usb", "type-c", "charging",
+        "포트", "커넥터", "단자", "충전구", "충전 포트", "充电口",
+    ),
+    "components": (
+        "component", "components", "accessory", "accessories", "included part", "included parts",
+        "구성품", "부속", "액세서리", "부속품",
+    ),
+    "logo": (
+        "logo", "brand mark", "brandmark", "로고", "브랜드 마크", "상표",
+    ),
+}
 TEXT_POLICY = {
     "mode": "no_rasterized_copy",
     "final_copy_owner": "deterministic_renderer",
@@ -200,7 +218,7 @@ def _scene_assets(project: ProductProject, card: dict[str, Any], db: Session) ->
     by_id = {row.id: row for row in rows}
     ordered_ids = list(card.get("candidate_asset_ids") or [])
     ordered_ids.extend(row.id for row in rows if row.asset_role in {
-        "product_main", "product_detail", "product_component", "product_in_use", "usage_scene"})
+        "product_main", "product_detail", "product_component", "components", "product_in_use", "usage_scene"})
     selected: list[Asset] = []
     for asset_id in dict.fromkeys(ordered_ids):
         asset = by_id.get(asset_id)
@@ -219,11 +237,61 @@ def _scene_facts(project: ProductProject, card: dict[str, Any], db: Session) -> 
     return [row for row in query.all() if row.verification_status in CONFIRMED_FACT_STATUSES and not row.needs_review]
 
 
+def _contains_identity_feature_keyword(text: str, keyword: str) -> bool:
+    if keyword.isascii():
+        return re.search(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", text) is not None
+    return keyword in text
+
+
+def _identity_feature_regions(assets: list[Asset]) -> dict[str, list[dict[str, Any]]]:
+    """Snapshot only explicit, frame-level identity evidence.
+
+    The current asset contract has no segmentation coordinates. A seller- or
+    inspector-classified close-up can still provide a deterministic region:
+    its full normalized frame. Ambiguous ``product_detail`` assets are not
+    assigned to a feature unless their filename/OCR explicitly names it.
+    """
+
+    regions: dict[str, list[dict[str, Any]]] = {
+        feature: [] for feature in IDENTITY_FEATURE_KEYWORDS
+    }
+    for reference_index, asset in enumerate(assets):
+        role = str(asset.asset_role or "").lower()
+        evidence_text = " ".join((str(asset.filename or ""), str(asset.ocr_text or ""))).lower()
+        explicit_features: set[str] = set()
+        if role in {"product_detail", "feature"}:
+            explicit_features = {
+                feature
+                for feature, keywords in IDENTITY_FEATURE_KEYWORDS.items()
+                if any(_contains_identity_feature_keyword(evidence_text, keyword) for keyword in keywords)
+            }
+        if role in {"components", "product_component"}:
+            explicit_features.add("components")
+
+        for feature in sorted(explicit_features):
+            regions[feature].append({
+                "feature": feature,
+                "reference_asset_id": asset.id,
+                "reference_index": reference_index,
+                "reference_box": [0.0, 0.0, 1.0, 1.0],
+                "output_box": [0.0, 0.0, 1.0, 1.0],
+                "coordinate_space": "normalized",
+                "evidence_source": (
+                    "asset_role" if feature == "components" and role in {"components", "product_component"}
+                    else "asset_metadata"
+                ),
+                "reference_role": asset.asset_role,
+            })
+    return regions
+
+
 def _identity_constraints(project: ProductProject, assets: list[Asset], facts: list[ProductFact]) -> dict[str, Any]:
     return {
         "product_name": project.name,
         "preserve_exactly": ["silhouette", "color", "material", "buttons", "ports", "components", "included_parts"],
         "reference_roles": [asset.asset_role for asset in assets],
+        "feature_region_schema_version": IDENTITY_FEATURE_REGION_SCHEMA_VERSION,
+        "feature_regions": _identity_feature_regions(assets),
         "fact_constraints": [
             {"id": fact.id, "field": fact.field_key, "value": fact.normalized_value or fact.fact_text, "unit": fact.normalized_unit}
             for fact in facts

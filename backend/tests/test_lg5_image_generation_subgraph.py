@@ -3,6 +3,7 @@ from __future__ import annotations
 from base64 import b64decode
 from contextlib import contextmanager
 from io import BytesIO
+import re
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
@@ -152,6 +153,7 @@ def _to_generation_pending(client, headers, run_id: str, db_session=None, *, min
     return state
 
 
+@pytest.mark.lg9_fake_e2e
 def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
     client, auth_headers, db_session, lg5_runtime, tmp_path
 ):
@@ -179,6 +181,7 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
     deliveries = db_session.query(ImageGenerationOutboxRecord).filter(ImageGenerationOutboxRecord.run_id == run.id).all()
     assert len(jobs) > 1
     assert len(deliveries) == len(jobs)
+    assert all(item.provider_mode == "mock" for item in deliveries)
     assert all(item.provider_dispatch_count == 0 for item in deliveries)
     assert len({item.idempotency_key for item in jobs}) == len(jobs)
 
@@ -203,6 +206,10 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
         worker_db.close()
     assert len(worker_results) == len(jobs)
     assert all(item["provider_dispatch_count"] == 1 for item in worker_results)
+    db_session.expire_all()
+    assert all(job.actual_cost == 0 for job in db_session.query(ImageGenerationJobRecord).filter(
+        ImageGenerationJobRecord.project_id == run.project_id
+    ).all())
 
     restored = client.get(f"/api/v1/graph-runs/{run.id}", headers=auth_headers)
     assert restored.status_code == 200, restored.text
@@ -241,6 +248,15 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
     assert image_review["values"]["review"]["pending"] is None
     assert image_review["values"]["generation"]["all_required_scenes_approved"] is True
     assert all(item["status"] == "approved" for item in image_review["values"]["generation"]["jobs"])
+    manifest = image_review["values"]["generation"]["approved_asset_manifest"]
+    assert manifest["schema_version"] == "lg9-approved-asset-manifest-v1"
+    assert manifest["run_id"] == run.id
+    assert manifest["project_id"] == run.project_id
+    assert {item["asset_id"] for item in manifest["assets"]} == set(
+        image_review["values"]["generation"]["approved_asset_ids"]
+    )
+    assert all(re.fullmatch(r"[0-9a-f]{64}", item["asset_content_hash"]) for item in manifest["assets"])
+    assert manifest["manifest_hash"]
     assert db_session.query(ImageGenerationJobRecord).filter(
         ImageGenerationJobRecord.project_id == run.project_id,
         ImageGenerationJobRecord.status == "approved",
@@ -259,6 +275,9 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
     db_session.add(completed_run)
     db_session.commit()
 
+    db_session.refresh(completed_run)
+    assert completed_run.outputs_json["langgraph_generation"]["approved_asset_manifest"] == manifest
+
     refreshed = client.get(f"/api/v1/graph-runs/{run.id}", headers=auth_headers)
     assert refreshed.status_code == 200, refreshed.text
     refreshed_state = refreshed.json()
@@ -266,6 +285,27 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
     assert refreshed_state["values"]["review"]["pending"] is None
     assert refreshed_state["values"]["generation"]["all_required_scenes_approved"] is True
     assert all(item["status"] == "approved" for item in refreshed_state["values"]["generation"]["jobs"])
+    assert refreshed_state["values"]["generation"]["approved_asset_manifest"] == manifest
+
+    # Simulate a process stopping after the LangGraph checkpoint commit but
+    # before the AgentRun SQL projection was written. History replay must use
+    # the same projector and restore the exact durable generation contract.
+    from src.services.langgraph_run_service import LangGraphRunService
+
+    db_session.refresh(completed_run)
+    outputs = dict(completed_run.outputs_json or {})
+    outputs.pop("langgraph_generation", None)
+    completed_run.outputs_json = outputs
+    db_session.add(completed_run)
+    db_session.commit()
+    graph = LangGraphRunService._compiled_graph(lg5_runtime)
+    rebuilt = LangGraphRunService._rebuild_projection_from_history(
+        completed_run,
+        db_session,
+        graph,
+        LangGraphRunService._config(run.id),
+    )
+    assert rebuilt.outputs_json["langgraph_generation"]["approved_asset_manifest"] == manifest
 
     # Duplicate worker/webhook/poll effects are absorbed by the durable outbox.
     worker_db = SessionLocal()
@@ -279,6 +319,7 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
     ).all())
 
 
+@pytest.mark.lg9_fake_e2e
 def test_lg5r_reject_regenerates_only_target_and_manual_upload_uses_owned_asset(
     client, auth_headers, db_session, lg5_runtime, tmp_path
 ):
@@ -399,6 +440,335 @@ def test_lg5r_reject_regenerates_only_target_and_manual_upload_uses_owned_asset(
         assert approved_upload.json()["current_stage"] == "image_review"
 
 
+def test_lg5r_worker_reconciles_completed_output_left_pending_before_provider_wait_resume(
+    monkeypatch, client, auth_headers, db_session, lg5_runtime, tmp_path
+):
+    """A completed outbox result must not leave its LangGraph run polling forever."""
+
+    from src.db.database import SessionLocal
+    from src.services import image_generation_worker
+
+    run = _create_run(client, auth_headers, db_session, tmp_path)
+    generation_wait = _to_generation_pending(client, auth_headers, run.id, db_session, minimum_generation_scenes=2)
+    provider_wait = _resume(
+        client, auth_headers, generation_wait, "approve", cost_plan_hash=_cost_hash(generation_wait)
+    ).json()
+    assert provider_wait["current_stage"] == "provider_wait"
+
+    original_resume = image_generation_worker._resume_completed_run
+    monkeypatch.setattr(image_generation_worker, "_resume_completed_run", lambda _run_id: None)
+    worker_db = SessionLocal()
+    try:
+        results = image_generation_worker.run_image_worker_batch(worker_db, owner="completion-recovery-worker", batch_size=100)
+    finally:
+        worker_db.close()
+    assert len(results) >= 2
+
+    db_session.expire_all()
+    stale_job = db_session.query(ImageGenerationJobRecord).filter(
+        ImageGenerationJobRecord.project_id == run.project_id,
+        ImageGenerationJobRecord.output_asset_id.isnot(None),
+    ).order_by(ImageGenerationJobRecord.created_at).first()
+    assert stale_job is not None
+    stale_job.status = "queued"
+    db_session.commit()
+
+    monkeypatch.setattr(image_generation_worker, "_resume_completed_run", original_resume)
+    worker_db = SessionLocal()
+    try:
+        assert image_generation_worker.run_image_worker_batch(
+            worker_db, owner="completion-recovery-reconciler", batch_size=100
+        ) == []
+    finally:
+        worker_db.close()
+
+    db_session.expire_all()
+    assert db_session.query(ImageGenerationJobRecord).filter(
+        ImageGenerationJobRecord.id == stale_job.id
+    ).one().status == "needs_review"
+    recovered = client.get(f"/api/v1/graph-runs/{run.id}", headers=auth_headers)
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["current_stage"] == "image_review"
+
+
+@pytest.mark.lg9_fake_e2e
+def test_lg5r_provider_failure_keeps_other_scene_output_for_review(
+    monkeypatch, client, auth_headers, db_session, lg5_runtime, tmp_path
+):
+    """A failed scene dead-letters without discarding a completed sibling."""
+
+    from src.db.database import SessionLocal
+    from src.services import image_generation_worker
+
+    run = _create_run(client, auth_headers, db_session, tmp_path)
+    generation_wait = _to_generation_pending(
+        client, auth_headers, run.id, db_session, minimum_generation_scenes=2
+    )
+    provider_wait = _resume(
+        client,
+        auth_headers,
+        generation_wait,
+        "approve",
+        cost_plan_hash=_cost_hash(generation_wait),
+    ).json()
+    assert provider_wait["current_stage"] == "provider_wait"
+
+    jobs = db_session.query(ImageGenerationJobRecord).filter(
+        ImageGenerationJobRecord.project_id == run.project_id
+    ).order_by(ImageGenerationJobRecord.created_at).all()
+    assert len(jobs) >= 2
+    failed_job_id = jobs[0].job_id
+    original_generate = image_generation_worker.DurableFakeImageProvider.generate
+
+    def fail_one_scene(self, request):
+        if request.job_id == failed_job_id:
+            raise RuntimeError("MODERATION_REJECTED")
+        return original_generate(self, request)
+
+    monkeypatch.setattr(
+        image_generation_worker.DurableFakeImageProvider,
+        "generate",
+        fail_one_scene,
+    )
+    worker_db = SessionLocal()
+    try:
+        results = image_generation_worker.run_image_worker_batch(
+            worker_db,
+            owner="lg5r-partial-failure-worker",
+            batch_size=100,
+        )
+    finally:
+        worker_db.close()
+    assert len(results) == len(jobs)
+    assert next(item for item in results if item["job_id"] == failed_job_id)["status"] == "dead_letter"
+
+    image_review = client.get(f"/api/v1/graph-runs/{run.id}", headers=auth_headers).json()
+    assert image_review["current_stage"] == "image_review"
+    review_jobs = image_review["values"]["generation"]["jobs"]
+    failed_job = next(item for item in review_jobs if item["job_id"] == failed_job_id)
+    completed_job = next(item for item in review_jobs if item["job_id"] != failed_job_id)
+    assert failed_job["status"] == "failed"
+    assert failed_job["output_asset_id"] is None
+    assert completed_job["status"] == "needs_review"
+    assert completed_job["output_asset_id"] is not None
+    assert "approved_asset_manifest" not in image_review["values"]["generation"]
+
+    approved = _resume(client, auth_headers, image_review, "approve", job_id=completed_job["job_id"])
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["current_stage"] == "image_review"
+    preserved = next(
+        item for item in approved.json()["values"]["generation"]["jobs"]
+        if item["job_id"] == completed_job["job_id"]
+    )
+    still_failed = next(
+        item for item in approved.json()["values"]["generation"]["jobs"]
+        if item["job_id"] == failed_job_id
+    )
+    assert preserved["status"] == "approved"
+    assert preserved["output_asset_id"] == completed_job["output_asset_id"]
+    assert still_failed["status"] == "failed"
+    assert "approved_asset_manifest" not in approved.json()["values"]["generation"]
+    from src.services import langgraph_image_generation_service as image_graph
+
+    retry_plan = image_graph.apply_image_review(
+        run_id=run.id,
+        project_id=run.project_id,
+        decision="regenerate",
+        job_id=failed_job_id,
+        db=db_session,
+    )
+    assert retry_plan["regenerate_scene_ids"] == [failed_job["scene_id"]]
+    assert retry_plan["next_action"] == "cost_approval"
+
+    source_assets = db_session.query(Asset).filter(
+        Asset.project_id == run.project_id,
+        Asset.source_type == "uploaded",
+    ).order_by(Asset.intake_order).all()
+    disallowed_asset = source_assets[0]
+    disallowed_asset.usage_status = "reference_only"
+    seller_path = tmp_path / "seller-owned-final.jpg"
+    seller_image = Image.new("RGB", (512, 512), color=(238, 226, 214))
+    seller_image.save(seller_path, format="JPEG")
+    seller_asset = Asset(
+        project_id=run.project_id,
+        source_type="uploaded",
+        usage_status="seller_owned",
+        filename=seller_path.name,
+        file_path=str(seller_path),
+        mime_type="image/jpeg",
+        file_size=seller_path.stat().st_size,
+        asset_role="product_detail",
+        quality_status="usable",
+        identity_status="confirmed",
+        content_hash=None,
+        intake_order=99,
+    )
+    db_session.add(seller_asset)
+    db_session.commit()
+    with pytest.raises(image_graph.ImageGenerationGateError):
+        image_graph.apply_image_review(
+            run_id=run.id,
+            project_id=run.project_id,
+            decision="upload",
+            job_id=failed_job_id,
+            asset_id=disallowed_asset.id,
+            seller_attested=True,
+            db=db_session,
+        )
+
+    uploaded = _resume(
+        client,
+        auth_headers,
+        approved.json(),
+        "upload",
+        job_id=failed_job_id,
+        asset_id=seller_asset.id,
+        seller_attested=True,
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    uploaded_jobs = uploaded.json()["values"]["generation"]["jobs"]
+    uploaded_target = next(item for item in uploaded_jobs if item["job_id"] == failed_job_id)
+    untouched_sibling = next(item for item in uploaded_jobs if item["job_id"] == completed_job["job_id"])
+    assert uploaded_target["status"] == "needs_review"
+    assert uploaded_target["output_asset_id"] == seller_asset.id
+    assert untouched_sibling["status"] == "approved"
+    assert untouched_sibling["output_asset_id"] == completed_job["output_asset_id"]
+    db_session.refresh(seller_asset)
+    assert re.fullmatch(r"[0-9a-f]{64}", seller_asset.content_hash or "")
+
+    recovered = _resume(client, auth_headers, uploaded.json(), "approve", job_id=failed_job_id)
+    assert recovered.status_code == 200, recovered.text
+    recovered_target = next(
+        item for item in recovered.json()["values"]["generation"]["jobs"]
+        if item["job_id"] == failed_job_id
+    )
+    assert recovered_target["status"] == "approved"
+    db_session.refresh(seller_asset)
+    assert re.fullmatch(r"[0-9a-f]{64}", seller_asset.content_hash or "")
+
+
+@pytest.mark.parametrize("invalid_hash", [None, "truthy-but-not-sha256", "A" * 64])
+def test_lg9_manifest_rejects_approved_asset_without_valid_sha256_content_hash(
+    client, auth_headers, db_session, lg5_runtime, tmp_path, invalid_hash
+):
+    from src.services import langgraph_image_generation_service as image_graph
+
+    run = _create_run(client, auth_headers, db_session, tmp_path)
+    asset = db_session.query(Asset).filter(Asset.project_id == run.project_id).first()
+    assert asset is not None
+    asset.content_hash = invalid_hash
+    db_session.add(ImageGenerationJobRecord(
+        project_id=run.project_id,
+        job_id=f"{run.id}-missing-content-hash",
+        section_id="hash-required-scene",
+        scene_id="hash-required-scene",
+        role="detail_closeup",
+        prompt="test",
+        status="approved",
+        output_asset_id=asset.id,
+        required_for_completion=True,
+        usage_metadata={"langgraph_run_id": run.id},
+    ))
+    db_session.commit()
+
+    with pytest.raises(image_graph.ImageGenerationGateError) as error:
+        image_graph.build_approved_asset_manifest(
+            run_id=run.id,
+            project_id=run.project_id,
+            db=db_session,
+        )
+    assert error.value.code == "APPROVED_ASSET_MANIFEST_INELIGIBLE"
+
+
+def test_lg5r_real_provider_failure_dead_letters_one_scene_and_enters_review(
+    monkeypatch, client, auth_headers, db_session, lg5_runtime, tmp_path
+):
+    """Exercise the production real-mode outbox/worker path without a paid call."""
+
+    from src.db.database import SessionLocal
+    from src.services import (
+        image_generation_service,
+        image_generation_worker,
+        langgraph_image_generation_service as image_graph,
+        storyboard_image_generation_service,
+    )
+
+    run = _create_run(client, auth_headers, db_session, tmp_path, mode="real")
+    monkeypatch.setattr(
+        image_generation_service.settings,
+        "SELLFORM_IMAGE_GENERATION_MODE",
+        "real",
+    )
+    monkeypatch.setattr(image_graph, "storyboard_image_generation_is_available", lambda: True)
+    monkeypatch.setattr(
+        storyboard_image_generation_service,
+        "storyboard_image_generation_is_available",
+        lambda: True,
+    )
+
+    generation_wait = _to_generation_pending(
+        client, auth_headers, run.id, db_session, minimum_generation_scenes=2
+    )
+    provider_wait = _resume(
+        client,
+        auth_headers,
+        generation_wait,
+        "approve",
+        cost_plan_hash=_cost_hash(generation_wait),
+    ).json()
+    assert provider_wait["current_stage"] == "provider_wait"
+    jobs = db_session.query(ImageGenerationJobRecord).filter(
+        ImageGenerationJobRecord.project_id == run.project_id
+    ).order_by(ImageGenerationJobRecord.created_at).all()
+    assert len(jobs) >= 2
+    failed_job_id = jobs[0].job_id
+    fake_provider = image_generation_worker.DurableFakeImageProvider()
+
+    class RealProviderDouble:
+        def generate(self, request):
+            if request.job_id == failed_job_id:
+                raise RuntimeError("TIMEOUT")
+            return fake_provider.generate(request)
+
+    monkeypatch.setattr(
+        image_generation_service,
+        "get_image_generation_adapter",
+        lambda provider_name, model=None: RealProviderDouble(),
+    )
+    worker_db = SessionLocal()
+    try:
+        results = image_generation_worker.run_image_worker_batch(
+            worker_db,
+            owner="lg5r-real-provider-worker",
+            batch_size=100,
+        )
+    finally:
+        worker_db.close()
+    failed_result = next(item for item in results if item["job_id"] == failed_job_id)
+    assert failed_result["status"] == "dead_letter"
+    assert failed_result["error_code"] == "PROVIDER_TIMEOUT"
+    assert failed_result["provider_dispatch_count"] == 1
+
+    failed_delivery = db_session.query(ImageGenerationOutboxRecord).filter(
+        ImageGenerationOutboxRecord.job_id == failed_job_id
+    ).one()
+    assert failed_delivery.provider_mode == "real"
+    assert failed_delivery.status == "dead_letter"
+    assert client.post(
+        f"/api/v1/image-worker/outbox/{failed_delivery.id}/retry", headers=auth_headers
+    ).status_code == 409
+
+    image_review = client.get(f"/api/v1/graph-runs/{run.id}", headers=auth_headers).json()
+    assert image_review["current_stage"] == "image_review"
+    review_jobs = image_review["values"]["generation"]["jobs"]
+    failed_job = next(item for item in review_jobs if item["job_id"] == failed_job_id)
+    successful_job = next(item for item in review_jobs if item["job_id"] != failed_job_id)
+    assert failed_job["status"] == "failed"
+    assert failed_job["output_asset_id"] is None
+    assert successful_job["status"] == "needs_review"
+    assert successful_job["output_asset_id"] is not None
+
+
 def test_lg5r_planning_reference_and_attempt_change_idempotency(client, auth_headers, db_session, lg5_runtime, tmp_path):
     from src.services import langgraph_image_generation_service as image_graph
 
@@ -512,6 +882,13 @@ def test_lg5r_worker_restart_recovery_and_operator_tools(
         f"/api/v1/image-worker/outbox/{deliveries[1].id}/retry", headers=auth_headers
     )
     assert unknown_retry.status_code == 409
+
+    deliveries[1].last_error_code = "PROVIDER_TIMEOUT"
+    db_session.commit()
+    timeout_retry = client.post(
+        f"/api/v1/image-worker/outbox/{deliveries[1].id}/retry", headers=auth_headers
+    )
+    assert timeout_retry.status_code == 409
 
     deliveries[0].status = "dead_letter"
     deliveries[0].last_error_code = "PROVIDER_SAFETY"

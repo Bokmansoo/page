@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from io import BytesIO
+from pathlib import Path
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
+from PIL import Image
 from sqlalchemy import inspect
 
 from src.config import settings
@@ -125,6 +128,18 @@ def test_lg8_compiles_every_required_scene_template_and_keeps_copy_out_of_provid
     assert all(row.reference_asset_ids for row in rows)
     assert all(row.approved_fact_ids for row in rows)
     assert all(row.identity_constraints["unknown_structure_policy"] == "do_not_invent" for row in rows)
+    assert all(
+        row.identity_constraints["feature_region_schema_version"] == "identity-feature-regions-v1"
+        for row in rows
+    )
+    assert all(
+        set(row.identity_constraints["feature_regions"]) == {"buttons", "ports", "components", "logo"}
+        for row in rows
+    )
+    assert all(
+        not any(row.identity_constraints["feature_regions"].values())
+        for row in rows
+    )
     assert all(row.text_policy["final_copy_owner"] == "deterministic_renderer" for row in rows)
     assert all(row.text_policy["allow_in_image_text"] is False for row in rows)
     assert all(row.rights_snapshot for row in rows)
@@ -143,6 +158,57 @@ def test_lg8_compiles_every_required_scene_template_and_keeps_copy_out_of_provid
     again = compile_project_scene_prompts(project, db_session, run_id=run.id)
     assert [row.id for row in again] == ids
     assert all(row.version == 1 for row in again)
+
+
+def test_lg8_compiler_derives_all_feature_regions_from_explicit_asset_evidence(
+    client, db_session, tmp_path
+):
+    run, project = _approved_project(client, db_session, tmp_path, scene_types=("hero",))
+    assets = db_session.query(Asset).filter_by(project_id=project.id).order_by(Asset.intake_order).all()
+    _, detail_asset = assets
+    detail_asset.filename = "seller-button-control-usb-port-brand-logo-detail.jpg"
+    component_asset = Asset(
+        project_id=project.id,
+        source_type="uploaded",
+        usage_status="seller_owned",
+        filename="seller-included-components.jpg",
+        file_path=detail_asset.file_path,
+        mime_type="image/jpeg",
+        file_size=detail_asset.file_size,
+        asset_role="components",
+        quality_status="usable",
+        identity_status="confirmed",
+        intake_order=3,
+    )
+    db_session.add(component_asset)
+    db_session.flush()
+    draft = dict(project.planning_draft or {})
+    draft["cards"] = [
+        {
+            **card,
+            "candidate_asset_ids": [*(card.get("candidate_asset_ids") or []), component_asset.id],
+        }
+        for card in draft.get("cards") or []
+    ]
+    project.planning_draft = draft
+    db_session.commit()
+
+    row = compile_project_scene_prompts(project, db_session, run_id=run.id)[0]
+    regions = row.identity_constraints["feature_regions"]
+
+    assert all(regions[element] for element in ("buttons", "ports", "components", "logo"))
+    assert regions["buttons"][0]["reference_asset_id"] == detail_asset.id
+    assert regions["ports"][0]["reference_asset_id"] == detail_asset.id
+    assert regions["components"][0]["reference_asset_id"] == component_asset.id
+    assert regions["components"][0]["evidence_source"] == "asset_role"
+    assert regions["logo"][0]["reference_asset_id"] == detail_asset.id
+    assert all(
+        entry["coordinate_space"] == "normalized"
+        and entry["reference_box"] == [0.0, 0.0, 1.0, 1.0]
+        and entry["output_box"] == [0.0, 0.0, 1.0, 1.0]
+        for entries in regions.values()
+        for entry in entries
+    )
 
 
 def test_lg8_scene_edit_is_local_and_invalidates_only_linked_job_and_outbox(client, db_session, tmp_path):
@@ -320,6 +386,49 @@ def test_lg8_real_graph_interrupt_compiles_prompts_and_links_fake_worker_jobs(
 ):
     run = _create_run(client, AUTH_HEADERS, db_session, tmp_path)
     project = db_session.query(ProductProject).filter_by(id=run.project_id).one()
+    main_asset = db_session.query(Asset).filter_by(
+        project_id=project.id,
+        asset_role="product_main",
+    ).one()
+    detail_asset = db_session.query(Asset).filter_by(
+        project_id=project.id,
+        asset_role="product_detail",
+    ).one()
+    from src.services.image_generation_provider import ImageGenerationRequest
+    from src.services.image_generation_worker import DurableFakeImageProvider
+    from src.services.product_identity_validator import ProductIdentityValidator
+
+    # Make index 0 visibly incompatible, while index 1 is the exact identity
+    # reference produced later by the production fake worker.
+    Image.new("RGB", (512, 512), color="black").save(main_asset.file_path, format="JPEG")
+    expected_output = DurableFakeImageProvider().generate(ImageGenerationRequest(
+        job_id="lg8-reference-fixture",
+        role="representative_product",
+        prompt="Preserve the product structure.",
+        source_asset_paths=[detail_asset.file_path],
+    ))
+    Path(detail_asset.file_path).write_bytes(expected_output.content)
+    main_asset.file_size = Path(main_asset.file_path).stat().st_size
+    detail_asset.file_size = len(expected_output.content)
+    assert Path(main_asset.file_path).read_bytes() != Path(detail_asset.file_path).read_bytes()
+
+    with (
+        Image.open(main_asset.file_path) as main_image,
+        Image.open(detail_asset.file_path) as detail_image,
+        Image.open(BytesIO(expected_output.content)) as output_image,
+    ):
+        full_frame = [0.0, 0.0, 1.0, 1.0]
+        main_crop = ProductIdentityValidator._normalized_crop(main_image, full_frame)
+        detail_crop = ProductIdentityValidator._normalized_crop(detail_image, full_frame)
+        output_crop = ProductIdentityValidator._normalized_crop(output_image, full_frame)
+        assert main_crop is not None and detail_crop is not None and output_crop is not None
+        assert ProductIdentityValidator._region_difference(main_crop, output_crop) > 45.0
+        assert ProductIdentityValidator._region_difference(detail_crop, output_crop) <= 45.0
+
+    # This is production asset metadata, not a feature_regions fixture. The
+    # compiler must derive the immutable normalized evidence from it.
+    detail_asset.filename = "seller-button-control-port-connector-detail.jpg"
+    db_session.commit()
     actor_id = AUTH_HEADERS["X-Mock-User-Id"]
     kit = create_kit(db_session, project.workspace_id, actor_id, "LG-8 graph pinned brand")
     pinned_brand = create_version(
@@ -347,6 +456,22 @@ def test_lg8_real_graph_interrupt_compiles_prompts_and_links_fake_worker_jobs(
     assert creative_brand_id == pinned_brand.id
     assert all(row.brand_kit_version_id == creative_brand_id for row in rows)
     assert all(item["brand_kit_version_id"] == creative_brand_id for item in artifact["scene_prompts"])
+    for row in rows:
+        regions = row.identity_constraints["feature_regions"]
+        assert regions["buttons"] and regions["ports"]
+        assert regions["components"] == []
+        assert regions["logo"] == []
+        for element in ("buttons", "ports"):
+            assert regions[element] == [{
+                "feature": element,
+                "reference_asset_id": detail_asset.id,
+                "reference_index": 1,
+                "reference_box": [0.0, 0.0, 1.0, 1.0],
+                "output_box": [0.0, 0.0, 1.0, 1.0],
+                "coordinate_space": "normalized",
+                "evidence_source": "asset_metadata",
+                "reference_role": "product_detail",
+            }]
 
     # Activating a new visual version after cost planning must not change the
     # prompt contract used by this already-running graph/checkpoint.
@@ -375,6 +500,20 @@ def test_lg8_real_graph_interrupt_compiles_prompts_and_links_fake_worker_jobs(
     assert all(prompt_by_id[job.scene_prompt_version_id].brand_kit_version_id == pinned_brand.id for job in jobs)
     assert all(job.prompt_hash == prompt_by_id[job.scene_prompt_version_id].prompt_hash for job in jobs)
     assert all(job.scene_id == prompt_by_id[job.scene_prompt_version_id].scene_id for job in jobs)
+    assert all(job.reference_hash == prompt_by_id[job.scene_prompt_version_id].reference_hash for job in jobs)
+    assert all(job.generation_attempt == 1 for job in jobs)
+    for job in jobs:
+        scene_prompt = job.input_snapshot["scene_prompt"]
+        assert scene_prompt["id"] == job.scene_prompt_version_id
+        assert scene_prompt["scene_id"] == job.scene_id
+        assert scene_prompt["prompt_version"] == job.prompt_version
+        assert scene_prompt["prompt_hash"] == job.prompt_hash
+        assert scene_prompt["reference_hash"] == job.reference_hash
+        assert scene_prompt["input_hash"]
+        assert scene_prompt["identity_constraints"]["feature_regions"] == (
+            prompt_by_id[job.scene_prompt_version_id].identity_constraints["feature_regions"]
+        )
+        assert job.input_hash
     assert db_session.query(ImageGenerationOutboxRecord).filter_by(run_id=run.id).count() == len(jobs)
 
     # Duplicate refresh remains on the same checkpoint/thread and does not
@@ -383,6 +522,7 @@ def test_lg8_real_graph_interrupt_compiles_prompts_and_links_fake_worker_jobs(
     assert refreshed.status_code == 200, refreshed.text
     assert refreshed.json()["thread_id"] == run.id
     assert db_session.query(ScenePromptVersion).filter_by(project_id=run.project_id).count() == len(rows)
+    assert db_session.query(ImageGenerationJobRecord).filter_by(project_id=run.project_id).count() == len(jobs)
     deliveries = db_session.query(ImageGenerationOutboxRecord).filter_by(run_id=run.id).all()
     assert all(delivery.provider_dispatch_count == 0 for delivery in deliveries)
 
@@ -414,6 +554,10 @@ def test_lg8_real_graph_interrupt_compiles_prompts_and_links_fake_worker_jobs(
     assert restored.status_code == 200, restored.text
     assert restored.json()["thread_id"] == run.id
     assert restored.json()["current_stage"] == "image_review"
+    review_jobs = restored.json()["values"]["generation"]["jobs"]
+    assert len(review_jobs) == len(jobs)
+    assert all(item["source_asset_ids"] for item in review_jobs)
+    assert all(item["validation"]["schema_version"] == "lg9-image-validation-v1" for item in review_jobs)
 
     db_session.expire_all()
     completed = db_session.query(ImageGenerationOutboxRecord).filter_by(run_id=run.id).all()
@@ -421,7 +565,26 @@ def test_lg8_real_graph_interrupt_compiles_prompts_and_links_fake_worker_jobs(
     assert all(row.status == "completed" for row in completed)
     assert all(row.provider_dispatch_count == 1 for row in completed)
     assert sum(row.completion_resume_count for row in completed) == 1
-    assert db_session.query(ImageGenerationJobRecord).filter_by(project_id=run.project_id).count() == len(jobs)
+    completed_jobs = db_session.query(ImageGenerationJobRecord).filter_by(project_id=run.project_id).all()
+    assert len(completed_jobs) == len(jobs)
+    for job in completed_jobs:
+        validation = job.validation_result
+        assert validation["schema_version"] == "lg9-image-validation-v1"
+        assert {"identity", "ocr", "crop", "resolution", "safety", "rights"} <= set(validation["checks"])
+        assert validation["checks"]["identity"] == "needs_review"
+        identity_checks = validation["details"]["identity"]["checks"]
+        assert {"buttons", "ports", "components", "logo"} <= set(identity_checks)
+        for element in ("buttons", "ports"):
+            assert identity_checks[element]["status"] == "passed"
+            assert identity_checks[element]["reason"] == "region_match"
+            assert identity_checks[element]["max_mean_absolute_difference"] <= 45.0
+            assert identity_checks[element]["region_count"] == 1
+        for element in ("components", "logo"):
+            assert identity_checks[element] == {
+                "status": "needs_review",
+                "reason": "structured_reference_unavailable",
+            }
+        assert validation["status"] in {"passed", "needs_review"}
 
 
 def test_lg8_worker_restart_reconciles_final_commit_without_duplicate_dispatch(

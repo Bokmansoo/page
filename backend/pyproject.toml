@@ -41,3 +41,7 @@ dev = [
 # The cache is optional and can otherwise retain files owned by a different
 # Windows account when the workspace is shared.
 addopts = "-p no:cacheprovider"
+markers = [
+    "lg9_fake_e2e: zero-cost production LangGraph LG-9 image workflow integration coverage",
+    "lg9_real_provider_smoke: opt-in smoke test that sends an image request to the configured real provider",
+]

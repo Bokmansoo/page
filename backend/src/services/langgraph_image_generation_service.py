@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import re
 from copy import deepcopy
 from typing import Any
 
@@ -24,6 +25,7 @@ from src.db.models import (
     ProductFact,
     ProductProject,
 )
+from src.services.commerce_policy import is_asset_final_output_eligible
 from src.services.storyboard_image_generation_service import (
     StoryboardImageGenerationError,
     approve_storyboard_job,
@@ -34,6 +36,9 @@ from src.services.storyboard_image_generation_service import (
     storyboard_image_generation_is_available,
 )
 from src.services.storyboard_service import approve_storyboard
+
+
+LG9_APPROVED_ASSET_MANIFEST_SCHEMA_VERSION = "lg9-approved-asset-manifest-v1"
 
 
 class ImageGenerationGateError(RuntimeError):
@@ -131,6 +136,7 @@ def _job_view(job: ImageGenerationJobRecord) -> dict[str, Any]:
         "error_message": (job.warnings or [None])[0],
         "warnings": list(job.warnings or []),
         "validation": dict(job.validation_result or {}),
+        "source_asset_ids": list(job.source_asset_ids or []),
         "estimated_cost": job.estimated_cost,
         "actual_cost": job.actual_cost,
         "attempt_count": job.attempt_count,
@@ -166,6 +172,52 @@ def _summary(rows: list[ImageGenerationJobRecord]) -> dict[str, Any]:
         "review_asset_ids": [job.output_asset_id for job in latest if job.status == "needs_review" and job.output_asset_id],
         "failed_job_ids": [job.job_id for job in latest if job.status in FAILED_STATUSES],
     }
+
+
+def build_approved_asset_manifest(*, run_id: str, project_id: str, db: Session) -> dict[str, Any]:
+    """Freeze only seller-approved final assets for the future Page Assembly input."""
+
+    latest = _latest_jobs(_owned_jobs(project_id, run_id, db))
+    required = [job for job in latest if job.required_for_completion]
+    if not required or any(job.status != "approved" or not job.output_asset_id for job in required):
+        raise ImageGenerationGateError(
+            "APPROVED_ASSET_MANIFEST_INCOMPLETE",
+            "모든 필수 장면을 승인한 뒤에만 Page Assembly asset manifest를 만들 수 있습니다.",
+        )
+
+    entries: list[dict[str, Any]] = []
+    for job in required:
+        asset = db.query(Asset).filter(
+            Asset.id == job.output_asset_id,
+            Asset.project_id == project_id,
+        ).first()
+        if (
+            asset is None
+            or not is_asset_final_output_eligible(asset)
+            or re.fullmatch(r"[0-9a-f]{64}", str(asset.content_hash or "")) is None
+        ):
+            raise ImageGenerationGateError(
+                "APPROVED_ASSET_MANIFEST_INELIGIBLE",
+                "승인 장면에 최종 출력으로 사용할 수 없는 asset이 포함되어 있습니다.",
+            )
+        entries.append({
+            "scene_id": str(job.scene_id or job.section_id),
+            "section_id": job.section_id,
+            "job_id": job.job_id,
+            "generation_attempt": int(job.generation_attempt or 1),
+            "asset_id": asset.id,
+            "asset_content_hash": asset.content_hash,
+            "provider": job.provider,
+            "model": job.model,
+        })
+
+    manifest = {
+        "schema_version": LG9_APPROVED_ASSET_MANIFEST_SCHEMA_VERSION,
+        "run_id": run_id,
+        "project_id": project_id,
+        "assets": entries,
+    }
+    return {**manifest, "manifest_hash": _hash(manifest)}
 
 
 def _cost_plan_payload(record: ImageGenerationCostApprovalRecord) -> dict[str, Any]:
@@ -309,6 +361,33 @@ def _idempotency_key(project_id: str, contract: dict[str, Any], generation_attem
     )
 
 
+def _immutable_scene_prompt_snapshot(contract: dict[str, Any]) -> dict[str, Any]:
+    """Copy and verify the LG-8 prompt payload before it becomes a job input.
+
+    The foreign key makes the source prompt traceable, while this JSON copy
+    preserves the exact provider input even if a later scene prompt revision
+    becomes active.  A malformed contract must not create a partially pinned
+    job that could be dispatched with mismatched prompt metadata.
+    """
+
+    snapshot = deepcopy(contract.get("input_snapshot") or {})
+    scene_prompt = dict(snapshot.get("scene_prompt") or {})
+    expected = {
+        "id": contract["scene_prompt_version_id"],
+        "scene_id": contract["scene_id"],
+        "prompt_version": contract["prompt_version"],
+        "prompt_hash": contract["prompt_hash"],
+        "reference_hash": contract["reference_hash"],
+    }
+    is_mismatched = any(scene_prompt.get(key) != value for key, value in expected.items())
+    if is_mismatched or not scene_prompt.get("input_hash"):
+        raise ImageGenerationGateError(
+            "SCENE_PROMPT_SNAPSHOT_INVALID",
+            "The image job must be created from one immutable scene prompt snapshot.",
+        )
+    return snapshot
+
+
 def prepare_graph_image_jobs(
     *, run_id: str, project_id: str, mode: str, db: Session,
     cost_plan_hash: str | None = None, scene_attempts: dict[str, int] | None = None,
@@ -379,7 +458,7 @@ def prepare_graph_image_jobs(
             model=contract["model"],
             error_code=contract["blocker_code"],
             warnings=contract["blocker_warnings"] or ["비용 승인 완료. durable worker 전송 대기 중입니다."],
-            input_snapshot=contract["input_snapshot"],
+            input_snapshot=_immutable_scene_prompt_snapshot(contract),
             validation_result={"status": "blocked" if contract["blocker_code"] else "pending"},
             estimated_cost=contract["estimated_cost"],
             usage_metadata={
@@ -525,5 +604,11 @@ def apply_image_review(
     except StoryboardImageGenerationError as error:
         raise ImageGenerationGateError("IMAGE_REVIEW_FAILED", str(error)) from error
     result = _summary(_owned_jobs(project_id, run_id, db))
+    if result["all_required_scenes_approved"]:
+        result["approved_asset_manifest"] = build_approved_asset_manifest(
+            run_id=run_id,
+            project_id=project_id,
+            db=db,
+        )
     result["next_action"] = "finalize" if result["all_required_scenes_approved"] else "review"
     return result
