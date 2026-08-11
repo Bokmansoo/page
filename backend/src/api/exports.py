@@ -9,7 +9,9 @@ from sqlalchemy.orm import Session
 
 from src.api.auth import get_current_user_and_workspace
 from src.db.database import get_db, SessionLocal
-from src.db.models import ProductProject, ProductPage, ExportJob, Asset, User
+from src.db.models import ProductProject, ProductPage, ExportJob, ExportArtifact, Asset, User, WorkspaceMember
+from src.config import settings
+from src.services.auth_service import create_session
 from src.schemas.export_history import ExportHistoryItem, ExportHistoryResponse
 from src.services.compliance_checker import PageComplianceChecker
 from src.services.page_readiness_service import inspect_page_readiness
@@ -60,11 +62,22 @@ class ExportJobResponse(BaseModel):
     class Config:
         from_attributes = True
 
+
+@router.get("/export/channel-presets")
+def list_channel_export_presets():
+    """Public, versioned output settings used by the web preview/export UI."""
+    from src.services.channel_export_service import serialize_channel_presets
+    return {"items": serialize_channel_presets()}
+
 # =====================================================================
 # Helper functions
 # =====================================================================
 
 def slugify(text: str) -> str:
+    from src.services.commerce_content_quality_service import export_slug
+    return export_slug(text)
+
+def _legacy_slugify(text: str) -> str:
     import re
     text = text.strip()
     text = re.sub(r'\s+', '-', text)
@@ -136,7 +149,12 @@ def get_project_or_404(db: Session, project_id: str, workspace_id: str) -> Produ
 
 def get_page_or_404(db: Session, project_id: str, workspace_id: str) -> ProductPage:
     get_project_or_404(db, project_id, workspace_id)
-    page = db.query(ProductPage).filter(ProductPage.project_id == project_id).first()
+    page = (
+        db.query(ProductPage)
+        .filter(ProductPage.project_id == project_id)
+        .order_by(ProductPage.created_at.asc(), ProductPage.id.asc())
+        .first()
+    )
     if not page:
         raise HTTPException(status_code=404, detail="Page draft not found for this project")
     return page
@@ -155,6 +173,7 @@ def run_export_task(
     final_version_id: Optional[str] = None,
 ):
     db = SessionLocal()
+    render_session = None
     try:
         # 1. 작업 상태를 rendering으로 업데이트
         job = db.query(ExportJob).filter(ExportJob.id == job_id).first()
@@ -180,18 +199,51 @@ def run_export_task(
         # 3. export_service의 run_export 구동
         from src.services.export_service import capture_next_render_export
         project = db.query(ProductProject).filter(ProductProject.id == project_id).first()
+        export_user = db.get(User, job.created_by)
+        if not project or not export_user or not export_user.is_active:
+            raise HTTPException(status_code=403, detail="Export identity is no longer available")
+        has_workspace_access = project.workspace.owner_id == export_user.id or db.query(WorkspaceMember).filter_by(
+            workspace_id=project.workspace_id,
+            user_id=export_user.id,
+        ).first()
+        if not has_workspace_access:
+            raise HTTPException(status_code=403, detail="Export user no longer has workspace access")
+        # The headless renderer is a different browser process.  Use a
+        # short-lived server session rather than legacy mock identity headers.
+        render_session, render_token, _ = create_session(db, export_user, project.workspace)
         export_res = capture_next_render_export(
             project_id=project_id,
             version_id=version.id,
             output_format=output_format,
-            auth_headers={
-                "X-Mock-User-Id": job.created_by,
-                "X-Mock-Workspace-Id": project.workspace_id if project else "",
-            },
+            auth_headers={"Cookie": f"{settings.SELLFORM_SESSION_COOKIE_NAME}={render_token}"},
         )
         
-        long_image_path = export_res["long_vertical_image"]
-        zip_path = export_res["section_images_zip"]
+        source_long_image_path = export_res["long_vertical_image"]
+        section_zip_path = export_res["section_images_zip"]
+        from src.services.channel_export_service import create_channel_export_bundle
+        project = db.query(ProductProject).filter(ProductProject.id == project_id).first()
+        project_name = project.name if project and project.name else "sellform-detail-page"
+        project_slug = slugify(project_name)
+        try:
+            channel_bundle = create_channel_export_bundle(
+                master_path=source_long_image_path,
+                output_dir=os.path.dirname(source_long_image_path),
+                project_slug=project_slug,
+                preset_key=preset_name,
+                output_format=output_format,
+                section_heights=export_res.get("section_heights", []),
+                section_images_zip=section_zip_path,
+                generation_plan=(version.sections_json or {}).get("ux2e0_generation_plan"),
+            )
+            long_image_path = channel_bundle["long_image"]
+            zip_path = channel_bundle["package_zip"]
+        except Exception as exc:
+            # Unit-render doubles may return marker bytes rather than a real
+            # image. Production exports always have a valid Playwright image;
+            # retain the canonical artifact instead of masking the real result.
+            logger.warning("Channel packaging skipped: %s", exc)
+            long_image_path = source_long_image_path
+            zip_path = section_zip_path
 
         # 4. ZIP 파일을 Asset 모델로 영구 등록
         zip_size = os.path.getsize(zip_path)
@@ -211,9 +263,7 @@ def run_export_task(
 
         # 5. 긴 세로 이미지도 Asset 모델로 영구 등록 및 output_images 지정
         long_size = os.path.getsize(long_image_path)
-        project_name = project.name if project and project.name else "sellform-detail-page"
-        project_slug = slugify(project_name)
-        export_filename = f"{project_slug}-상세페이지.{output_format}"
+        export_filename = os.path.basename(long_image_path)
         
         long_asset = Asset(
             project_id=project_id,
@@ -227,11 +277,30 @@ def run_export_task(
         db.add(long_asset)
         db.flush()
 
+        # Preserve channel preset/version and the immutable page version without
+        # requiring a schema migration. Artifact types are intentionally
+        # machine-readable for later preset replacement/re-download checks.
+        db.add_all([
+            ExportArtifact(
+                project_id=project_id,
+                version_id=version.id,
+                artifact_type=f"channel_long:{preset_name}:{output_format}",
+                file_path=long_image_path,
+            ),
+            ExportArtifact(
+                project_id=project_id,
+                version_id=version.id,
+                artifact_type=f"channel_package:{preset_name}:{output_format}",
+                file_path=zip_path,
+            ),
+        ])
+
         # 6. 완료 상태 업데이트
         job.status = "completed"
         job.zip_asset_id = zip_asset.id
         job.output_images = [
-            f"/api/v1/projects/{project_id}/page/export/download/{long_asset.id}"
+            f"/api/v1/projects/{project_id}/page/export/download/{long_asset.id}",
+            f"/api/v1/projects/{project_id}/page/export/download/{zip_asset.id}",
         ]
         job.completed_at = datetime.datetime.utcnow()
         db.commit()
@@ -246,6 +315,9 @@ def run_export_task(
             job.completed_at = datetime.datetime.utcnow()
             db.commit()
     finally:
+        if render_session:
+            render_session.revoked_at = datetime.datetime.utcnow()
+            db.commit()
         db.close()
 
 # =====================================================================
@@ -301,6 +373,16 @@ def request_page_export(
                 status_code=409,
                 detail="The requested version is not the current finalized page.",
             )
+        version_snapshot = requested_final.sections_json if isinstance(requested_final.sections_json, dict) else {}
+        quality_snapshot = version_snapshot.get("ux2d_content_quality")
+        if quality_snapshot and not quality_snapshot.get("ready_for_sale", False):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "선택한 최종본의 판매용 품질 확인 항목이 해결되지 않았습니다.",
+                    "content_quality": quality_snapshot,
+                },
+            )
 
     # 0. Readiness check (visual contract, edit markers, etc.)
     readiness = inspect_page_readiness(page, db)
@@ -324,6 +406,53 @@ def request_page_export(
                 "issues": blockers
             }
         )
+
+    # An export is derived from the immutable final page version. Return the
+    # previous exact artifact immediately rather than launching duplicate work.
+    final_version = None
+    try:
+        final_version = (
+            db.query(__import__("src.db.models", fromlist=["DetailPageVersion"]).DetailPageVersion)
+            .filter_by(id=req.final_version_id, project_id=project_id).first()
+            if req.final_version_id else get_final_page_version(db, project_id)
+        )
+    except FinalPageNotFoundError:
+        final_version = None
+    if final_version:
+        artifact_type = f"channel_long:{req.preset_name}:{req.output_format}"
+        existing_artifact = (
+            db.query(ExportArtifact)
+            .filter_by(project_id=project_id, version_id=final_version.id, artifact_type=artifact_type)
+            .order_by(ExportArtifact.created_at.desc()).first()
+        )
+        if existing_artifact and os.path.isfile(existing_artifact.file_path):
+            existing_asset = db.query(Asset).filter_by(
+                project_id=project_id, file_path=existing_artifact.file_path
+            ).first()
+            if existing_asset:
+                package_artifact = (
+                    db.query(ExportArtifact)
+                    .filter_by(project_id=project_id, version_id=final_version.id,
+                               artifact_type=f"channel_package:{req.preset_name}:{req.output_format}")
+                    .order_by(ExportArtifact.created_at.desc()).first()
+                )
+                package_asset = db.query(Asset).filter_by(
+                    project_id=project_id, file_path=package_artifact.file_path if package_artifact else ""
+                ).first()
+                job = ExportJob(
+                    project_id=project_id, preset_name=req.preset_name, status="completed",
+                    created_by=user.id, zip_asset_id=package_asset.id if package_asset else None,
+                    output_images=[
+                        f"/api/v1/projects/{project_id}/page/export/download/{existing_asset.id}",
+                        *(
+                            [f"/api/v1/projects/{project_id}/page/export/download/{package_asset.id}"]
+                            if package_asset else []
+                        ),
+                    ],
+                    completed_at=datetime.datetime.utcnow(),
+                )
+                db.add(job); db.commit(); db.refresh(job)
+                return job
 
     # 2. ExportJob 생성
     job = ExportJob(

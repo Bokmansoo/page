@@ -9,7 +9,7 @@ from src.api.auth import get_current_user_and_workspace
 from src.config import settings
 from src.db.database import get_db
 from src.db.models import ProductProject, ProductPage, PageSection, Asset, AuditLog
-from src.services.validation import validate_file_upload
+from src.services.validation import ALLOWED_EXTENSIONS, REVIEW_DOCUMENT_EXTENSIONS, validate_file_upload
 from src.services.commerce_policy import initial_asset_usage_status
 
 router = APIRouter(prefix="/files", tags=["files"])
@@ -82,7 +82,15 @@ async def upload_file(
     await file.seek(0)
 
     # Perform validation (extension, size limits)
-    validate_file_upload(file, file_size)
+    # Supplier/reference collection may contain review documents. They remain
+    # reference-only assets and are parsed only by the LG-7 review pipeline;
+    # seller-owned product inputs continue to accept images only.
+    allowed_extensions = (
+        ALLOWED_EXTENSIONS | REVIEW_DOCUMENT_EXTENSIONS
+        if source_type == "sourced"
+        else ALLOWED_EXTENSIONS
+    )
+    validate_file_upload(file, file_size, allowed_extensions=allowed_extensions)
 
     # 3. Create destination directory if it doesn't exist
     upload_dir = settings.UPLOAD_DIR
@@ -112,10 +120,11 @@ async def upload_file(
     db.add(asset)
     db.flush()
     if asset.mime_type.startswith("image/"):
-        from src.services.image_asset_inspector import apply_asset_inspection, refresh_representative_product_asset
+        from src.services.asset_understanding_service import run_asset_inspection
+        from src.services.image_asset_inspector import refresh_representative_product_asset
         from src.services.local_image_upscale import create_auto_upscale_preview
 
-        apply_asset_inspection(asset, db)
+        run_asset_inspection(asset, db)
         # Preserve the original as the automatic representative.  The local
         # enlargement is only a seller-reviewable candidate, never a silent
         # HERO assignment.
@@ -178,6 +187,10 @@ def update_asset_usage_status(
     """
     asset = _workspace_asset_or_404(asset_id, auth_ctx["workspace"].id, db)
     asset.usage_status = payload.usage_status
+    from src.services.storyboard_service import mark_storyboard_assets_stale
+    project = db.query(ProductProject).filter(ProductProject.id == asset.project_id).first()
+    if project:
+        mark_storyboard_assets_stale(project, [asset.id])
     db.add(
         AuditLog(
             workspace_id=auth_ctx["workspace"].id,
@@ -246,26 +259,28 @@ def apply_upscaled_asset(
         or item.source_asset_id in {enhanced.source_asset_id, lineage_root_id}
     }
 
-    for item in project_assets:
-        item.is_representative = item.id == enhanced.id
-        item.representative_source = "manual" if item.id == enhanced.id else "auto"
-    enhanced.asset_role = "product_main"
-    enhanced.role_confidence = 1.0
-    enhanced.role_source = "manual"
-    enhanced.identity_status = "confirmed"
+    source_was_representative = bool(source and source.is_representative)
+    if source_was_representative:
+        for item in project_assets:
+            if item.id in related_ids or item.id == enhanced.id:
+                item.is_representative = item.id == enhanced.id
+                item.representative_source = "manual" if item.id == enhanced.id else "auto"
+    # A feature/detail photo must not silently become the representative
+    # product photo merely because it was enlarged.
+    if source:
+        enhanced.asset_role = source.asset_role
+        enhanced.role_confidence = source.role_confidence
+        enhanced.role_source = source.role_source
+        enhanced.identity_status = source.identity_status
 
     page = db.query(ProductPage).filter(ProductPage.project_id == enhanced.project_id).first()
     if page:
-        from src.services.hero_composition import build_composed_product_payload
-
-        hero_payload = build_composed_product_payload(enhanced, page.project.selected_style if page.project else None)
         for section in page.sections:
             if section.image_asset_id not in related_ids:
                 continue
+            # Upscaling replaces only the linked file. The seller's current
+            # layout, crop/fit, background and copy placement stay unchanged.
             section.image_asset_id = enhanced.id
-            if section.section_type == "hero" and hero_payload:
-                section.visual_kind = "composed_product"
-                section.visual_payload = hero_payload
 
     db.add(
         AuditLog(
@@ -274,7 +289,11 @@ def apply_upscaled_asset(
             action="asset_local_upscale_applied",
             entity_type="asset",
             entity_id=enhanced.id,
-            payload={"source_asset_id": enhanced.source_asset_id, "replaced_asset_ids": sorted(related_ids)},
+            payload={
+                "source_asset_id": enhanced.source_asset_id,
+                "replaced_asset_ids": sorted(related_ids),
+                "layout_preserved": True,
+            },
         )
     )
     db.commit()

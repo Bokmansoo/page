@@ -246,6 +246,46 @@ def test_manual_representative_api_keeps_exactly_one_primary_asset(client, db_se
     assert second.asset_role == "product_main"
 
 
+def test_manual_classification_api_accepts_lg5r_identity_roles(client, db_session):
+    headers = {
+        "X-Mock-User-Id": "00000000-0000-0000-0000-000000000001",
+        "X-Mock-Workspace-Id": "00000000-0000-0000-0000-000000000002",
+    }
+    project = ProductProject(
+        id="classification-lg5r-role-project",
+        workspace_id=headers["X-Mock-Workspace-Id"],
+        brand_id="brand-1",
+        name="LG-5R manual role selection",
+        status="draft",
+    )
+    asset = Asset(
+        id="classification-lg5r-role-asset",
+        project_id=project.id,
+        source_type="uploaded",
+        usage_status="seller_owned",
+        filename="control-detail.jpg",
+        file_path="https://cdn.example.com/control-detail.jpg",
+        mime_type="image/jpeg",
+        file_size=10,
+    )
+    db_session.add_all([project, asset])
+    db_session.commit()
+
+    for role in ("product_component", "product_in_use", "product_detail", "usage_scene"):
+        response = client.patch(
+            f"/api/v1/projects/{project.id}/assets/{asset.id}/classification",
+            headers=headers,
+            json={"asset_role": role},
+        )
+        assert response.status_code == 200
+        assert response.json()["asset_role"] == role
+        assert response.json()["role_source"] == "manual"
+
+    db_session.refresh(asset)
+    assert asset.asset_role == "usage_scene"
+    assert asset.role_confidence == 1.0
+
+
 def test_low_quality_hero_requires_explicit_server_confirmation(client, db_session):
     headers = {
         "X-Mock-User-Id": "00000000-0000-0000-0000-000000000001",
@@ -279,7 +319,16 @@ def test_low_quality_hero_requires_explicit_server_confirmation(client, db_sessi
         sort_order=0,
         is_visible=True,
     )
-    db_session.add_all([project, page, asset, section])
+    pain_point = PageSection(
+        id="low-quality-pain-point-section",
+        page_id=page.id,
+        section_type="pain_point",
+        title="Pain point",
+        body_copy="Body",
+        sort_order=1,
+        is_visible=True,
+    )
+    db_session.add_all([project, page, asset, section, pain_point])
     db_session.commit()
     payload = {
         "sections": [{
@@ -301,6 +350,54 @@ def test_low_quality_hero_requires_explicit_server_confirmation(client, db_sessi
         json={**payload, "confirm_low_quality_hero": True},
     )
     assert allowed.status_code == 200
+    allowed_sections = {item["id"]: item for item in allowed.json()["sections"]}
+    assert allowed_sections[section.id]["visual_payload"]["low_quality_hero_confirmed"] is True
+
+    # Editing PAIN_POINT sends the current HERO back from full-page editors.
+    # An unchanged, already reviewed HERO must neither block this save nor
+    # lose its persisted review evidence.
+    non_hero_update = client.patch(
+        f"/api/v1/projects/{project.id}/page",
+        headers=headers,
+        json={
+            "sections": [
+                {
+                    "id": section.id,
+                    "title": section.title,
+                    "body_copy": section.body_copy,
+                    "image_asset_id": asset.id,
+                    "visual_kind": allowed_sections[section.id]["visual_kind"],
+                    "visual_payload": allowed_sections[section.id]["visual_payload"],
+                    "sort_order": 0,
+                    "is_visible": True,
+                },
+                {
+                    "id": pain_point.id,
+                    "title": pain_point.title,
+                    "body_copy": pain_point.body_copy,
+                    "image_asset_id": asset.id,
+                    "visual_kind": "image",
+                    "visual_payload": {"layout_variant": "image_text"},
+                    "sort_order": 1,
+                    "is_visible": True,
+                },
+            ]
+        },
+    )
+    assert non_hero_update.status_code == 200, non_hero_update.text
+    saved_sections = {item["id"]: item for item in non_hero_update.json()["sections"]}
+    assert saved_sections[pain_point.id]["image_asset_id"] == asset.id
+    assert saved_sections[section.id]["visual_payload"]["low_quality_hero_confirmed"] is True
+
+    readiness = client.get(
+        f"/api/v1/projects/{project.id}/page/readiness",
+        headers=headers,
+    )
+    assert readiness.status_code == 200
+    assert not any(
+        blocker["code"] == "hero_asset_quality_blocking"
+        for blocker in readiness.json()["blockers"]
+    )
 
 
 def test_agent_run_never_auto_recommends_low_quality_photo_for_hero():
@@ -464,7 +561,11 @@ def test_low_quality_hero_shows_auto_upscale_as_manual_candidate(db_session, tmp
     db_session.add(job)
     db_session.commit()
 
-    section = type("Section", (), {"id": "auto-upscale-candidate-hero"})()
+    section = type(
+        "Section",
+        (),
+        {"id": "auto-upscale-candidate-hero", "section_type": "hero"},
+    )()
     candidates = get_image_candidates_for_section(section, db_session, project.id)
 
     assert preview is not None

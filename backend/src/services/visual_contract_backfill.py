@@ -7,8 +7,11 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from src.db.models import PageSection, ProductFact, ProductPage
-from src.services.commerce_policy import CONFIRMED_FACT_STATUSES
-from src.services.seller_fact_ingestion_service import display_seller_spec
+from src.services.commerce_policy import (
+    CONFIRMED_FACT_STATUSES,
+    is_final_spec_section_type,
+)
+from src.services.seller_fact_ingestion_service import SpecDisplay, display_seller_spec
 
 
 LAYOUT_BY_SECTION: dict[str, str] = {
@@ -43,6 +46,13 @@ NARRATIVE_SECTION_TYPES = {
     "hero_reemphasize",
     "features",
 }
+TEXT_ONLY_NARRATIVE_SECTION_TYPES = {
+    "problem",
+    "target_customer",
+    "caution",
+    "cta",
+    "overall_summary",
+}
 
 
 def _section_facts(section: PageSection, db: Session) -> list[ProductFact]:
@@ -54,10 +64,18 @@ def _section_facts(section: PageSection, db: Session) -> list[ProductFact]:
     fact_ids = list(section.associated_fact_ids or [])
     if fact_ids:
         query = query.filter(ProductFact.id.in_(fact_ids))
+    elif (section.visual_payload or {}).get("facts_intentionally_empty"):
+        return []
     return query.all()
 
 
 def _fact_body(fact: ProductFact) -> str:
+    if fact.normalized_value not in (None, ""):
+        value = str(fact.normalized_value).strip()
+        if fact.field_key == "charging_port" and value.replace("-", "").lower() in {"typec", "usbc"}:
+            value = "Type-C"
+        unit = str(fact.normalized_unit or "").strip()
+        return f"{value}{unit}"
     return (fact.source_text or fact.fact_text or "").strip()
 
 
@@ -104,11 +122,6 @@ def _numeric_highlights(facts: list[ProductFact]) -> list[dict[str, Any]]:
 
 
 def _hero_spec_label(fact: ProductFact) -> str:
-    return display_seller_spec(
-        fact.fact_text,
-        _fact_body(fact),
-        fact.verification_status,
-    ).label
     text = fact.fact_text or ""
     if "무게" in text:
         return "무게"
@@ -118,7 +131,11 @@ def _hero_spec_label(fact: ProductFact) -> str:
         return "사용 시간"
     if "흡입력" in text:
         return "흡입력"
-    return "상품 사양"
+    return display_seller_spec(
+        fact.fact_text,
+        _fact_body(fact),
+        fact.verification_status,
+    ).label
 
 
 def _refresh_hero_numeric_spec_line(page: ProductPage, db: Session) -> int:
@@ -179,9 +196,17 @@ def _apply_fact_display_labels(
         fact = facts_by_id.get(fact_ids[0]) if fact_ids else None
         if not fact:
             return None
-        return display_seller_spec(
+        display = display_seller_spec(
             fact.fact_text, _fact_body(fact), fact.verification_status
         )
+        fact_text = (fact.fact_text or "").strip()
+        if ":" in fact_text:
+            display = SpecDisplay(
+                label=fact_text.split(":", 1)[0].strip(),
+                value=display.value,
+                provenance_label=display.provenance_label,
+            )
+        return display
 
     for key in ("cards", "highlights", "table_rows", "steps", "items"):
         entries = normalized.get(key)
@@ -224,7 +249,11 @@ def build_grounded_html_payload(section: PageSection, db: Session) -> dict[str, 
         # Weight, battery capacity, and duration are useful in one summary
         # visual or a spec table. Repeating them as generic marketing benefits
         # across several sections makes the page noisier without adding proof.
-        card_facts = [fact for fact in confirmed_facts if not _is_numeric_seller_spec(fact)]
+        card_facts = (
+            confirmed_facts
+            if section.section_type == "features"
+            else [fact for fact in confirmed_facts if not _is_numeric_seller_spec(fact)]
+        )
         cards = []
         for fact in card_facts:
             cards.append(
@@ -319,10 +348,13 @@ def build_grounded_html_payload_for_layout(
 
 def _is_payload_complete(section: PageSection) -> bool:
     """Check if the visual payload has all required fields for its kind."""
+    payload = section.visual_payload or {}
+    if payload.get("facts_intentionally_empty") and payload.get("strategy") == "text_only":
+        return True
     from src.services.page_visual_contract import validate_visual
     visual = {
         "visual_kind": section.visual_kind,
-        "visual_payload": section.visual_payload or {},
+        "visual_payload": payload,
         "image_asset_id": section.image_asset_id,
     }
     return len(validate_visual(visual)) == 0
@@ -391,6 +423,37 @@ def _upsert_seller_checklist(
     return 0
 
 
+def _ensure_final_specifications_are_last(page: ProductPage) -> int:
+    """Keep every visible seller-action section before the final specs.
+
+    Seller checklists can be added after the planning draft has already placed
+    its specifications section. Appending such a checklist made an otherwise
+    valid page fail the commerce rule that specifications/notices are the final
+    visible content. Preserve the existing relative order and move only final
+    specification sections to the end.
+    """
+    ordered = sorted(page.sections, key=lambda section: section.sort_order)
+    final_specs = [
+        section
+        for section in ordered
+        if is_final_spec_section_type(section.section_type)
+    ]
+    if not final_specs:
+        return 0
+
+    normalized = [
+        section
+        for section in ordered
+        if not is_final_spec_section_type(section.section_type)
+    ] + final_specs
+    updated = 0
+    for sort_order, section in enumerate(normalized):
+        if section.sort_order != sort_order:
+            section.sort_order = sort_order
+            updated += 1
+    return updated
+
+
 def apply_html_graphic_section_policy(page: ProductPage, db: Session) -> int:
     """Replace repeated/no-photo body visuals with fact-grounded graphics.
 
@@ -401,6 +464,35 @@ def apply_html_graphic_section_policy(page: ProductPage, db: Session) -> int:
     updated = 0
     missing_sections: list[PageSection] = []
     for section in page.sections:
+        # UX-2 Mock pages intentionally use HTML-first information sections.
+        # They already carry a valid visual contract and must not be converted
+        # into hidden "missing photo" sections by the legacy fact-card backfill.
+        if (section.visual_payload or {}).get("ux2_mock_output"):
+            continue
+        if (
+            section.section_type in TEXT_ONLY_NARRATIVE_SECTION_TYPES
+            and
+            (section.visual_payload or {}).get("facts_intentionally_empty")
+            and (section.visual_payload or {}).get("strategy") == "text_only"
+        ):
+            # Problem, target, caution, and similar narrative copy may be
+            # intentionally fact-free. Keep its authored text visible without
+            # manufacturing a graphic from unrelated specifications.
+            # Text-only narrative sections still need a valid visual contract
+            # for preview/export parity. ``image_text`` renders the authored
+            # copy without inventing a fact-backed card or requiring an image.
+            payload = dict(section.visual_payload or {})
+            payload["layout_variant"] = "image_text"
+            if (
+                section.visual_kind != "html_graphic"
+                or section.image_asset_id is not None
+                or section.visual_payload != payload
+            ):
+                section.visual_kind = "html_graphic"
+                section.image_asset_id = None
+                section.visual_payload = payload
+                updated += 1
+            continue
         if section.section_type in {"hero", "pre_purchase"} or section.section_type not in LAYOUT_BY_SECTION:
             continue
         if _has_distinct_section_photo(section, db):
@@ -412,6 +504,7 @@ def apply_html_graphic_section_policy(page: ProductPage, db: Session) -> int:
         # specs for the dedicated numeric summary/product-info sections.
         if (
             section.section_type in NARRATIVE_SECTION_TYPES
+            and section.section_type != "features"
             and section_facts
             and all(_is_numeric_seller_spec(fact) for fact in section_facts)
         ):
@@ -451,7 +544,9 @@ def apply_html_graphic_section_policy(page: ProductPage, db: Session) -> int:
             section.visual_payload = payload
             section.is_visible = True
             updated += 1
-    return updated + _upsert_seller_checklist(page, missing_sections, db)
+    updated += _upsert_seller_checklist(page, missing_sections, db)
+    updated += _ensure_final_specifications_are_last(page)
+    return updated
 
 
 def backfill_page_visuals(db: Session, project_id: str) -> BackfillReport:
@@ -459,7 +554,12 @@ def backfill_page_visuals(db: Session, project_id: str) -> BackfillReport:
 
     Fills both missing visual_kind AND incomplete visual_payload (cards, rows, etc.).
     """
-    page = db.query(ProductPage).filter(ProductPage.project_id == project_id).first()
+    page = (
+        db.query(ProductPage)
+        .filter(ProductPage.project_id == project_id)
+        .order_by(ProductPage.created_at.asc(), ProductPage.id.asc())
+        .first()
+    )
     if not page:
         return BackfillReport(project_id=project_id, updated=0)
 
@@ -484,10 +584,20 @@ def backfill_page_visuals(db: Session, project_id: str) -> BackfillReport:
         if section.visual_kind and _is_payload_complete(section):
             continue  # already fully backfilled
 
+        existing_payload = dict(section.visual_payload or {})
         if section.image_asset_id:
             section.visual_kind = "image"
             section.visual_payload = {
-                "layout_variant": "hero_overlay" if section.section_type == "hero" else "image_text"
+                "layout_variant": "hero_overlay" if section.section_type == "hero" else "image_text",
+                **{
+                    key: existing_payload[key]
+                    for key in (
+                        "low_quality_hero_confirmed",
+                        "ux2c_selection_state",
+                        "asset_id",
+                    )
+                    if key in existing_payload
+                },
             }
         else:
             section.visual_kind = "html_graphic"

@@ -31,19 +31,7 @@ interface LegacyProjectListResponse {
   items?: LegacyProjectItem[];
 }
 
-function mockHeaders(): Record<string, string> {
-  const defaults = {
-    "X-Mock-User-Id": "00000000-0000-0000-0000-000000000001",
-    "X-Mock-Workspace-Id": "00000000-0000-0000-0000-000000000002",
-  };
-
-  if (typeof window === "undefined") return defaults;
-
-  return {
-    "X-Mock-User-Id": localStorage.getItem("X-Mock-User-Id") || defaults["X-Mock-User-Id"],
-    "X-Mock-Workspace-Id": localStorage.getItem("X-Mock-Workspace-Id") || defaults["X-Mock-Workspace-Id"],
-  };
-}
+function mockHeaders(): Record<string, string> { return {}; }
 
 function normalizeStatus(status: string): ProjectWorklistStatus {
   const value = (status || "").toLowerCase();

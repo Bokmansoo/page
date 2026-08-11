@@ -5,7 +5,10 @@ from typing import Any
 
 
 PRIMARY_IMAGE_SECTION_TYPES = {"header", "hero", "problem_statement", "main_claim"}
-MAX_REUSE_PER_ASSET = 2
+# Sprint 2 completion rule: one source photo is never silently repeated in
+# multiple body sections. Additional sections must use another asset, an
+# HTML graphic, or a separately generated visual.
+MAX_REUSE_PER_ASSET = 1
 AUTO_HERO_BLOCKING_WARNINGS = {
     "LOW_RESOLUTION",
     "EXTREME_ASPECT_RATIO",
@@ -16,9 +19,12 @@ AUTO_HERO_BLOCKING_WARNINGS = {
 PERSISTED_ROLE_TO_MAPPER_ROLE = {
     "product_main": "product_main",
     "product_detail": "detail_closeup",
+    "feature": "detail_closeup",
     "usage_scene": "lifestyle_scene",
     "components": "package_or_components",
+    "material_detail": "detail_closeup",
     "package": "package_or_components",
+    "shipping_info": "package_or_components",
     "spec_reference": "certification",
 }
 
@@ -101,6 +107,19 @@ SECTION_ROLE_PREFERENCES: dict[str, tuple[str, ...]] = {
     "main_claim_support": ("certification", "detail_closeup", "product_main"),
     "benefit_list": ("detail_closeup", "product_main", "lifestyle_scene"),
     "features": ("detail_closeup", "product_main"),
+    # UX-2C one-click page section types. Keep the first preference specific
+    # enough that four distinct seller photos naturally land in representative,
+    # feature, usage and components/spec positions.
+    "feature_1": ("detail_closeup", "product_main"),
+    "feature_2": ("detail_closeup", "product_main"),
+    "feature_3": ("detail_closeup", "product_main"),
+    "usage_guide": ("lifestyle_scene", "detail_closeup", "product_main"),
+    "details_components": (
+        "package_or_components",
+        "detail_closeup",
+        "certification",
+        "product_main",
+    ),
     "summary_claim": ("lifestyle_scene", "product_main", "background"),
     "product_information": (
         "package_or_components",
@@ -180,6 +199,23 @@ def _section_preferences(section_type: str) -> tuple[str, ...]:
     return SECTION_ROLE_PREFERENCES.get((section_type or "").lower(), ())
 
 
+def _unique_image_assets(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep one automatic candidate per file-hash duplicate group.
+
+    A seller can still deliberately choose a duplicate in the UI, but automatic
+    placement must never fill two sections with an original and its copy.
+    """
+    selected: list[dict[str, Any]] = []
+    seen_groups: set[str] = set()
+    for asset in assets:
+        group = str(asset.get("content_hash") or f"asset:{asset.get('id')}")
+        if group in seen_groups:
+            continue
+        seen_groups.add(group)
+        selected.append(asset)
+    return selected
+
+
 def _match_score(
     section_type: str,
     asset: dict[str, Any],
@@ -213,12 +249,12 @@ def _match_score(
 def map_image_assets_to_sections(
     sections: list[dict[str, Any]], assets: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    image_assets = [
+    image_assets = _unique_image_assets([
         asset
         for asset in assets
         if str(asset.get("mime_type") or "").startswith("image/")
         and asset.get("quality_status") != "rejected"
-    ]
+    ])
     if not image_assets:
         return []
 
@@ -287,6 +323,52 @@ def map_image_assets_to_sections(
         )
         used_counts[asset_id] += 1
 
+    return assignments
+
+
+def map_with_upload_order_fallback(
+    sections: list[dict[str, Any]], assets: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Map role-aware photos, then fill remaining slots in upload order.
+
+    The fallback is intentionally deterministic and still enforces one photo
+    per section. It gives unclassified direct uploads a useful HERO-first
+    placement without weakening the role-aware result for inspected photos.
+    """
+    assignments = map_image_assets_to_sections(sections, assets)
+    assigned_section_ids = {str(item["section_id"]) for item in assignments}
+    used_asset_ids = {str(item["asset_id"]) for item in assignments}
+    remaining_assets = [
+        asset
+        for asset in _unique_image_assets(assets)
+        if str(asset.get("mime_type") or "").startswith("image/")
+        and asset.get("quality_status") != "rejected"
+        and str(asset.get("id") or "") not in used_asset_ids
+    ]
+    remaining_sections = [
+        section
+        for section in sections
+        if str(section.get("id") or "") not in assigned_section_ids
+        and str(section.get("section_type") or section.get("key") or "").lower()
+        != "product_information"
+    ]
+    for section, asset in zip(remaining_sections, remaining_assets):
+        asset_id = str(asset.get("id") or "")
+        classified = classify_image_asset(asset)
+        assignments.append(
+            {
+                "section_id": str(section.get("id") or ""),
+                "section_type": str(
+                    section.get("section_type") or section.get("key") or ""
+                ),
+                "asset_id": asset_id,
+                "filename": str(asset.get("filename") or ""),
+                "asset_role": classified.primary_role,
+                "confidence": classified.confidence,
+                "score": 1,
+                "reason": "역할 미분류 사진을 업로드 순서에 따라 빈 섹션에 제안",
+            }
+        )
     return assignments
 
 

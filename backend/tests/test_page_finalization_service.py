@@ -107,6 +107,7 @@ def test_finalize_page_creates_single_final_snapshot(db_session):
     assert final_version.sections_json["sections"][0]["image_asset_id"] == "asset-hero"
     assert final_version.sections_json["sections"][0]["visual_kind"] == "composed_product"
     assert final_version.sections_json["sections"][0]["visual_payload"]["product_fit"] == "contain"
+    assert "ux2d_content_quality" in final_version.sections_json
 
     finals = (
         db_session.query(DetailPageVersion)

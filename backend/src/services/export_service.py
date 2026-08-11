@@ -104,6 +104,7 @@ def capture_next_render_export(
     )
     zip_path = os.path.join(output_dir, f"{project_id}_{version_id}_sections.zip")
     section_paths: list[tuple[str, str]] = []
+    section_heights: list[int] = []
     browser = None
     owns_playwright = playwright is None
     playwright_manager = None
@@ -166,6 +167,8 @@ def capture_next_render_export(
                 section_options["quality"] = 92
             sections.nth(index).screenshot(**section_options)
             section_paths.append((filename, section_path))
+            with Image.open(section_path) as section_image:
+                section_heights.append(section_image.height)
 
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for filename, section_path in section_paths:
@@ -174,6 +177,9 @@ def capture_next_render_export(
         return {
             "long_vertical_image": image_path,
             "section_images_zip": zip_path,
+            # Pixel boundaries are used by the channel splitter to avoid
+            # cutting a section in half. They are not user supplied data.
+            "section_heights": section_heights,
         }
     except Exception:
         for path in [image_path, zip_path, *(path for _, path in section_paths)]:

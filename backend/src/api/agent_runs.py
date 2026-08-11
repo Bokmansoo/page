@@ -13,6 +13,8 @@ from src.services.intake_structuring_service import structure_intake
 from src.services.url_evidence_collector import collect_url_evidence
 from src.services.generation_status_service import GenerationStatusService
 from src.services.seller_fact_ingestion_service import persist_confirmed_seller_specs
+from src.agents.langgraph_runtime import configured_graph_runtime
+from src.services.brand_kit_service import snapshot_project_brand_kit
 
 
 router = APIRouter(prefix="/agent-runs", tags=["agent-runs"])
@@ -182,7 +184,12 @@ class AgentRunCreateRequest(BaseModel):
     sales_channel: Optional[str] = None
     model_options: Optional[str] = None
     desired_mood: List[str] = Field(default_factory=list)
-    planning_mode: Optional[str] = "quality"
+    # Browser intake explicitly sends the recommended `quick` mode. Missing
+    # values belong to pre-LG-7/API clients and preserve the manual gate flow.
+    planning_mode: Optional[str] = "expert"
+    # The normal UX-1 route uses the automatic pipeline. Explicit advanced
+    # review routes retain the existing evidence gates.
+    ux_auto_generate: bool = False
     force_new: bool = False
 
 
@@ -194,10 +201,11 @@ class AgentRunResponseSchema(BaseModel):
     current_stage: str
     product_input: ProductInputSchema
     outputs: Dict[str, Any] = Field(default_factory=dict)
-    planning_mode: Optional[str] = "quality"
+    planning_mode: Optional[str] = "expert"
     collection_warnings: List[str] = Field(default_factory=list)
     source_captures: List[SourceCaptureSchema] = Field(default_factory=list)
     input_guidance: List[str] = Field(default_factory=list)
+    graph_runtime: str = "legacy"
 
 
 def _capture_schema(capture: SourceCapture | dict[str, Any]) -> SourceCaptureSchema:
@@ -254,6 +262,9 @@ AGENT_STAGE_ORDER = [
     "source_collection",
     "product_understanding",
     "reference_analysis",
+    "category_classifier",
+    "prompt_pack_resolver",
+    "creative_brief_compiler",
     "sales_strategy",
     "page_planning",
     "copywriting",
@@ -428,7 +439,12 @@ def create_agent_run(
             collection_warnings.append(f"{source_url}: {exc}")
         source_capture_attempts.append(capture)
 
-    resolved_product_name = req.product_name or collected_product_name
+    project_id = str(uuid.uuid4())
+    from src.services.commerce_content_quality_service import normalize_product_name
+    resolved_product_name, name_warnings = normalize_product_name(
+        req.product_name or collected_product_name,
+        fallback_id=project_id,
+    )
 
     # Duplicate run guard: block by default, but allow the seller to intentionally
     # create a new version of the same product page.
@@ -466,9 +482,10 @@ def create_agent_run(
 
     # 2. Create ProductProject
     project = ProductProject(
+        id=project_id,
         workspace_id=workspace.id,
         brand_id=brand.id,
-        name=resolved_product_name or req.freeform_input or "Untitled product",
+        name=resolved_product_name,
         raw_input_text=req.description or req.freeform_input or "\n".join(collected_text),
         raw_input_url=req.product_url,
         status="draft",
@@ -477,10 +494,11 @@ def create_agent_run(
         category_confirmed=bool(req.category),
         category_confirmed_by=user.id if req.category else None,
         category_confirmed_at=datetime.utcnow() if req.category else None,
-        planning_mode=req.planning_mode or "quality",
+        planning_mode="expert" if (req.planning_mode or "expert") in {"expert", "quality"} else "quick",
         intake_snapshot={
             "input_bundle": {
                 "product_name": resolved_product_name,
+                "product_name_warnings": name_warnings,
                 "category": req.category,
                 "description": req.description,
                 "feature_details": req.feature_details,
@@ -499,6 +517,8 @@ def create_agent_run(
         },
     )
     db.add(project)
+    db.flush()
+    snapshot_project_brand_kit(db, project)
     db.commit()
     db.refresh(project)
 
@@ -575,6 +595,8 @@ def create_agent_run(
             "url_specs": collected_specs,
             "reference_text_blocks": collected_text,
             "source_collection_warnings": collection_warnings,
+            "ux_auto_generate": req.ux_auto_generate,
+            "interaction_mode": "expert" if (req.planning_mode or "expert") in {"expert", "quality"} else "quick",
         },
         outputs_json={},
         cost_approval_status="not_required",
@@ -612,6 +634,7 @@ def create_agent_run(
         collection_warnings=collection_warnings,
         source_captures=[_capture_schema(capture) for capture in source_capture_attempts],
         input_guidance=_input_guidance(source_capture_attempts),
+        graph_runtime=configured_graph_runtime(),
     )
 
 
@@ -726,11 +749,31 @@ def run_mock(
     db: Session = Depends(get_db),
     auth_ctx: dict = Depends(get_current_user_and_workspace),
 ):
-    from src.services.agent_run_service import AgentRunService
+    from src.services.agent_run_service import (
+        AgentRunService,
+        AssetUnderstandingNotReady,
+        FactEvidenceNotReady,
+    )
     workspace = auth_ctx["workspace"]
 
     try:
         run = AgentRunService.run_mock(id, workspace.id, db)
+    except AssetUnderstandingNotReady as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "asset_understanding_not_ready", "blockers": e.blockers},
+        )
+    except FactEvidenceNotReady as e:
+        target_run = db.query(AgentRun).filter(AgentRun.id == id).first()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "fact_evidence_not_ready",
+                "message": "사실·증거 확인을 완료한 뒤 상세페이지 생성을 다시 실행해 주세요.",
+                "blockers": e.blockers,
+                "review_url": f"/workspace/projects/{target_run.project_id}/facts" if target_run else None,
+            },
+        )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -769,11 +812,31 @@ def run_real(
     db: Session = Depends(get_db),
     auth_ctx: dict = Depends(get_current_user_and_workspace),
 ):
-    from src.services.agent_run_service import AgentRunService
+    from src.services.agent_run_service import (
+        AgentRunService,
+        AssetUnderstandingNotReady,
+        FactEvidenceNotReady,
+    )
     workspace = auth_ctx["workspace"]
 
     try:
         run = AgentRunService.run_real_text(id, workspace.id, db)
+    except AssetUnderstandingNotReady as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "asset_understanding_not_ready", "blockers": e.blockers},
+        )
+    except FactEvidenceNotReady as e:
+        target_run = db.query(AgentRun).filter(AgentRun.id == id).first()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "fact_evidence_not_ready",
+                "message": "사실·증거 확인을 완료한 뒤 상세페이지 생성을 다시 실행해 주세요.",
+                "blockers": e.blockers,
+                "review_url": f"/workspace/projects/{target_run.project_id}/facts" if target_run else None,
+            },
+        )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 

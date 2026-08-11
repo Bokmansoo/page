@@ -226,3 +226,179 @@ def test_approve_planning_draft_uses_product_cutout_as_generation_reference(clie
         .one()
     )
     assert spec.visual_kind == "html_graphic"
+
+
+def test_approve_planning_draft_can_create_text_first_page_while_storyboard_images_wait(
+    client, db_session, tmp_path
+):
+    """A seller can finish the page structure before a paid image API is available."""
+    from src.services.storyboard_image_generation_service import prepare_storyboard_jobs
+
+    user = User(
+        id="planning-pending-user",
+        email="pending@example.com",
+        name="Pending Planning User",
+    )
+    workspace = Workspace(
+        id="planning-pending-workspace",
+        name="Pending Planning Workspace",
+        owner_id=user.id,
+    )
+    brand = Brand(id="planning-pending-brand", workspace_id=workspace.id, name="Pending Brand")
+    reference_path = tmp_path / "pending-reference.png"
+    reference_path.write_bytes(b"pending-reference")
+    detail_path = tmp_path / "pending-detail.png"
+    detail_path.write_bytes(b"pending-detail")
+    project = ProductProject(
+        id="planning-pending-project",
+        workspace_id=workspace.id,
+        brand_id=brand.id,
+        name="Pending image product",
+        category="living",
+        status="draft",
+        planning_draft={
+            "status": "approved",
+            "cards": [
+                {
+                    "id": "pending-hero",
+                    "type": "hero",
+                    "title": "Product hero",
+                    "bullets": ["Review the product details before purchase."],
+                    "visual_strategy": "image_overlay",
+                    "image_requirement": "ai_redesign_required",
+                    "candidate_asset_ids": ["pending-reference"],
+                    "source_fact_ids": [],
+                    "sort_order": 0,
+                    "is_enabled": True,
+                },
+                {
+                    "id": "pending-target",
+                    "type": "target_customer",
+                    "title": "Comfort at home",
+                    "bullets": ["Use the product in a calm home setting."],
+                    "visual_strategy": "lifestyle_image",
+                    "image_requirement": "ai_redesign_required",
+                    "candidate_asset_ids": ["pending-reference"],
+                    "source_fact_ids": [],
+                    "sort_order": 1,
+                    "is_enabled": True,
+                },
+                {
+                    "id": "pending-features",
+                    "type": "features",
+                    "title": "Verified feature",
+                    "bullets": ["Review the product details before purchase."],
+                    "visual_strategy": "image_overlay",
+                    "image_requirement": "ai_redesign_required",
+                    "candidate_asset_ids": ["pending-reference"],
+                    "source_fact_ids": [],
+                    "sort_order": 2,
+                    "is_enabled": True,
+                },
+                {
+                    "id": "pending-spec",
+                    "type": "specifications",
+                    "title": "Product information",
+                    "bullets": ["Check the supplied product information."],
+                    "visual_strategy": "text_only",
+                    "source_fact_ids": [],
+                    "sort_order": 3,
+                    "is_enabled": True,
+                },
+            ],
+        },
+    )
+    reference = Asset(
+        id="pending-reference",
+        project_id=project.id,
+        source_type="sourced",
+        usage_status="reference_only",
+        filename="pending-reference.png",
+        file_path=str(reference_path),
+        mime_type="image/png",
+        file_size=reference_path.stat().st_size,
+        asset_role="product_main",
+    )
+    detail = Asset(
+        id="pending-detail",
+        project_id=project.id,
+        source_type="sourced",
+        usage_status="reference_only",
+        filename="pending-detail.png",
+        file_path=str(detail_path),
+        mime_type="image/png",
+        file_size=detail_path.stat().st_size,
+        asset_role="product_detail",
+    )
+    db_session.add_all([user, workspace, brand, project, reference, detail])
+    db_session.commit()
+    prepare_storyboard_jobs(project, db_session)
+
+    response = client.post(
+        "/api/v1/projects/planning-pending-project/planning-draft/approve",
+        headers={
+            "X-Mock-User-Id": user.id,
+            "X-Mock-Workspace-Id": workspace.id,
+        },
+        json={"allow_pending_images": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["image_job_count"] == 0
+    page = db_session.query(ProductPage).filter(ProductPage.project_id == project.id).one()
+    hero = (
+        db_session.query(PageSection)
+        .filter(PageSection.page_id == page.id, PageSection.section_type == "hero")
+        .one()
+    )
+    assert hero.image_asset_id is None
+    assert hero.visual_kind == "html_graphic"
+    assert hero.visual_payload["image_generation_pending"] is True
+    target = (
+        db_session.query(PageSection)
+        .filter(PageSection.page_id == page.id, PageSection.section_type == "target_customer")
+        .one()
+    )
+    assert target.image_asset_id is None
+    assert target.visual_kind == "html_graphic"
+    assert target.visual_payload["image_generation_pending"] is True
+    features = (
+        db_session.query(PageSection)
+        .filter(PageSection.page_id == page.id, PageSection.section_type == "features")
+        .one()
+    )
+    assert features.body_copy == ""
+    assert features.visual_payload["image_generation_pending"] is True
+
+    # Simulate the later, seller-approved provider result.  It must upgrade
+    # the already assembled page instead of requiring another page rebuild.
+    generated_path = tmp_path / "approved-later.png"
+    generated_path.write_bytes(b"approved-later")
+    generated_asset = Asset(
+        id="pending-approved-output",
+        project_id=project.id,
+        source_type="ai_generated",
+        usage_status="ai_generated",
+        filename="approved-later.png",
+        file_path=str(generated_path),
+        mime_type="image/png",
+        file_size=generated_path.stat().st_size,
+    )
+    storyboard_job = (
+        db_session.query(ImageGenerationJobRecord)
+        .filter(ImageGenerationJobRecord.project_id == project.id)
+        .one()
+    )
+    storyboard_job.provider = "openai"
+    storyboard_job.status = "needs_review"
+    storyboard_job.output_asset_id = generated_asset.id
+    db_session.add(generated_asset)
+    db_session.commit()
+
+    from src.services.storyboard_image_generation_service import approve_storyboard_job
+
+    approve_storyboard_job(project, storyboard_job.job_id, db_session)
+    db_session.refresh(hero)
+    assert hero.image_asset_id == generated_asset.id
+    assert hero.visual_kind == "image"
+    assert hero.visual_payload["image_generation_pending"] is False

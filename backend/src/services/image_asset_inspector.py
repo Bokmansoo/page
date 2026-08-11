@@ -20,10 +20,18 @@ from src.db.models import Asset
 ROLE_VALUES = {
     "product_main",
     "product_detail",
+    "product_component",
+    "product_in_use",
+    "feature",
     "usage_scene",
     "components",
+    "material_detail",
     "package",
+    "shipping_info",
     "spec_reference",
+    "supplier_banner",
+    "decorative",
+    "unidentifiable_reference",
     "unknown",
 }
 QUALITY_VALUES = {"usable", "warning", "rejected"}
@@ -55,16 +63,43 @@ def recommend_asset_role(
     ocr_text: str = "",
 ) -> tuple[str, float]:
     """Recommend a Sprint 2 role from stable, explainable local signals."""
+    # Tesseract often inserts spaces between individual CJK characters. Use a
+    # compact OCR view for semantic classification while preserving the exact
+    # OCR text and coordinates in the inspection record.
+    compact_ocr = "".join((ocr_text or "").lower().split())
+    semantic_ocr_rules = (
+        (
+            "spec_reference",
+            ("产品参数", "额定电压", "额定功率", "电池容量", "工作时间", "充电时间", "使用时间"),
+        ),
+        ("material_detail", ("面料", "布料", "材质", "触感柔软", "空气层")),
+        ("usage_scene", ("随时随地享受按摩", "让睡眠更轻松", "使用场景")),
+        (
+            "feature",
+            ("加热", "恒温", "档位调节", "角度自在选择", "调节头枕", "按摩体验", "一键启动"),
+        ),
+        ("product_detail", ("充电口", "type-c", "按键", "按钮")),
+    )
+    for role, keywords in semantic_ocr_rules:
+        hits = sum(keyword in compact_ocr for keyword in keywords)
+        if hits:
+            return role, round(min(0.95, 0.65 + hits * 0.1), 2)
+
     # Local temporary directories can contain accidental keywords such as
     # "inspector". Only a remote URL is a meaningful path-level signal.
     path_signal = file_path if file_path.startswith(("http://", "https://")) else ""
     text = " ".join((filename or "", source_type or "", path_signal, ocr_text or "")).lower()
     rules = (
-        ("spec_reference", ("spec", "dimension", "manual", "label", "chart", "인증", "스펙", "규격", "설명서")),
+        ("supplier_banner", ("banner", "logo", "watermark", "supplier", "广告", "店铺", "供应商")),
+        ("shipping_info", ("shipping", "delivery", "carton", "cbm", "物流", "包装数量", "배송", "출고")),
+        ("spec_reference", ("spec", "dimension", "manual", "label", "chart", "产品参数", "额定电压", "额定功率", "电池容量", "规格", "인증", "스펙", "규격", "설명서")),
         ("components", ("component", "accessory", "parts", "attachment", "구성품", "부속", "액세서리")),
         ("package", ("package", "packaging", "box", "unbox", "패키지", "박스", "포장")),
-        ("product_detail", ("detail", "closeup", "close-up", "macro", "feature", "button", "head", "디테일", "근접", "기능")),
-        ("usage_scene", ("lifestyle", "usage", "use", "scene", "room", "outdoor", "사용", "연출", "장면", "거실", "야외")),
+        ("material_detail", ("material", "fabric", "texture", "材质", "面料", "触感", "소재", "원단", "질감")),
+        ("usage_scene", ("lifestyle", "usage", "scene", "room", "outdoor", "睡眠", "享受按摩", "使用场景", "사용", "연출", "장면", "거실", "야외")),
+        ("feature", ("feature", "heating", "adjust", "按摩头", "加热", "调节", "正转", "反转", "온열", "각도", "기능")),
+        ("product_detail", ("detail", "closeup", "close-up", "macro", "button", "type-c", "充电口", "按键", "head", "디테일", "근접", "조작")),
+        ("decorative", ("decoration", "ornament", "pattern", "장식", "패턴")),
         ("product_main", ("main", "hero", "front", "product", "대표", "정면", "상품", "제품")),
     )
     for role, keywords in rules:
@@ -190,7 +225,12 @@ def apply_asset_inspection(asset: Asset, db: Session, *, preserve_manual_role: b
         asset.role_confidence = inspection.role_confidence
         asset.role_source = "auto"
     asset.quality_status = inspection.quality_status
-    asset.identity_status = inspection.identity_status
+    if not (
+        asset.identity_status == "confirmed"
+        and asset.is_representative
+        and asset.representative_source == "manual"
+    ):
+        asset.identity_status = inspection.identity_status
     asset.width = inspection.width
     asset.height = inspection.height
     asset.image_format = inspection.image_format
@@ -231,10 +271,16 @@ def refresh_representative_product_asset(project_id: str, db: Session) -> Asset 
         "product_main": 4,
         "unknown": 3,
         "product_detail": 2,
+        "feature": 2,
         "usage_scene": 1,
         "components": 0,
+        "material_detail": 1,
         "package": 0,
+        "shipping_info": 0,
         "spec_reference": 0,
+        "supplier_banner": 0,
+        "decorative": 0,
+        "unidentifiable_reference": 0,
     }
 
     def rank(asset: Asset) -> tuple[int, int, int, float]:

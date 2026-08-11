@@ -126,6 +126,126 @@ def test_readiness_blocks_invalid_html_layout():
     assert any(b.code == "visual_invalid_html_layout" for b in result.blockers)
 
 
+def test_readiness_blocks_active_seller_action_checklist():
+    page = SimpleNamespace(
+        project_id="project-1",
+        sections=[
+            _section(
+                id="seller-actions",
+                section_type="pre_purchase",
+                visual_kind="html_graphic",
+                visual_payload={
+                    "layout_variant": "checklist",
+                    "items": [{
+                        "kind": "seller_action",
+                        "text": "상품 사진을 추가해 주세요.",
+                        "verification_status": "action_required",
+                        "source_fact_ids": [],
+                    }],
+                },
+                image_asset_id=None,
+                sort_order=0,
+            ),
+            _section(
+                id="spec",
+                section_type="specifications",
+                visual_kind="html_graphic",
+                visual_payload={
+                    "layout_variant": "spec_table",
+                    "table_rows": [{
+                        "label": "모델",
+                        "value": "기준 모델",
+                        "verification_status": "confirmed",
+                        "source_fact_ids": ["fact-model"],
+                    }],
+                },
+                image_asset_id=None,
+                sort_order=1,
+            ),
+        ],
+    )
+
+    result = inspect_page_readiness(page)
+
+    assert result.ready is False
+    assert any(item.code == "seller_action_required" for item in result.blockers)
+
+
+def test_readiness_blocks_hidden_ai_redesign_requirement():
+    page = SimpleNamespace(
+        project_id="project-1",
+        sections=[
+            _section(
+                id="hidden-cta",
+                section_type="cta",
+                is_visible=False,
+                visual_kind="image",
+                visual_payload={"missing_state": "ai_redesign_required"},
+                image_asset_id=None,
+                sort_order=0,
+            ),
+            _section(
+                id="spec",
+                section_type="specifications",
+                visual_kind="html_graphic",
+                visual_payload={
+                    "layout_variant": "spec_table",
+                    "table_rows": [{
+                        "label": "모델",
+                        "value": "기준 모델",
+                        "verification_status": "confirmed",
+                        "source_fact_ids": ["fact-model"],
+                    }],
+                },
+                image_asset_id=None,
+                sort_order=1,
+            ),
+        ],
+    )
+
+    result = inspect_page_readiness(page)
+
+    assert result.ready is False
+    assert any(item.code == "ai_redesign_required" for item in result.blockers)
+
+
+def test_readiness_requires_a_reviewed_hero_visual():
+    page = SimpleNamespace(
+        project_id="project-1",
+        sections=[
+            _section(
+                id="hero",
+                section_type="hero",
+                visual_kind="html_graphic",
+                visual_payload={"layout_variant": "hero_overlay"},
+                image_asset_id=None,
+                sort_order=0,
+            ),
+            _section(
+                id="spec",
+                section_type="specifications",
+                visual_kind="html_graphic",
+                visual_payload={
+                    "layout_variant": "spec_table",
+                    "table_rows": [{
+                        "label": "모델",
+                        "value": "기준 모델",
+                        "verification_status": "confirmed",
+                        "source_fact_ids": ["fact-model"],
+                    }],
+                },
+                image_asset_id=None,
+                sort_order=1,
+            ),
+        ],
+    )
+
+    result = inspect_page_readiness(page)
+
+    assert result.ready is False
+    assert any(item.code == "hero_visual_required" for item in result.blockers)
+
+
 def test_readiness_blocks_generated_image_awaiting_identity_review(db_session):
     user = User(id="readiness-user", email="readiness@test.com", name="Readiness User")
     workspace = Workspace(id="readiness-ws", name="Readiness WS", owner_id=user.id)

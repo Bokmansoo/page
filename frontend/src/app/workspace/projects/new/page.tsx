@@ -33,9 +33,8 @@ export default function NewProjectPage() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-Mock-User-Id": localStorage.getItem("X-Mock-User-Id") || "00000000-0000-0000-0000-000000000001",
-          "X-Mock-Workspace-Id": localStorage.getItem("X-Mock-Workspace-Id") || "00000000-0000-0000-0000-000000000002"
         },
+        credentials: "include",
         body: JSON.stringify({
           name: projectName,
           brand_id: brandId,
@@ -97,17 +96,13 @@ export default function NewProjectPage() {
 
     try {
       setIsSubmitting(true);
-      const uid = localStorage.getItem("X-Mock-User-Id") || "00000000-0000-0000-0000-000000000001";
-      const wid = localStorage.getItem("X-Mock-Workspace-Id") || "00000000-0000-0000-0000-000000000002";
-
       // 1. Create project
       const projectRes = await fetch("http://localhost:8000/api/v1/projects", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-Mock-User-Id": uid,
-          "X-Mock-Workspace-Id": wid
         },
+        credentials: "include",
         body: JSON.stringify({
           name: projectName,
           brand_id: brandId,
@@ -132,10 +127,7 @@ export default function NewProjectPage() {
 
         const uploadRes = await fetch("http://localhost:8000/api/v1/files/upload", {
           method: "POST",
-          headers: {
-            "X-Mock-User-Id": uid,
-            "X-Mock-Workspace-Id": wid
-          },
+          credentials: "include",
           body: formData
         });
 

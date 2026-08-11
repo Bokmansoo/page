@@ -1,5 +1,6 @@
 from src.agents.nodes.base import AgentNode
 from src.agents.state import AgentRunState
+from typing import Any
 from src.services.commerce_policy import (
     FINAL_OUTPUT_ASSET_STATUSES,
     initial_asset_usage_status,
@@ -163,4 +164,11 @@ class SourceCollectionAgent(AgentNode):
             "source_summary": source_summary
         }
         return state
+
+    def run_delta(self, *, run_id: str, project_id: str, input_snapshot: dict[str, Any]) -> dict[str, Any]:
+        """LG-2 adapter using the established asset/source domain boundary."""
+
+        from src.services.langgraph_discovery_service import collect_discovery_sources
+
+        return collect_discovery_sources(run_id=run_id, project_id=project_id, input_snapshot=input_snapshot)
 

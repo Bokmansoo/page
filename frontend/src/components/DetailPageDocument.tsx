@@ -31,6 +31,8 @@ export interface DetailPageSection {
   sort_order: number;
   is_visible?: boolean;
   image_candidates?: DetailPageImageCandidate[];
+  associated_fact_ids?: string[];
+  associated_fact_texts?: string[];
 }
 
 export interface DetailPageData {
@@ -53,6 +55,13 @@ interface DetailPageDocumentProps {
   page: DetailPageData;
   assets: DetailPageAsset[];
   exportMode?: boolean;
+  editingSectionId?: string | null;
+  inlineDraft?: { title: string; body_copy: string } | null;
+  inlineSaving?: boolean;
+  onStartInlineEdit?: (section: DetailPageSection) => void;
+  onInlineDraftChange?: (field: "title" | "body_copy", value: string) => void;
+  onSaveInlineEdit?: () => void;
+  onCancelInlineEdit?: () => void;
 }
 
 function sourceLabel(sourceType: string): string {
@@ -175,10 +184,23 @@ function FormattedBodyCopy({ body, className }: { body: string; className: strin
   );
 }
 
-export default function DetailPageDocument({ page, assets, exportMode = false }: DetailPageDocumentProps) {
+export default function DetailPageDocument({
+  page, assets, exportMode = false, editingSectionId, inlineDraft, inlineSaving = false,
+  onStartInlineEdit, onInlineDraftChange, onSaveInlineEdit, onCancelInlineEdit,
+}: DetailPageDocumentProps) {
   const [exportErrors, setExportErrors] = useState<string[]>([]);
   const visibleSections = page.sections
     .filter((section) => section.is_visible !== false)
+    .filter((section) => {
+      if (section.section_type !== "pre_purchase") return true;
+      const payload = (section.visual_payload || {}) as Record<string, unknown>;
+      const items = Array.isArray(payload.items) ? payload.items : [];
+      return !items.some((item) => {
+        if (!item || typeof item !== "object") return false;
+        const record = item as Record<string, unknown>;
+        return record.kind === "seller_action" || record.verification_status === "action_required";
+      });
+    })
     .sort((a, b) => a.sort_order - b.sort_order);
 
   useEffect(() => {
@@ -238,22 +260,58 @@ export default function DetailPageDocument({ page, assets, exportMode = false }:
         const isImage = visualKind === "image";
         const isComposedProduct = visualKind === "composed_product";
         const visualIssues = validateSectionVisual(section as unknown as DetailPageSectionVisual);
+        const payload = (section.visual_payload || {}) as Record<string, unknown>;
+        const layoutVariant = payload.layout_variant as string | undefined;
+        const isStructuredHtmlGraphic =
+          isHtmlGraphic &&
+          new Set([
+            "comparison_cards",
+            "benefit_cards",
+            "numeric_highlights",
+            "spec_table",
+            "steps",
+            "checklist",
+          ]).has(layoutVariant || "");
+        const isInlineEditing = !exportMode && section.id === editingSectionId && inlineDraft;
 
         return (
           <section
             key={section.id || `${section.section_type}-${index}`}
+            id={section.id ? `section-${section.id}` : undefined}
             className={theme.section}
             data-detail-page-section="true"
           >
+            {!exportMode && onStartInlineEdit ? (
+              <div className="mb-3 flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => onStartInlineEdit(section)}
+                  className="rounded-md border border-current/20 bg-white/80 px-2.5 py-1 text-[11px] font-bold text-emerald-800 shadow-sm"
+                >
+                  문구 수정
+                </button>
+              </div>
+            ) : null}
             {!isComposedProduct ? (
               <>
                 <p className={`text-[11px] font-extrabold uppercase ${theme.eyebrow}`}>
                   {section.section_type.replace("_", " ")}
                 </p>
-                <h3 className={`mx-auto mt-3 max-w-2xl text-2xl font-extrabold leading-snug sm:text-3xl ${theme.title}`}>
-                  {title}
-                </h3>
-                <FormattedBodyCopy body={body} className={theme.body} />
+                {isInlineEditing ? (
+                  <div className="mx-auto mt-3 max-w-2xl rounded-xl border border-emerald-300 bg-white p-4 text-left shadow-lg">
+                    <label className="block text-xs font-bold text-slate-700">제목<input value={inlineDraft.title} onChange={(event) => onInlineDraftChange?.("title", event.target.value)} className="mt-1 w-full rounded border border-slate-300 px-3 py-2 text-base font-bold text-slate-900" /></label>
+                    <label className="mt-3 block text-xs font-bold text-slate-700">본문<textarea value={inlineDraft.body_copy} onChange={(event) => onInlineDraftChange?.("body_copy", event.target.value)} className="mt-1 min-h-24 w-full rounded border border-slate-300 px-3 py-2 text-sm leading-6 text-slate-800" /></label>
+                    {section.associated_fact_texts?.length ? <div className="mt-3 rounded bg-emerald-50 p-2 text-[11px] leading-5 text-emerald-950">연결된 사실: {section.associated_fact_texts.join(" · ")}</div> : <p className="mt-3 text-[11px] text-slate-500">이 문구에는 연결된 수치 사실이 없습니다.</p>}
+                    <div className="mt-3 flex justify-end gap-2"><button type="button" onClick={onCancelInlineEdit} className="rounded border border-slate-300 px-3 py-2 text-xs font-bold text-slate-700">취소</button><button type="button" disabled={inlineSaving} onClick={onSaveInlineEdit} className="rounded bg-emerald-600 px-3 py-2 text-xs font-bold text-white disabled:bg-slate-300">{inlineSaving ? "저장 중…" : "저장"}</button></div>
+                  </div>
+                ) : (
+                  <h3 className={`mx-auto mt-3 max-w-2xl text-2xl font-extrabold leading-snug sm:text-3xl ${theme.title}`}>
+                    {title}
+                  </h3>
+                )}
+                {!isInlineEditing && !isStructuredHtmlGraphic ? (
+                  <FormattedBodyCopy body={body} className={theme.body} />
+                ) : null}
               </>
             ) : null}
             {isComposedProduct ? (

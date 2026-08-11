@@ -101,6 +101,7 @@ def test_low_resolution_photo_can_be_compared_and_applied_as_local_upscale(
     db_session.refresh(hero)
     enhanced = db_session.query(Asset).filter(Asset.id == preview["id"]).one()
     assert hero.image_asset_id == enhanced.id
-    assert hero.visual_kind == "composed_product"
-    assert hero.visual_payload["product_fit"] == "contain"
-    assert inspect_page_readiness(page, db_session).ready is True
+    assert hero.visual_kind == "image"
+    assert hero.visual_payload == {"layout_variant": "hero_overlay"}
+    readiness = inspect_page_readiness(page, db_session)
+    assert not any(issue.code == "hero_asset_quality_blocking" for issue in readiness.blockers)

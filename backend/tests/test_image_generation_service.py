@@ -26,6 +26,17 @@ def generate_dummy_png(color="red", size=(512, 512)):
     return buf.getvalue()
 
 
+def generate_redesigned_png(color="red", size=(512, 512)):
+    """Keep product colour while changing the composition from the reference."""
+    img = Image.new("RGB", size, color=color)
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([220, 220, 360, 360], fill="blue" if color == "red" else "red")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 @pytest.fixture
 def db_setup(db_session):
     user = User(email="test_service@example.com", name="Service Tester")
@@ -136,7 +147,7 @@ def test_execute_image_generation_success(db_session, db_setup):
     # Mock Provider
     mock_provider = MagicMock()
     mock_result = ImageGenerationResult(
-        content=generate_dummy_png(color="red"), # matches ref color!
+        content=generate_redesigned_png(color="red"), # keeps colour but changes layout
         mime_type="image/png",
         provider="openai",
         model="gpt-image-1.5",
@@ -153,6 +164,7 @@ def test_execute_image_generation_success(db_session, db_setup):
     assert record.error_code is None
     assert record.output_asset_id is not None
     assert record.warnings is None or len(record.warnings) == 0
+    assert record.actual_cost == 0.04
 
     # Verify output asset was registered
     out_asset = db_session.query(Asset).filter(Asset.id == record.output_asset_id).first()
@@ -179,7 +191,7 @@ def test_execute_image_generation_color_drift_warning(db_session, db_setup):
     # Mock Provider returning a BLUE image (differs from RED source image)
     mock_provider = MagicMock()
     mock_result = ImageGenerationResult(
-        content=generate_dummy_png(color="blue"),
+        content=generate_redesigned_png(color="blue"),
         mime_type="image/png",
         provider="openai",
         model="gpt-image-1.5",
@@ -215,7 +227,7 @@ def test_execute_image_generation_rejection_identity_gate(db_session, db_setup):
 
     mock_provider = MagicMock()
     mock_result = ImageGenerationResult(
-        content=generate_dummy_png(color="red"),
+        content=generate_redesigned_png(color="red"),
         mime_type="image/png",
         provider="openai",
         model="gpt-image-1.5",
@@ -283,7 +295,7 @@ def test_execute_retries_one_transient_provider_failure(db_session, db_setup):
     mock_provider.generate.side_effect = [
         RuntimeError("RATE_LIMIT_EXCEEDED"),
         ImageGenerationResult(
-            content=generate_dummy_png(color="red"),
+            content=generate_redesigned_png(color="red"),
             mime_type="image/png",
             provider="openai",
             model="gpt-image-1.5",
@@ -300,6 +312,11 @@ def test_execute_retries_one_transient_provider_failure(db_session, db_setup):
 
     assert record.status == "needs_review"
     assert mock_provider.generate.call_count == 2
+    assert [item["status"] for item in record.usage_metadata["attempt_history"]] == [
+        "failed",
+        "needs_review",
+    ]
+    assert record.usage_metadata["attempt_history"][0]["error_code"] == "RATE_LIMIT_EXCEEDED"
 
     output = db_session.query(Asset).filter(Asset.id == record.output_asset_id).first()
     if output and os.path.exists(output.file_path):
@@ -335,7 +352,7 @@ def test_negative_exclusion_prompt_does_not_trigger_identity_rejection(db_sessio
 
     mock_provider = MagicMock()
     mock_provider.generate.return_value = ImageGenerationResult(
-        content=generate_dummy_png(color="red"),
+        content=generate_redesigned_png(color="red"),
         mime_type="image/png",
         provider="openai",
         model="gpt-image-1.5",
@@ -350,6 +367,36 @@ def test_negative_exclusion_prompt_does_not_trigger_identity_rejection(db_sessio
     )
 
     assert record.status == "needs_review"
+
+
+def test_generated_price_or_market_text_is_blocked(db_session, db_setup, monkeypatch):
+    from src.services import asset_understanding_service
+
+    project = db_setup["project"]
+    monkeypatch.setattr(
+        asset_understanding_service,
+        "extract_ocr_blocks",
+        lambda _asset: ([{"text": "쿠팡 특가 39,900원"}], "test_ocr"),
+    )
+    mock_provider = MagicMock()
+    mock_provider.generate.return_value = ImageGenerationResult(
+        content=generate_redesigned_png(color="red"),
+        mime_type="image/png",
+        provider="openai",
+        model="gpt-image-1.5",
+    )
+
+    record = execute_image_generation(
+        project.id, "job-service-1", db_session, cost_approved=True, provider_override=mock_provider
+    )
+
+    assert record.status == "blocked"
+    assert record.error_code == "UNSAFE_GENERATED_CONTENT_DETECTED"
+    assert set(record.validation_result["risk_codes"]) >= {"price_exposed", "market_or_competitor_text"}
+    output = db_session.query(Asset).filter(Asset.id == record.output_asset_id).first()
+    assert output.quality_status == "rejected"
+    if output and os.path.exists(output.file_path):
+        os.remove(output.file_path)
 
     output = db_session.query(Asset).filter(Asset.id == record.output_asset_id).first()
     if output and os.path.exists(output.file_path):

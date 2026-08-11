@@ -73,8 +73,55 @@ def inspect_page_readiness(
 
     for section in all_sections:
         sec_id = section.id
+        payload = section.visual_payload or {}
+
+        # Seller-action checklists belong to the review UI, never to a page
+        # that is presented as export-ready.  A hidden, already-resolved stale
+        # checklist does not block; an active one does.
+        if getattr(section, "is_visible", True) and section.section_type == "pre_purchase":
+            action_items = [
+                item
+                for item in payload.get("items", [])
+                if isinstance(item, dict)
+                and (
+                    item.get("kind") == "seller_action"
+                    or item.get("verification_status") == "action_required"
+                )
+            ]
+            if action_items:
+                blockers.append(
+                    ReadinessIssue(
+                        section_id=sec_id,
+                        code="seller_action_required",
+                        message="Complete the seller review checklist before export.",
+                    )
+                )
+
         if not getattr(section, "is_visible", True):
+            # Hiding a required section must not make an unfinished visual job
+            # disappear from readiness.  It remains blocked until generation
+            # and review produce a final-output-eligible asset.
+            if payload.get("missing_state") == "ai_redesign_required":
+                blockers.append(
+                    ReadinessIssue(
+                        section_id=sec_id,
+                        code="ai_redesign_required",
+                        message="Generate and review the hidden section visual before export.",
+                    )
+                )
             continue
+
+        if section.section_type == "hero" and (
+            section.visual_kind not in {"image", "composed_product"}
+            or not section.image_asset_id
+        ) and not (section.visual_kind == "html_graphic" and payload.get("mock_safe_hero")):
+            blockers.append(
+                ReadinessIssue(
+                    section_id=sec_id,
+                    code="hero_visual_required",
+                    message="A reviewed final-output product image is required for the HERO section.",
+                )
+            )
 
         if db is not None and section.associated_fact_ids:
             linked_unapproved = db.query(ProductFact).filter(
@@ -140,7 +187,14 @@ def inspect_page_readiness(
                             )
                         )
                     else:
-                        if re.search(r"[\u4e00-\u9fff]", asset.ocr_text or ""):
+                        acknowledgements = (payload.get("ux2d_quality_acknowledgements") or [])
+                        foreign_text_acknowledged = any(
+                            isinstance(item, dict)
+                            and item.get("code") == "foreign_text_exposed"
+                            and item.get("asset_id") == asset.id
+                            for item in acknowledgements
+                        )
+                        if re.search(r"[\u4e00-\u9fff]", asset.ocr_text or "") and not foreign_text_acknowledged:
                             blockers.append(
                                 ReadinessIssue(
                                     section_id=sec_id,
@@ -154,6 +208,7 @@ def inspect_page_readiness(
                         if (
                             section.section_type == "hero"
                             and HERO_BLOCKING_WARNINGS.intersection(quality_warnings)
+                            and not payload.get("low_quality_hero_confirmed")
                         ):
                             blockers.append(
                                 ReadinessIssue(
@@ -177,7 +232,7 @@ def inspect_page_readiness(
         # reference-only source photos must not be exported as a visually empty
         # final detail page.  The seller needs an approved redesigned asset (or
         # an owned/authorized product image) for the affected section.
-        if db is not None and (section.visual_payload or {}).get("missing_state") == "ai_redesign_required":
+        if db is not None and payload.get("missing_state") == "ai_redesign_required":
             blockers.append(
                 ReadinessIssue(
                     section_id=sec_id,

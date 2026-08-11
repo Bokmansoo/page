@@ -59,12 +59,7 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const uid = typeof window !== "undefined" ? localStorage.getItem("X-Mock-User-Id") || "00000000-0000-0000-0000-000000000001" : "00000000-0000-0000-0000-000000000001";
-  const wid = typeof window !== "undefined" ? localStorage.getItem("X-Mock-Workspace-Id") || "00000000-0000-0000-0000-000000000002" : "00000000-0000-0000-0000-000000000002";
-
   const headers = {
-    "X-Mock-User-Id": uid,
-    "X-Mock-Workspace-Id": wid,
     "Content-Type": "application/json",
   };
 
@@ -267,6 +262,9 @@ export default function SettingsPage() {
         <p className="text-slate-400 text-sm mt-1">
           다중 브랜드 자산 프로필, 팀원 초대 권한 제어 및 SaaS 사용량 제한 가드레일을 관리합니다.
         </p>
+        <a href="/workspace/settings/intelligence" className="mt-4 inline-flex rounded-lg bg-violet-600 px-4 py-2 text-sm font-semibold text-white">
+          Prompt Intelligence · Brand Kit 관리
+        </a>
       </div>
 
       {error && (

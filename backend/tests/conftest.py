@@ -2,6 +2,7 @@ import sys
 import os
 import tempfile
 import uuid
+from pathlib import Path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 
 import pytest
@@ -18,7 +19,29 @@ from src.config import settings
 settings.OPENAI_API_KEY = None
 settings.GEMINI_API_KEY = None
 settings.ANTHROPIC_API_KEY = None
+# Tests must not inherit a developer's local rollout flag. Individual LG-2/
+# LG-3 fixtures explicitly enable the compiled migration graph they exercise.
+settings.SELLFORM_GRAPH_RUNTIME = "legacy"
+settings.SELLFORM_IMAGE_WORKER_ENABLED = False
 settings.SELLFORM_FIGMA_PLUGIN_TICKET_SECRET = "test-only-figma-plugin-secret-32-chars"
+# Legacy header identities remain available only inside this explicit test
+# fixture; deployed and normal local browser traffic use server sessions.
+settings.SELLFORM_AUTH_MODE = "test"
+settings.SELLFORM_AUTH_ALLOW_TEST_MOCK = True
+
+
+def pytest_sessionstart(session):
+    """Give each Windows test run an isolated, caller-owned ``tmp_path`` root.
+
+    Pytest's default base path is shared by all runs for the user.  A stale
+    directory left by another account or process then makes pytest fail during
+    fixture setup before the test itself can run.  A unique base directory is
+    created by the process running pytest, avoiding both the stale profile
+    directory and concurrent-run cleanup races.
+    """
+    session.config._tmp_path_factory._given_basetemp = Path(tempfile.gettempdir()) / (
+        f"sellform-pytest-{os.getpid()}-{uuid.uuid4().hex}"
+    )
 
 # Setup a clean temporary SQLite database for testing.
 #

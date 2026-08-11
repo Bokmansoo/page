@@ -58,6 +58,7 @@ export interface VisualPayload {
     | "checklist";
   eyebrow?: string;
   badges?: string[];
+  image_fit?: "contain" | "cover";
   cards?: VisualCard[];
   highlights?: VisualNumericHighlight[];
   table_rows?: VisualTableRow[];

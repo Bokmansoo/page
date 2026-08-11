@@ -1,0 +1,529 @@
+"""LG-5R durable image-generation domain service.
+
+Only compact IDs, hashes and summaries enter LangGraph state. Provider work is
+persisted in a DB outbox and processed by ``image_generation_worker``.
+"""
+
+from __future__ import annotations
+
+import datetime
+import hashlib
+import json
+from copy import deepcopy
+from typing import Any
+
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from src.db.models import (
+    AgentRun,
+    Asset,
+    ImageGenerationCostApprovalRecord,
+    ImageGenerationJobRecord,
+    ImageGenerationOutboxRecord,
+    ProductFact,
+    ProductProject,
+)
+from src.services.storyboard_image_generation_service import (
+    StoryboardImageGenerationError,
+    approve_storyboard_job,
+    attach_manual_storyboard_output,
+    build_storyboard_generation_contracts,
+    reject_storyboard_job,
+    start_storyboard_job,
+    storyboard_image_generation_is_available,
+)
+from src.services.storyboard_service import approve_storyboard
+
+
+class ImageGenerationGateError(RuntimeError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+PENDING_STATUSES = {"queued", "leased", "running", "generating"}
+REVIEWABLE_STATUSES = {"needs_review"}
+FAILED_STATUSES = {"failed", "blocked", "rejected", "cancelled", "dead_letter"}
+
+
+def approve_graph_storyboard(*, project_id: str, db: Session) -> dict[str, Any]:
+    """Bridge LG-4 planning approval to the canonical storyboard invariant.
+
+    LG-5R still depends on the seller-approved storyboard contract established
+    in LG-4.  Keeping this bridge here preserves that boundary while the new
+    cost/outbox pipeline remains responsible only for paid generation work.
+    """
+
+    project = _project(project_id, db)
+    # Graph visual planning stores source references in ``image_asset_id`` for
+    # editor previews. They are generation inputs, not automatically approved
+    # final-output assignments. Normalize them into candidate references before
+    # applying the canonical storyboard approval invariant.
+    draft = deepcopy(project.planning_draft or {})
+    seen_final_assets: set[str] = set()
+    for card in draft.get("cards") or []:
+        asset_id = str(card.get("image_asset_id") or "")
+        if not asset_id:
+            continue
+        if card.get("image_requirement") == "ai_redesign_required" or asset_id in seen_final_assets:
+            card["image_asset_id"] = None
+        else:
+            seen_final_assets.add(asset_id)
+    project.planning_draft = draft
+    assets = db.query(Asset).filter(Asset.project_id == project_id).all()
+    facts = db.query(ProductFact).filter(ProductFact.project_id == project_id).all()
+    approved = approve_storyboard(project, assets, facts, db, user_id=None)
+    db.add(project)
+    db.commit()
+    return approved
+
+
+def _hash(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _project(project_id: str, db: Session) -> ProductProject:
+    project = db.query(ProductProject).filter(ProductProject.id == project_id).first()
+    if project is None:
+        raise ImageGenerationGateError("PROJECT_NOT_FOUND", "이미지 생성을 위한 프로젝트를 찾을 수 없습니다.")
+    return project
+
+
+def _run(run_id: str, project_id: str, db: Session) -> AgentRun:
+    run = db.query(AgentRun).filter(AgentRun.id == run_id, AgentRun.project_id == project_id).first()
+    if run is None:
+        raise ImageGenerationGateError("GRAPH_RUN_NOT_FOUND", "이미지 생성 실행을 찾을 수 없습니다.")
+    return run
+
+
+def _owned_jobs(project_id: str, run_id: str, db: Session) -> list[ImageGenerationJobRecord]:
+    rows = (
+        db.query(ImageGenerationJobRecord)
+        .filter(ImageGenerationJobRecord.project_id == project_id)
+        .order_by(ImageGenerationJobRecord.created_at.asc(), ImageGenerationJobRecord.job_id.asc())
+        .all()
+    )
+    return [row for row in rows if str((row.usage_metadata or {}).get("langgraph_run_id") or "") == run_id]
+
+
+def _latest_jobs(rows: list[ImageGenerationJobRecord]) -> list[ImageGenerationJobRecord]:
+    latest: dict[str, ImageGenerationJobRecord] = {}
+    for row in rows:
+        scene_id = str(row.scene_id or row.section_id)
+        current = latest.get(scene_id)
+        if current is None or int(row.generation_attempt or 1) > int(current.generation_attempt or 1):
+            latest[scene_id] = row
+    return sorted(latest.values(), key=lambda item: (item.created_at or datetime.datetime.min, item.job_id))
+
+
+def _job_view(job: ImageGenerationJobRecord) -> dict[str, Any]:
+    outbox = job.outbox_record
+    return {
+        "job_id": job.job_id,
+        "scene_id": job.scene_id or job.section_id,
+        "section_id": job.section_id,
+        "role": job.role,
+        "status": job.status,
+        "output_asset_id": job.output_asset_id,
+        "error_code": job.error_code,
+        "error_message": (job.warnings or [None])[0],
+        "warnings": list(job.warnings or []),
+        "validation": dict(job.validation_result or {}),
+        "estimated_cost": job.estimated_cost,
+        "actual_cost": job.actual_cost,
+        "attempt_count": job.attempt_count,
+        "generation_attempt": job.generation_attempt,
+        "prompt_version": job.prompt_version,
+        "prompt_hash": job.prompt_hash,
+        "reference_hash": job.reference_hash,
+        "planning_hash": job.planning_hash,
+        "input_hash": job.input_hash,
+        "idempotency_key": job.idempotency_key,
+        "required_for_completion": bool(job.required_for_completion),
+        "outbox_status": outbox.status if outbox else None,
+    }
+
+
+def _summary(rows: list[ImageGenerationJobRecord]) -> dict[str, Any]:
+    latest = _latest_jobs(rows)
+    required = [job for job in latest if job.required_for_completion]
+    remaining = [str(job.scene_id or job.section_id) for job in required if job.status != "approved"]
+    return {
+        "job_ids": [job.job_id for job in latest],
+        "jobs": [_job_view(job) for job in latest],
+        "attempt_job_ids": [job.job_id for job in rows],
+        "estimated_cost": sum(float(job.estimated_cost or 0) for job in latest),
+        "actual_cost": sum(float(job.actual_cost or 0) for job in rows),
+        "pending_count": sum(job.status in PENDING_STATUSES for job in latest),
+        "review_count": sum(job.status in REVIEWABLE_STATUSES for job in latest),
+        "approved_count": sum(job.status == "approved" for job in required),
+        "required_scene_count": len(required),
+        "remaining_required_scene_ids": remaining,
+        "all_required_scenes_approved": bool(required) and not remaining,
+        "approved_asset_ids": [job.output_asset_id for job in required if job.status == "approved" and job.output_asset_id],
+        "review_asset_ids": [job.output_asset_id for job in latest if job.status == "needs_review" and job.output_asset_id],
+        "failed_job_ids": [job.job_id for job in latest if job.status in FAILED_STATUSES],
+    }
+
+
+def _cost_plan_payload(record: ImageGenerationCostApprovalRecord) -> dict[str, Any]:
+    return {
+        "approval_id": record.id,
+        "cost_plan_hash": record.cost_plan_hash,
+        "planning_hash": record.planning_hash,
+        "provider": record.provider,
+        "model": record.model,
+        "scene_count": record.scene_count,
+        "scenes": list(record.scene_costs or []),
+        "total_estimated_cost": float(record.total_estimated_cost or 0),
+        "currency": record.currency,
+        "status": record.status,
+    }
+
+
+def _pinned_brand_kit(run: AgentRun) -> tuple[str | None, str | None]:
+    """Return the immutable Creative Brief Brand Kit reference for this run."""
+
+    snapshot = dict((run.input_snapshot or {}).get("creative_brief_snapshot") or {})
+    return snapshot.get("brand_kit_version_id"), snapshot.get("brand_kit_hash")
+
+
+def ensure_generation_cost_plan(
+    *, run_id: str, project_id: str, db: Session, scene_ids: list[str] | None = None
+) -> dict[str, Any]:
+    """Persist the exact pre-dispatch cost snapshot without creating jobs."""
+
+    project = _project(project_id, db)
+    run = _run(run_id, project_id, db)
+    try:
+        brand_version_id, brand_hash = _pinned_brand_kit(run)
+        contracts = build_storyboard_generation_contracts(
+            project,
+            db,
+            brand_kit_version_id=brand_version_id,
+            brand_kit_hash=brand_hash,
+        )
+    except StoryboardImageGenerationError as error:
+        raise ImageGenerationGateError("IMAGE_JOB_PREPARE_FAILED", str(error)) from error
+    wanted = set(scene_ids or [])
+    if wanted:
+        contracts = [item for item in contracts if item["scene_id"] in wanted]
+    if not contracts:
+        raise ImageGenerationGateError("NO_GENERATION_SCENES", "이미지 생성이 필요한 승인 장면이 없습니다.")
+    scenes = [
+        {
+            "scene_id": item["scene_id"],
+            "title": item["scene_title"],
+            "role": item["role"],
+            "model": item["model"],
+            "output_size": item["output_size"],
+            "estimated_cost": float(item["estimated_cost"]),
+            "prompt_version": item["prompt_version"],
+            "prompt_hash": item["prompt_hash"],
+            "reference_hash": item["reference_hash"],
+            "input_hash": item["input_hash"],
+        }
+        for item in contracts
+    ]
+    planning_hash = contracts[0]["planning_hash"]
+    plan_hash = _hash({"run_id": run_id, "planning_hash": planning_hash, "scenes": scenes})
+    record = db.query(ImageGenerationCostApprovalRecord).filter(
+        ImageGenerationCostApprovalRecord.run_id == run_id,
+        ImageGenerationCostApprovalRecord.cost_plan_hash == plan_hash,
+    ).first()
+    if record is None:
+        db.query(ImageGenerationCostApprovalRecord).filter(
+            ImageGenerationCostApprovalRecord.run_id == run_id,
+            ImageGenerationCostApprovalRecord.status.in_(["pending", "deferred"]),
+        ).update({ImageGenerationCostApprovalRecord.status: "stale"}, synchronize_session=False)
+        record = ImageGenerationCostApprovalRecord(
+            workspace_id=run.workspace_id,
+            project_id=project_id,
+            run_id=run_id,
+            thread_id=run.graph_thread_id or run.id,
+            planning_hash=planning_hash,
+            cost_plan_hash=plan_hash,
+            provider=contracts[0]["provider"],
+            model=contracts[0]["model"],
+            scene_count=len(scenes),
+            scene_costs=scenes,
+            total_estimated_cost=sum(item["estimated_cost"] for item in scenes),
+            currency="credit",
+            status="pending",
+        )
+        db.add(record)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            record = db.query(ImageGenerationCostApprovalRecord).filter(
+                ImageGenerationCostApprovalRecord.run_id == run_id,
+                ImageGenerationCostApprovalRecord.cost_plan_hash == plan_hash,
+            ).one()
+    run.estimated_cost = float(record.total_estimated_cost or 0)
+    run.cost_approval_status = record.status
+    db.add(run)
+    db.commit()
+    return _cost_plan_payload(record)
+
+
+def record_cost_decision(
+    *, run_id: str, project_id: str, cost_plan_hash: str, decision: str, db: Session
+) -> dict[str, Any]:
+    run = _run(run_id, project_id, db)
+    record = db.query(ImageGenerationCostApprovalRecord).filter(
+        ImageGenerationCostApprovalRecord.run_id == run_id,
+        ImageGenerationCostApprovalRecord.cost_plan_hash == cost_plan_hash,
+    ).with_for_update().first()
+    if record is None or record.status == "stale":
+        raise ImageGenerationGateError("COST_PLAN_STALE", "비용 계획이 변경되었습니다. 최신 비용을 다시 확인해 주세요.")
+    now = datetime.datetime.utcnow()
+    if decision == "approve":
+        record.status = "approved"
+        record.approved_at = record.approved_at or now
+        record.approved_by = record.approved_by or run.created_by
+        run.cost_approval_status = "approved"
+    elif decision == "defer":
+        if record.status != "approved":
+            record.status = "deferred"
+            record.deferred_at = now
+        run.cost_approval_status = "deferred"
+    else:
+        raise ImageGenerationGateError("COST_DECISION_INVALID", "지원하지 않는 비용 승인 결정입니다.")
+    db.add_all([record, run])
+    db.commit()
+    return _cost_plan_payload(record)
+
+
+def _idempotency_key(project_id: str, contract: dict[str, Any], generation_attempt: int) -> str:
+    return _hash(
+        {
+            "project_id": project_id,
+            "scene_id": contract["scene_id"],
+            "prompt_version": contract["prompt_version"],
+            "reference_hash": contract["reference_hash"],
+            "attempt": generation_attempt,
+        }
+    )
+
+
+def prepare_graph_image_jobs(
+    *, run_id: str, project_id: str, mode: str, db: Session,
+    cost_plan_hash: str | None = None, scene_attempts: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    project = _project(project_id, db)
+    run = _run(run_id, project_id, db)
+    approval = db.query(ImageGenerationCostApprovalRecord).filter(
+        ImageGenerationCostApprovalRecord.run_id == run_id,
+        ImageGenerationCostApprovalRecord.cost_plan_hash == cost_plan_hash,
+        ImageGenerationCostApprovalRecord.status == "approved",
+    ).first()
+    if approval is None:
+        raise ImageGenerationGateError("COST_APPROVAL_REQUIRED", "현재 비용 계획을 승인한 뒤 이미지 작업을 만들 수 있습니다.")
+    try:
+        brand_version_id, brand_hash = _pinned_brand_kit(run)
+        contracts = build_storyboard_generation_contracts(
+            project,
+            db,
+            brand_kit_version_id=brand_version_id,
+            brand_kit_hash=brand_hash,
+        )
+    except StoryboardImageGenerationError as error:
+        raise ImageGenerationGateError("IMAGE_JOB_PREPARE_FAILED", str(error)) from error
+    approved_scenes = {item["scene_id"]: item for item in (approval.scene_costs or [])}
+    contracts = [item for item in contracts if item["scene_id"] in approved_scenes]
+    if not contracts or any(item["planning_hash"] != approval.planning_hash for item in contracts):
+        approval.status = "stale"
+        db.commit()
+        raise ImageGenerationGateError("COST_PLAN_STALE", "스토리보드 또는 기준 사진이 변경되었습니다. 비용을 다시 확인해 주세요.")
+    attempts = scene_attempts or {}
+    for contract in contracts:
+        approved_scene = approved_scenes[contract["scene_id"]]
+        if approved_scene.get("input_hash") != contract["input_hash"]:
+            approval.status = "stale"
+            db.commit()
+            raise ImageGenerationGateError("COST_PLAN_STALE", "프롬프트 또는 기준 사진이 변경되었습니다. 비용을 다시 확인해 주세요.")
+        generation_attempt = int(attempts.get(contract["scene_id"], 1))
+        key = _idempotency_key(project_id, contract, generation_attempt)
+        existing = db.query(ImageGenerationJobRecord).filter(ImageGenerationJobRecord.idempotency_key == key).first()
+        if existing is not None:
+            if existing.input_hash != contract["input_hash"]:
+                raise ImageGenerationGateError("IDEMPOTENCY_INPUT_MISMATCH", "같은 작업 키의 입력이 일치하지 않습니다.")
+            continue
+        previous = (
+            db.query(ImageGenerationJobRecord)
+            .filter(
+                ImageGenerationJobRecord.project_id == project_id,
+                ImageGenerationJobRecord.scene_id == contract["scene_id"],
+                ImageGenerationJobRecord.generation_attempt < generation_attempt,
+            )
+            .order_by(ImageGenerationJobRecord.generation_attempt.desc())
+            .first()
+        )
+        job = ImageGenerationJobRecord(
+            project_id=project_id,
+            job_id=f"lg5r-{key[:24]}",
+            section_id=contract["section_id"],
+            scene_id=contract["scene_id"],
+            role=contract["role"],
+            source_asset_ids=contract["source_asset_ids"],
+            prompt=contract["prompt"],
+            negative_prompt=contract["negative_prompt"],
+            preserve_product_identity=True,
+            output_size=contract["output_size"],
+            cost_tier=contract["cost_tier"],
+            status="blocked" if contract["blocker_code"] else "awaiting_approval",
+            provider=contract["provider"],
+            model=contract["model"],
+            error_code=contract["blocker_code"],
+            warnings=contract["blocker_warnings"] or ["비용 승인 완료. durable worker 전송 대기 중입니다."],
+            input_snapshot=contract["input_snapshot"],
+            validation_result={"status": "blocked" if contract["blocker_code"] else "pending"},
+            estimated_cost=contract["estimated_cost"],
+            usage_metadata={
+                "langgraph_run_id": run_id,
+                "langgraph_thread_id": run.graph_thread_id or run.id,
+                "langgraph_mode": mode,
+                "cost_approval_id": approval.id,
+                "cost_plan_hash": approval.cost_plan_hash,
+            },
+            prompt_version=contract["prompt_version"],
+            prompt_hash=contract["prompt_hash"],
+            reference_hash=contract["reference_hash"],
+            planning_hash=contract["planning_hash"],
+            input_hash=contract["input_hash"],
+            generation_attempt=generation_attempt,
+            idempotency_key=key,
+            required_for_completion=contract["required_for_completion"],
+            supersedes_job_id=previous.job_id if previous else None,
+            scene_prompt_version_id=contract["scene_prompt_version_id"],
+        )
+        db.add(job)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            existing = db.query(ImageGenerationJobRecord).filter(ImageGenerationJobRecord.idempotency_key == key).one()
+            if existing.input_hash != contract["input_hash"]:
+                raise ImageGenerationGateError("IDEMPOTENCY_INPUT_MISMATCH", "같은 작업 키의 입력이 일치하지 않습니다.")
+    return _summary(_owned_jobs(project_id, run_id, db))
+
+
+def _provider_gate(mode: str) -> None:
+    if mode == "mock":
+        return
+    if not storyboard_image_generation_is_available():
+        raise ImageGenerationGateError(
+            "API_KEY_MISSING",
+            "이미지 제공자 API 키가 준비되지 않았습니다. 키와 생성 모드를 확인한 뒤 같은 실행을 재개해 주세요.",
+        )
+
+
+def dispatch_graph_image_jobs(*, run_id: str, project_id: str, mode: str, db: Session) -> dict[str, Any]:
+    """Persist queue deliveries only; provider execution never occurs here."""
+
+    _provider_gate(mode)
+    project = _project(project_id, db)
+    run = _run(run_id, project_id, db)
+    rows = _owned_jobs(project_id, run_id, db)
+    if not rows:
+        raise ImageGenerationGateError("IMAGE_JOB_MISSING", "준비된 이미지 생성 작업을 찾을 수 없습니다.")
+    for job in _latest_jobs(rows):
+        if job.status in {"approved", "needs_review", "queued", "running", "generating"}:
+            continue
+        if job.status == "blocked":
+            continue
+        try:
+            started = start_storyboard_job(project, job.job_id, True, db, allow_mock_provider=(mode == "mock"))
+        except StoryboardImageGenerationError as error:
+            raise ImageGenerationGateError("IMAGE_JOB_DISPATCH_FAILED", str(error)) from error
+        if not started.get("dispatch_required"):
+            continue
+        outbox = db.query(ImageGenerationOutboxRecord).filter(
+            ImageGenerationOutboxRecord.idempotency_key == job.idempotency_key
+        ).first()
+        if outbox is None:
+            outbox = ImageGenerationOutboxRecord(
+                workspace_id=run.workspace_id,
+                project_id=project_id,
+                run_id=run_id,
+                thread_id=run.graph_thread_id or run.id,
+                image_job_id=job.id,
+                job_id=job.job_id,
+                idempotency_key=str(job.idempotency_key),
+                provider_mode=mode,
+                status="queued",
+            )
+            db.add(outbox)
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+    return _summary(_owned_jobs(project_id, run_id, db))
+
+
+def collect_graph_image_results(*, run_id: str, project_id: str, db: Session) -> dict[str, Any]:
+    rows = _owned_jobs(project_id, run_id, db)
+    if not rows:
+        raise ImageGenerationGateError("IMAGE_JOB_MISSING", "이미지 생성 작업을 찾을 수 없습니다.")
+    return _summary(rows)
+
+
+def _next_attempts(rows: list[ImageGenerationJobRecord], scene_ids: list[str]) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for scene_id in scene_ids:
+        attempts = [int(row.generation_attempt or 1) for row in rows if str(row.scene_id or row.section_id) == scene_id]
+        result[scene_id] = max(attempts or [0]) + 1
+    return result
+
+
+def apply_image_review(
+    *, run_id: str, project_id: str, decision: str, job_id: str = "", asset_id: str = "",
+    seller_attested: bool = False, db: Session,
+) -> dict[str, Any]:
+    """Apply one scene decision and retain every sibling and prior attempt."""
+
+    project = _project(project_id, db)
+    rows = _owned_jobs(project_id, run_id, db)
+    latest = _latest_jobs(rows)
+    if not latest:
+        raise ImageGenerationGateError("IMAGE_JOB_MISSING", "검수할 이미지 생성 작업을 찾을 수 없습니다.")
+    by_id = {job.job_id: job for job in latest}
+    target = by_id.get(job_id) if job_id else None
+    if decision in {"approve", "reject", "upload"} and target is None:
+        raise ImageGenerationGateError("IMAGE_REVIEW_JOB_REQUIRED", "처리할 장면을 한 개 선택해 주세요.")
+    try:
+        if decision == "approve" and target is not None:
+            approve_storyboard_job(project, target.job_id, db, identity_confirmed=True)
+            target.approved_at = datetime.datetime.utcnow()
+            db.commit()
+        elif decision == "reject" and target is not None:
+            reject_storyboard_job(project, target.job_id, db)
+            target.rejected_at = datetime.datetime.utcnow()
+            db.commit()
+        elif decision == "upload" and target is not None:
+            if not asset_id:
+                raise ImageGenerationGateError("UPLOAD_ASSET_REQUIRED", "직접 업로드할 사진을 선택해 주세요.")
+            attach_manual_storyboard_output(project, target.job_id, asset_id, seller_attested, db)
+        elif decision == "regenerate":
+            if target is not None:
+                candidates = [target] if target.status in FAILED_STATUSES | REVIEWABLE_STATUSES else []
+            else:
+                candidates = [job for job in latest if job.status in FAILED_STATUSES]
+            if not candidates:
+                raise ImageGenerationGateError("NO_FAILED_SCENES", "재시도할 실패·차단·거절 장면이 없습니다.")
+            result = _summary(_owned_jobs(project_id, run_id, db))
+            scene_ids = [str(job.scene_id or job.section_id) for job in candidates]
+            result["regenerate_scene_ids"] = scene_ids
+            result["scene_attempts"] = _next_attempts(rows, scene_ids)
+            result["next_action"] = "cost_approval"
+            return result
+        else:
+            raise ImageGenerationGateError("IMAGE_REVIEW_DECISION_INVALID", "지원하지 않는 이미지 검수 결정입니다.")
+    except StoryboardImageGenerationError as error:
+        raise ImageGenerationGateError("IMAGE_REVIEW_FAILED", str(error)) from error
+    result = _summary(_owned_jobs(project_id, run_id, db))
+    result["next_action"] = "finalize" if result["all_required_scenes_approved"] else "review"
+    return result

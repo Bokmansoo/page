@@ -87,6 +87,18 @@ def apply_composed_product_hero(page: Any, db: Any, template_key: str | None = N
         composed_payload = build_composed_product_payload(asset, template_key)
         if not composed_payload:
             continue
+        # Composition is a rendering upgrade, not a new seller selection.
+        # Keep server-owned review/selection evidence that was persisted when
+        # the current HERO asset was explicitly chosen.  Dropping this data
+        # made an already-confirmed HERO block unrelated section edits and
+        # exports again after the visual backfill ran.
+        for key in (
+            "low_quality_hero_confirmed",
+            "ux2c_selection_state",
+            "asset_id",
+        ):
+            if key in payload:
+                composed_payload[key] = payload[key]
         section.visual_kind = "composed_product"
         section.visual_payload = composed_payload
         changed = True

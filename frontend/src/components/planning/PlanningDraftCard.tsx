@@ -12,6 +12,13 @@ export interface PlanningCard {
   visual_strategy: string;
   is_enabled: boolean;
   sort_order: number;
+  image_asset_id?: string | null;
+  candidate_asset_ids?: string[];
+  image_requirement?: "asset_ready" | "ai_redesign_required" | "seller_upload_required" | "derived_graphic" | "not_required" | string | null;
+  scene_request?: string | null;
+  rendering_template?: string | null;
+  facts_stale?: boolean;
+  missing_reasons?: string[];
 }
 
 interface PlanningDraftCardProps {
@@ -29,6 +36,14 @@ const visualStrategyLabels: Record<string, string> = {
   graphic_chart: "비교/그래픽",
   text_only: "텍스트 중심",
   html_graphic: "HTML 그래픽",
+};
+
+const imageRequirementLabels: Record<string, string> = {
+  asset_ready: "승인 자산 연결됨",
+  ai_redesign_required: "AI 리디자인 필요",
+  seller_upload_required: "판매자 이미지 필요",
+  derived_graphic: "사실 기반 그래픽",
+  not_required: "이미지 없음",
 };
 
 export default function PlanningDraftCard({
@@ -168,6 +183,24 @@ export default function PlanningDraftCard({
             포인트 추가
           </button>
         </div>
+
+        {(card.image_requirement || card.scene_request || card.facts_stale) && (
+          <div className="rounded-xl border border-slate-100 bg-slate-50 p-3 text-xs leading-5 text-slate-600">
+            <div className="flex flex-wrap gap-2">
+              {card.image_requirement && (
+                <span className="rounded-md bg-white px-2 py-1 font-bold text-slate-700">
+                  {imageRequirementLabels[card.image_requirement] || card.image_requirement}
+                </span>
+              )}
+              {(card.candidate_asset_ids || []).length > 0 && <span>자산 후보 {card.candidate_asset_ids?.length}개</span>}
+              {card.source_fact_ids.length > 0 && <span>근거 사실 {card.source_fact_ids.length}개</span>}
+              {card.rendering_template && <span>렌더 템플릿: {card.rendering_template}</span>}
+              {card.facts_stale && <span className="font-bold text-amber-700">연결 사실 변경됨</span>}
+            </div>
+            {card.scene_request && <p className="mt-2">장면 요청: {card.scene_request}</p>}
+            {(card.missing_reasons || []).map((reason) => <p key={reason} className="mt-1 text-amber-700">{reason}</p>)}
+          </div>
+        )}
       </div>
     </div>
   );

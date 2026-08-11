@@ -14,6 +14,8 @@ __pycache__/
 *.py[oc]
 .pytest_cache/
 backend/.pytest_cache/
+.pytest-cache/
+backend/.pytest-cache/
 
 # Virtual environments
 .venv/
@@ -55,6 +57,8 @@ backend/.pytest_cache_temp/
 # Temp / generated output
 tmp/
 output/
+backend/.runtime/
+.tmp-tesseract-langs/
 
 # Runtime uploads
 uploads/
@@ -70,3 +74,17 @@ integrations/figma-bridge/dist/
 integrations/figma-plugin/node_modules/
 integrations/figma-plugin/dist/
 integrations/figma-plugin/manifest.json
+
+# Pytest temporary artifacts
+.tmp/
+
+# Stale Next.js build folders
+frontend/.next-stale*/
+frontend/.next.stale*/
+
+# Test / build temporary artifacts
+.tmp/
+.test-tmp/
+frontend/.next-stale*/
+frontend/.next.stale*/
+backend/.pytest-cache-codex/

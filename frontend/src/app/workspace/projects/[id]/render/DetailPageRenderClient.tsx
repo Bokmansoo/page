@@ -8,13 +8,16 @@ import DetailPageDocument, {
 } from "@/components/DetailPageDocument";
 import { apiUrl } from "@/lib/api";
 
-const MOCK_HEADERS = {
-  "X-Mock-User-Id": "00000000-0000-0000-0000-000000000001",
-  "X-Mock-Workspace-Id": "00000000-0000-0000-0000-000000000002",
-};
+const SESSION_HEADERS: Record<string, string> = {};
 
 interface FinalPageResponse {
-  sections_json: DetailPageData;
+  sections_json: DetailPageData & {
+    commerce_renderer?: {
+      theme_color?: string;
+      font_family?: string;
+      sections?: DetailPageData["sections"];
+    };
+  };
 }
 
 export default function DetailPageRenderClient() {
@@ -29,25 +32,25 @@ export default function DetailPageRenderClient() {
     const loadFinalPage = async () => {
       try {
         const versionId = searchParams.get("version_id");
-        const headers = {
-          "X-Mock-User-Id": searchParams.get("user_id") || MOCK_HEADERS["X-Mock-User-Id"],
-          "X-Mock-Workspace-Id":
-            searchParams.get("workspace_id") || MOCK_HEADERS["X-Mock-Workspace-Id"],
-        };
+        const headers = SESSION_HEADERS;
         const versionQuery = versionId ? `?version_id=${encodeURIComponent(versionId)}` : "";
         const [finalRes, assetsRes] = await Promise.all([
-          fetch(apiUrl(`/api/v1/projects/${projectId}/page/final${versionQuery}`), { headers }),
-          fetch(apiUrl(`/api/v1/projects/${projectId}/assets`), { headers }),
+          fetch(apiUrl(`/api/v1/projects/${projectId}/page/final${versionQuery}`), { headers, credentials: "include" }),
+          fetch(apiUrl(`/api/v1/projects/${projectId}/assets`), { headers, credentials: "include" }),
         ]);
         if (!finalRes.ok) {
           throw new Error("Final detail page version is not ready.");
         }
         const finalPage = (await finalRes.json()) as FinalPageResponse;
+        // Sprint 6 parity rule: an export always uses the renderer snapshot
+        // that was frozen when the page was finalized.  The regular snapshot
+        // remains as a backward-compatible fallback for older versions.
+        const rendererSnapshot = finalPage.sections_json.commerce_renderer;
         setPage({
           project_id: projectId,
-          theme_color: finalPage.sections_json.theme_color,
-          font_family: finalPage.sections_json.font_family,
-          sections: finalPage.sections_json.sections || [],
+          theme_color: rendererSnapshot?.theme_color || finalPage.sections_json.theme_color,
+          font_family: rendererSnapshot?.font_family || finalPage.sections_json.font_family,
+          sections: rendererSnapshot?.sections || finalPage.sections_json.sections || [],
         });
         setAssets(assetsRes.ok ? await assetsRes.json() : []);
       } catch (err) {

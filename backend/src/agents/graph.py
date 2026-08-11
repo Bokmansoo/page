@@ -227,7 +227,17 @@ class AgentGraph:
                     uploaded_list.append({
                         "id": a.id,
                         "filename": a.filename,
-                        "url": f"/api/assets/{a.id}/file"
+                        "url": f"/api/assets/{a.id}/file",
+                        "source_type": a.source_type,
+                        "usage_status": a.usage_status,
+                        "mime_type": a.mime_type,
+                        "asset_role": getattr(a, "asset_role", "unknown"),
+                        "quality_status": getattr(a, "quality_status", "warning"),
+                        "quality_warnings": getattr(a, "quality_warnings", []) or [],
+                        "safe_crop_status": getattr(a, "safe_crop_status", "needs_review"),
+                        "is_representative": getattr(a, "is_representative", False),
+                        "ocr_text": getattr(a, "ocr_text", "") or "",
+                        "content_hash": getattr(a, "content_hash", None),
                     })
             finally:
                 db.close()

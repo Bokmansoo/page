@@ -334,6 +334,15 @@ def test_run_real_api_materializes_uploaded_image_into_page_sections(client, aut
     response = client.post(f"/api/agent-runs/{created['id']}/run", headers=auth_headers)
     assert response.status_code == 200
 
+    repeated = client.post(f"/api/agent-runs/{created['id']}/run", headers=auth_headers)
+    assert repeated.status_code == 200
+    assert (
+        db_session.query(ProductPage)
+        .filter(ProductPage.project_id == created["project_id"])
+        .count()
+        == 1
+    )
+
     page = db_session.query(ProductPage).filter(ProductPage.project_id == created["project_id"]).first()
     sections = (
         db_session.query(PageSection)

@@ -92,7 +92,14 @@ class ProductIdentityValidator:
         # 1. Text / logo / certificate exclusion validation
         # Reject outputs if prompt explicitly requests text/logos that should not be baked in
         text_keywords = ["text", "words", "letters", "writing", "logo", "badge", "certificate", "label", "stamp", "watermark", "pricing", "discount"]
-        if any(kw in prompt_lower for kw in text_keywords):
+        # Match complete instruction words.  Substring checks incorrectly treated
+        # harmless visual phrases such as "lifestyle context" as a request for
+        # rasterized "text" and blocked otherwise valid LG-8 scene prompts.
+        requests_raster_content = any(
+            re.search(rf"\b{re.escape(keyword)}\b", prompt_lower)
+            for keyword in text_keywords
+        )
+        if requests_raster_content:
             # Only reject if it's a product role where text/logos shouldn't be generated
             if role in ["representative_product", "cutout_product", "lifestyle_scene", "detail_closeup", "cta_visual"]:
                 raise ProductIdentityValidationError(
@@ -145,6 +152,13 @@ class ProductIdentityValidator:
         if mad > 100.0:
             warnings.append(
                 f"Silhouette/layout inconsistency detected (mean absolute difference: {mad:.1f}). The shape or structure differs from the original product photo."
+            )
+        elif mad < 2.0:
+            # A generated commercial image that is effectively pixel-identical
+            # to the supplier capture is not a redesign.  Keep it out of the
+            # approval flow rather than relying on a prompt-only policy.
+            raise ProductIdentityValidationError(
+                "Output rejected: generated image is too similar to the supplier reference layout."
             )
 
         return warnings

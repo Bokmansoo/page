@@ -57,12 +57,15 @@ class PageAssemblyAgent(AgentNode):
                         "filename": a.filename,
                         "url": a.file_path if str(a.file_path).startswith("http") else f"/api/v1/files/assets/{a.id}",
                         "source_type": a.source_type,
+                        "usage_status": a.usage_status,
                         "mime_type": a.mime_type,
                         "asset_role": getattr(a, "asset_role", "unknown"),
                         "quality_status": getattr(a, "quality_status", "warning"),
                         "quality_warnings": getattr(a, "quality_warnings", []) or [],
                         "safe_crop_status": getattr(a, "safe_crop_status", "needs_review"),
                         "is_representative": getattr(a, "is_representative", False),
+                        "ocr_text": getattr(a, "ocr_text", "") or "",
+                        "content_hash": getattr(a, "content_hash", None),
                     }
                     uploaded_list.append(item)
                     assets_by_id[a.id] = item
@@ -78,6 +81,25 @@ class PageAssemblyAgent(AgentNode):
             product_url=state.product_input.product_url,
             copy_set=copy_set
         )
+
+        # UX-2 is deliberately HTML-first while no image provider is
+        # connected. Do not run the legacy candidate-selection path below:
+        # it turns missing scenes into blocking image placeholders and can
+        # re-select URL/supplier references. The assembler has already kept
+        # only seller-owned assets for final placement.
+        if (state.input_snapshot or {}).get("ux_auto_generate"):
+            for section in state.outputs[self.name].get("sections") or []:
+                visual_slot = section.get("visual_slot") or {}
+                image_asset_id = visual_slot.get("asset_id")
+                section["image_asset_id"] = image_asset_id
+                section["visual_kind"] = "image" if image_asset_id else "html_graphic"
+                section["visual_payload"] = {
+                    "layout_variant": "image_text",
+                    "ux2_mock_output": True,
+                    **({"ux2d1_auto_replacement": section["ux2d1_auto_replacement"]} if section.get("ux2d1_auto_replacement") else {}),
+                    **({"mock_safe_hero": True} if section.get("section_type") == "hero" and not image_asset_id else {}),
+                }
+            return state
 
         # -------------------------------------------------------------
         # Sprint 55 / 56: Map Selected / Recommended image candidates & copy

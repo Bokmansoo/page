@@ -4,7 +4,7 @@ import React, { Suspense, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import GenerationStatusPanel from "@/components/GenerationStatusPanel";
 import { apiUrl } from "@/lib/api";
-import { fetchGenerationStatusDashboard, GenerationStatusDashboard, mockHeaders } from "@/lib/generationStatus";
+import { fetchGenerationStatusDashboard, GenerationStatusDashboard } from "@/lib/generationStatus";
 
 export default function OperationsPage() {
   return (
@@ -60,7 +60,6 @@ function OperationsPageContent() {
       setSeeding(true);
       const res = await fetch(apiUrl("/api/v1/operations/seed"), {
         method: "POST",
-        headers: mockHeaders(),
       });
 
       if (!res.ok) {

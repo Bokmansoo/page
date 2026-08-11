@@ -84,17 +84,11 @@ export interface GenerationStatusDashboard {
   projects: GenerationProjectStatus[];
 }
 
-export function mockHeaders(): Record<string, string> {
-  if (typeof window === "undefined") return {};
-  return {
-    "X-Mock-User-Id": localStorage.getItem("X-Mock-User-Id") || "00000000-0000-0000-0000-000000000001",
-    "X-Mock-Workspace-Id": localStorage.getItem("X-Mock-Workspace-Id") || "00000000-0000-0000-0000-000000000002",
-  };
-}
+export function sessionHeaders(): Record<string, string> { return {}; }
 
 export async function fetchGenerationStatusDashboard(): Promise<GenerationStatusDashboard> {
   const response = await fetch(apiUrl("/api/v1/operations/generation-status"), {
-    headers: mockHeaders(),
+    headers: sessionHeaders(), credentials: "include",
   });
   if (!response.ok) {
     throw new Error("작업 상태를 불러오지 못했습니다.");

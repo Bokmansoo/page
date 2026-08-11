@@ -6,7 +6,6 @@ import StructuredIntakeReview from "./StructuredIntakeReview";
 import GenerationDuplicateRunDialog, { DuplicateRunDetail } from "./GenerationDuplicateRunDialog";
 import { apiUrl, structureIntake, StructuredIntakeDraft } from "@/lib/api";
 import { useRouter, useSearchParams } from "next/navigation";
-import PlanningModeSelector from "./planning/PlanningModeSelector";
 
 type PendingImage = {
   id: string;
@@ -22,7 +21,6 @@ export default function AIDetailPageIntake() {
   const searchParams = useSearchParams();
   const [productName, setProductName] = useState("");
   const [category, setCategory] = useState("Living");
-  const [planningMode, setPlanningMode] = useState<"quality" | "quick">("quality");
   const [description, setDescription] = useState("");
   const [featureDetails, setFeatureDetails] = useState("");
   const [components, setComponents] = useState("");
@@ -34,6 +32,7 @@ export default function AIDetailPageIntake() {
   const [productUrl, setProductUrl] = useState("");
   const [referenceUrlsText, setReferenceUrlsText] = useState("");
   const [freeformInput, setFreeformInput] = useState("");
+  const [interactionMode, setInteractionMode] = useState<"quick" | "expert">("quick");
   const [structuredDraft, setStructuredDraft] = useState<StructuredIntakeDraft | null>(null);
   const [selectedPreset, setSelectedPreset] = useState("깔끔한");
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
@@ -46,6 +45,12 @@ export default function AIDetailPageIntake() {
   const runId = searchParams.get("runId");
 
   const presets = ["깔끔한", "감성적인", "프리미엄", "실용 강조", "선물용"];
+  const productNameLooksLikeSpecification = (() => {
+    const compact = productName.trim().replace(/\s+/g, " ");
+    const labeledValues = (compact.match(/(?:^|\s)[^:]{1,24}:\s*[^:]{1,40}/g) || []).length;
+    const startsWithSpecification = /^(?:색상|모델명|정격(?:\s*(?:입력|주파수|소비전력))?|배터리(?:\s*용량)?|제품\s*크기|외부\s*포장(?:\s*크기|\s*구성)?)\s*[:：]/.test(compact);
+    return compact.length > 80 || labeledValues >= 2 || (compact.match(/×/g) || []).length >= 2 || startsWithSpecification;
+  })();
 
   const duplicateRunDialog = duplicateRunDetail ? (
     <GenerationDuplicateRunDialog
@@ -155,9 +160,6 @@ export default function AIDetailPageIntake() {
       return;
     }
 
-    const uid = localStorage.getItem("X-Mock-User-Id") || "00000000-0000-0000-0000-000000000001";
-    const wid = localStorage.getItem("X-Mock-Workspace-Id") || "00000000-0000-0000-0000-000000000002";
-
     setLoading(true);
     setError(null);
     try {
@@ -174,10 +176,7 @@ export default function AIDetailPageIntake() {
           sales_channel: salesChannel,
           model_options: modelOptions,
         },
-        {
-          "X-Mock-User-Id": uid,
-          "X-Mock-Workspace-Id": wid,
-        }
+        {}
       );
       setStructuredDraft({
         ...draft,
@@ -203,10 +202,9 @@ export default function AIDetailPageIntake() {
     forceNew: boolean = false
   ) => {
     e.preventDefault();
-    // Sprint 1 keeps the seller in control: a normal submit first opens the
-    // immutable input-bundle review. The second submit happens only after the
-    // seller confirms that review (or intentionally creates a duplicate run).
-    if (!confirmedDraft && !forceNew) {
+    // UX-1 starts the normal path immediately. Input review remains on the
+    // explicit advanced route for sellers who need it.
+    if (!confirmedDraft && !forceNew && searchParams.get("advanced") === "1") {
       await handleStructureIntake();
       return;
     }
@@ -228,17 +226,13 @@ export default function AIDetailPageIntake() {
     setLoading(true);
     setError(null);
 
-    const uid = localStorage.getItem("X-Mock-User-Id") || "00000000-0000-0000-0000-000000000001";
-    const wid = localStorage.getItem("X-Mock-Workspace-Id") || "00000000-0000-0000-0000-000000000002";
-
     try {
       const res = await fetch(apiUrl("/api/agent-runs"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-Mock-User-Id": uid,
-          "X-Mock-Workspace-Id": wid,
         },
+        credentials: "include",
         body: JSON.stringify({
           product_name: finalProductName,
           // The original seller text is the source of truth for numeric
@@ -261,7 +255,8 @@ export default function AIDetailPageIntake() {
           sales_channel: salesChannel,
           model_options: modelOptions,
           desired_mood: confirmedDraft?.desired_mood || [selectedPreset],
-          planning_mode: planningMode,
+          planning_mode: interactionMode,
+          ux_auto_generate: true,
           force_new: forceNew,
         }),
       });
@@ -285,10 +280,7 @@ export default function AIDetailPageIntake() {
 
         const uploadRes = await fetch(apiUrl("/api/v1/files/upload"), {
           method: "POST",
-          headers: {
-            "X-Mock-User-Id": uid,
-            "X-Mock-Workspace-Id": wid,
-          },
+          credentials: "include",
           body: formData,
         });
         if (!uploadRes.ok) throw new Error(`상품 사진 업로드에 실패했습니다: ${image.file.name}`);
@@ -310,11 +302,10 @@ export default function AIDetailPageIntake() {
         // useful evidence collected from the supplied product/reference URLs.
         const assetsRes = await fetch(apiUrl(`/api/agent-runs/${data.id}/input-assets`), {
           method: "PATCH",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Mock-User-Id": uid,
-            "X-Mock-Workspace-Id": wid,
-          },
+        headers: {
+          "Content-Type": "application/json",
+        },
+        credentials: "include",
           body: JSON.stringify({ asset_ids: orderedAssetIds }),
         });
         if (!assetsRes.ok) throw new Error("상품 사진 순서를 저장하지 못했습니다.");
@@ -328,11 +319,21 @@ export default function AIDetailPageIntake() {
           );
         }
       }
-      if (planningMode === "quality") {
-        router.push(`/workspace/projects/${data.project_id}/planning`);
-      } else {
-        router.push(`/workspace?runId=${data.id}`);
+      if (data.graph_runtime === "langgraph") {
+        const graphStart = await fetch(apiUrl(`/api/v1/graph-runs/${data.id}/start`), {
+          method: "POST",
+          credentials: "include",
+        });
+        const graphPayload = await graphStart.json().catch(() => null);
+        if (!graphStart.ok) {
+          throw new Error(graphPayload?.detail || "LangGraph 승인 흐름을 시작하지 못했습니다.");
+        }
+        router.push(`/workspace/projects/${data.project_id}/planning?runId=${encodeURIComponent(data.id)}`);
+        return;
       }
+      // UX-1: send the seller's photos and facts directly to the persisted
+      // generation run. Storyboard controls remain in the advanced editor.
+      router.push(`/workspace?runId=${encodeURIComponent(data.id)}`);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "연결 오류가 발생했습니다.");
     } finally {
@@ -524,6 +525,9 @@ export default function AIDetailPageIntake() {
               onChange={(e) => setProductName(e.target.value)}
               className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent text-sm bg-slate-50 hover:bg-slate-100/50 transition-colors"
             />
+            {productNameLooksLikeSpecification ? (
+              <p className="mt-2 text-xs font-semibold leading-5 text-amber-700">상품명에는 한 줄 이름만 입력해 주세요. 모델명·색상·전원·크기 같은 스펙은 아래 상세 설명에 넣으면 프로젝트명과 다운로드 파일명이 깔끔하게 생성됩니다.</p>
+            ) : null}
           </div>
           <div>
             <label className="block text-sm font-semibold text-slate-700 mb-2" htmlFor="product-category">카테고리</label>
@@ -629,10 +633,23 @@ export default function AIDetailPageIntake() {
           </div>
         </div>
 
-        {/* Planning Mode Selection */}
-        <PlanningModeSelector mode={planningMode} onChange={setPlanningMode} />
-
         {/* CTA Button */}
+        <fieldset className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+          <legend className="px-1 text-sm font-bold text-slate-800">진행 방식</legend>
+          <div className="mt-2 grid gap-3 sm:grid-cols-2">
+            <label className={`cursor-pointer rounded-xl border p-3 ${interactionMode === "quick" ? "border-emerald-500 bg-emerald-50" : "border-slate-200 bg-white"}`}>
+              <input className="mr-2" type="radio" name="interaction-mode" value="quick" checked={interactionMode === "quick"} onChange={() => setInteractionMode("quick")} />
+              <strong>빠른 생성</strong>
+              <span className="mt-1 block text-xs text-slate-600">안전하고 되돌릴 수 있는 무료 단계만 자동 승인합니다.</span>
+            </label>
+            <label className={`cursor-pointer rounded-xl border p-3 ${interactionMode === "expert" ? "border-violet-500 bg-violet-50" : "border-slate-200 bg-white"}`}>
+              <input className="mr-2" type="radio" name="interaction-mode" value="expert" checked={interactionMode === "expert"} onChange={() => setInteractionMode("expert")} />
+              <strong>전문가 검수</strong>
+              <span className="mt-1 block text-xs text-slate-600">입력·근거·스토리보드를 단계별로 직접 승인합니다.</span>
+            </label>
+          </div>
+          <p className="mt-2 text-xs text-slate-500">비용 승인, 권리·사실 충돌, 이미지 검수는 두 방식 모두 자동으로 넘기지 않습니다.</p>
+        </fieldset>
         <button
           type="submit"
           disabled={loading}

@@ -171,3 +171,8 @@ class VisualPlanningAgent(AgentNode):
 
         state.outputs[self.name] = self._attach_image_jobs(state, visual_plan)
         return state
+
+    def run_delta(self, *, run_id: str, project_id: str, mode: str) -> dict:
+        from src.services.langgraph_commerce_planning_service import run_visual_planning
+
+        return run_visual_planning(run_id=run_id, project_id=project_id, mode=mode)

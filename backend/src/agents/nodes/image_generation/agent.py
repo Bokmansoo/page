@@ -275,7 +275,15 @@ class ImageGenerationAgent(AgentNode):
                     "url-imported",
                 }
 
-            if slot_candidates and (uploaded_candidate_indexes or selected_candidate):
+            # The normal UX-1 path must create the planned in-use/detail
+            # scenes from the seller's product reference.  Historically this
+            # branch returned early whenever an uploaded photo existed, which
+            # meant that a configured real image provider was never called.
+            # Advanced/manual runs keep the conservative existing-photo
+            # fallback, while UX-1 only bypasses it in real-provider mode.
+            ux_auto_generate = bool((state.input_snapshot or {}).get("ux_auto_generate"))
+            should_generate_scene = ux_auto_generate and self.mode == "real" and matching_job is not None
+            if slot_candidates and (uploaded_candidate_indexes or selected_candidate) and not should_generate_scene:
                 # HERO uses the main product image. The product-introduction slot
                 # uses a second photo when one is available, while preserving the
                 # original asset id if only one uploaded photo was supplied.
@@ -416,7 +424,13 @@ class ImageGenerationAgent(AgentNode):
                     continue
                 
                 # Check identity validator needs_review status
-                needs_review = True if matching_job.get("product_identity_required") else False
+                # UX-1 may use a generated scene automatically only when the
+                # provider did not report an identity failure.  Explicit
+                # review remains required for manual/advanced runs.
+                needs_review = bool(
+                    matching_job.get("product_identity_required")
+                    and not ux_auto_generate
+                )
                 
                 # Check if identity verification is failed based on metadata or status
                 is_failed = False

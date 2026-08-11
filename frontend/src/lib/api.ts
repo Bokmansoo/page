@@ -4,6 +4,15 @@ export function apiUrl(path: string): string {
   return `${API_BASE_URL}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
+/**
+ * Browser calls to the API must carry the httpOnly Sellform session cookie.
+ * Keep this wrapper as the default for new UI work; it avoids reintroducing
+ * client-side mock user/workspace headers.
+ */
+export function sessionFetch(input: RequestInfo | URL, init: RequestInit = {}) {
+  return fetch(input, { ...init, credentials: "include" });
+}
+
 export type StructuredIntakeDraft = {
   product_name: { value: string; source: string; confidence: string };
   category?: { value: string; source: string; confidence: string };
@@ -33,7 +42,7 @@ export async function structureIntake(
   },
   headers: Record<string, string> = {}
 ): Promise<StructuredIntakeDraft> {
-  const res = await fetch(apiUrl("/api/agent-runs/structure-intake"), {
+  const res = await sessionFetch(apiUrl("/api/agent-runs/structure-intake"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

@@ -213,6 +213,7 @@ class VisualPackagePlanner:
                     "role_confidence": getattr(asset, "role_confidence", 0.0),
                     "quality_status": getattr(asset, "quality_status", "warning"),
                     "quality_warnings": getattr(asset, "quality_warnings", []) or [],
+                    "content_hash": getattr(asset, "content_hash", None),
                     "ocr_text": getattr(asset, "ocr_text", None),
                     "is_representative": getattr(asset, "is_representative", False),
                 })

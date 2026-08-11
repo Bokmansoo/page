@@ -4,6 +4,7 @@
 # pyright: reportArgumentType=false, reportAssignmentType=false, reportReturnType=false, reportGeneralTypeIssues=false, reportCallIssue=false, reportOptionalMemberAccess=false, reportAttributeAccessIssue=false
 
 import logging
+from datetime import datetime, timezone
 import anthropic
 from typing import Optional, List, Dict, Any, Literal
 from types import SimpleNamespace
@@ -13,8 +14,16 @@ from sqlalchemy.orm import Session
 from src.api.auth import get_current_user_and_workspace
 from src.config import settings
 from src.db.database import get_db
-from src.db.models import ProductProject, ProductPage, PageSection, PageVersion, ProductFact, Asset, User, AgentRun, ImageGenerationJobRecord, CommerceStoryBaselineRecord
+from src.db.models import ProductProject, ProductPage, PageSection, PageVersion, DetailPageVersion, ProductFact, Asset, User, AgentRun, ImageGenerationJobRecord, CommerceStoryBaselineRecord
 from src.schemas.planning_draft import PlanningDraftSchema
+from src.schemas.api_ready_generation import (
+    ApiReadyGenerationPlanSchema,
+    GroundedCopyDraftRequestSchema,
+    GroundedCopyDraftResponseSchema,
+    GroundedCopyDraftDecisionSchema,
+    GroundedCopyDraftEstimateSchema,
+    GenerationPlanUpdateSchema,
+)
 
 from src.services.page_generator import PageGenerationService
 from src.services.style_strategy_service import generate_style_candidates, get_category_frame, is_valid_style_candidate_key
@@ -48,6 +57,16 @@ from src.services.page_asset_policy import (
 from src.services.visual_contract_backfill import backfill_page_visuals
 from src.services.planning_draft_service import PlanningDraftService
 from src.services.commerce_policy import CONFIRMED_FACT_STATUSES, final_spec_is_last, resolved_asset_usage_status
+from src.services.storyboard_service import (
+    StoryboardValidationError,
+    approve_storyboard,
+    generate_storyboard,
+    record_storyboard_revision,
+    restore_storyboard_revision,
+    select_recommendation,
+    validate_storyboard,
+)
+from src.services.commerce_renderer_service import build_commerce_artifact
 
 
 router = APIRouter(tags=["Page Editor"])
@@ -66,12 +85,18 @@ class CreatePageRequest(BaseModel):
     )
 
 
+class PlanningDraftApprovalRequest(BaseModel):
+    """Permit a text-first page draft while AI scene images are pending."""
+
+    allow_pending_images: bool = False
+
+
 class SectionUpdateSchema(BaseModel):
     id: str
     title: Optional[str] = None
     body_copy: Optional[str] = None
     image_asset_id: Optional[str] = None
-    visual_kind: Optional[Literal["image", "html_graphic"]] = None
+    visual_kind: Optional[Literal["image", "html_graphic", "composed_product"]] = None
     visual_payload: Optional[dict] = None
     sort_order: int
     is_visible: bool
@@ -82,7 +107,7 @@ class SectionCreateSchema(BaseModel):
     body_copy: Optional[str] = None
     associated_fact_ids: List[str] = []
     image_asset_id: Optional[str] = None
-    visual_kind: Optional[Literal["image", "html_graphic"]] = None
+    visual_kind: Optional[Literal["image", "html_graphic", "composed_product"]] = None
     visual_payload: Optional[dict] = None
     sort_order: Optional[int] = None
 
@@ -91,9 +116,45 @@ class UpdatePageRequest(BaseModel):
     font_family: Optional[str] = None
     sections: List[SectionUpdateSchema]
     confirm_low_quality_hero: bool = False
+    # The latest DetailPageVersion id known by the editor.  Omitting this keeps
+    # legacy clients working; providing it gives Sprint 6 block edits an
+    # optimistic-locking guard instead of silently overwriting another edit.
+    expected_version_id: Optional[str] = None
+    # UX-2B: an unsupported claim is first returned as a warning. The client
+    # must explicitly send this acknowledgement on a second save attempt.
+    confirm_unsupported_claims: bool = False
+
+
+class CommerceRendererArtifactSchema(BaseModel):
+    artifact_version: str
+    template_key: str
+    template_tokens: Dict[str, Any]
+    theme_color: str
+    font_family: str
+    sections: List[Dict[str, Any]]
+    renderer_rules: Dict[str, Any]
+    artifact_hash: str
+    ready: bool
+    blockers: List[Dict[str, Any]]
+    warnings: List[Dict[str, Any]] = []
+
+
+class ContentQualityAcknowledgementSchema(BaseModel):
+    section_id: str
+    code: str
+    asset_id: Optional[str] = None
 
 class RegenerateSectionRequest(BaseModel):
     user_instruction: str = Field(..., description="AI에게 내릴 섹션 수정 요구사항")
+
+
+class StoryboardRecommendationSelectSchema(BaseModel):
+    candidate_key: str
+
+
+class StoryboardRestoreSchema(BaseModel):
+    revision: int
+
 
 class GroundingWarningSchema(BaseModel):
     risk_type: str
@@ -112,6 +173,7 @@ class SectionResponseSchema(BaseModel):
     title: Optional[str]
     body_copy: Optional[str]
     associated_fact_ids: Optional[List[str]]
+    associated_fact_texts: List[str] = []
     image_asset_id: Optional[str]
     visual_kind: Optional[str] = None
     visual_payload: Optional[dict] = None
@@ -157,6 +219,10 @@ class PageVersionResponseSchema(BaseModel):
         from_attributes = True
 
 
+class PageVersionSnapshotSchema(PageVersionResponseSchema):
+    sections_json: Dict[str, Any]
+
+
 class FinalPageVersionResponseSchema(PageVersionResponseSchema):
     sections_json: Dict[str, Any]
 
@@ -200,7 +266,7 @@ def create_page_snapshot(page: ProductPage, db: Optional[Session] = None) -> Dic
         assets = get_page_eligible_assets(db, page.project_id)
         eligible_asset_ids = {asset.id for asset in assets}
 
-    return {
+    snapshot = {
         "theme_color": page.theme_color,
         "font_family": page.font_family,
         "style_key": page.project.selected_style if page.project else None,
@@ -220,6 +286,7 @@ def create_page_snapshot(page: ProductPage, db: Optional[Session] = None) -> Dic
                 ),
                 "visual_kind": sec.visual_kind,
                 "visual_payload": sec.visual_payload or {},
+                "facts_stale": sec.facts_stale,
                 "sort_order": sec.sort_order,
                 "is_visible": sec.is_visible
             }
@@ -238,6 +305,17 @@ def create_page_snapshot(page: ProductPage, db: Optional[Session] = None) -> Dic
                 "confidence": fact.confidence,
                 "needs_review": fact.needs_review,
                 "risk_flags": fact.risk_flags,
+                "field_key": fact.field_key,
+                "fact_category": fact.fact_category,
+                "original_text": fact.original_text,
+                "translated_text": fact.translated_text,
+                "normalized_value": fact.normalized_value,
+                "normalized_unit": fact.normalized_unit,
+                "scope": fact.scope,
+                "model_option": fact.model_option,
+                "extractor_version": fact.extractor_version,
+                "conflict_group_key": fact.conflict_group_key,
+                "evidence_ids": [item.id for item in fact.evidences],
             }
             for fact in facts
         ],
@@ -253,6 +331,18 @@ def create_page_snapshot(page: ProductPage, db: Optional[Session] = None) -> Dic
             for asset in assets
         ],
     }
+    if db is not None:
+        from src.services.commerce_content_quality_service import inspect_content_quality
+        from src.services.api_ready_generation_service import (
+            generation_rendering_contract,
+            get_generation_plan as get_api_ready_generation_plan,
+        )
+        snapshot["ux2d_content_quality"] = inspect_content_quality(page, db)
+        generation_plan = get_api_ready_generation_plan(page.project)
+        if generation_plan:
+            snapshot["ux2e0_generation_plan"] = generation_plan
+            snapshot.setdefault("commerce_renderer", {})["api_generation"] = generation_rendering_contract(generation_plan)
+    return snapshot
 
 
 def get_project_or_404(db: Session, project_id: str, workspace_id: str) -> ProductProject:
@@ -272,7 +362,12 @@ def get_page_or_404(db: Session, project_id: str, workspace_id: str) -> ProductP
     # original product photo before a page is displayed or exported.
     from src.services.detail_page_orchestrator import DetailPageOrchestrator
     DetailPageOrchestrator.repair_mock_visual_assets(project, db)
-    page = db.query(ProductPage).filter(ProductPage.project_id == project_id).first()
+    page = (
+        db.query(ProductPage)
+        .filter(ProductPage.project_id == project_id)
+        .order_by(ProductPage.created_at.asc(), ProductPage.id.asc())
+        .first()
+    )
     if not page:
         raise HTTPException(status_code=404, detail="Page draft not found for this project")
     return page
@@ -314,6 +409,94 @@ def format_planning_card_body_copy(card: dict) -> str:
         bullet if bullet.startswith(("- ", "* ", "• ")) else f"- {bullet}"
         for bullet in bullets
     )
+
+
+def _asset_candidate_block_reason(asset: Asset) -> str | None:
+    """Explain why a project image cannot be placed in a final page yet."""
+    usage_status = resolved_asset_usage_status(asset)
+    if usage_status == "reference_only":
+        return "공급처·참고 사진입니다. 최종 사용 권한을 확인한 뒤에만 선택할 수 있습니다."
+    if usage_status == "blocked":
+        return "최종 상세페이지에 사용할 수 없는 사진입니다. 출처와 사용 권한을 확인해 주세요."
+    if asset.quality_status == "rejected":
+        return "이미지 품질 검토에서 제외된 사진입니다."
+    return "최종 출력에 사용할 수 없는 사진입니다."
+
+
+def _asset_candidate_recommended(section: PageSection, asset: Asset) -> bool:
+    """Keep recommendations deterministic while the seller remains in control."""
+    role = (asset.asset_role or "unknown").lower()
+    section_type = (section.section_type or "").lower()
+    preferred_roles = {
+        "hero": {"product_main"},
+        "feature_1": {"feature", "product_detail", "material_detail"},
+        "feature_2": {"feature", "product_detail", "material_detail"},
+        "feature_3": {"feature", "product_detail", "material_detail"},
+        "usage_guide": {"usage_scene", "feature", "product_detail"},
+        "details_components": {"components", "package", "shipping_info", "spec_reference"},
+        "product_information": {"spec_reference", "package", "components", "shipping_info"},
+    }
+    return role in preferred_roles.get(section_type, set()) or (
+        section_type == "hero" and bool(asset.is_representative)
+    )
+
+
+def _with_project_asset_candidates(
+    candidates: list[dict],
+    section: PageSection,
+    db: Session,
+    project_id: str,
+) -> list[dict]:
+    """Append project photos when no image-generation job exists.
+
+    UX-2C treats generated-image jobs as optional.  A seller must always be
+    able to select a direct upload, while reference-only photos remain visible
+    with a clear permission block instead of silently disappearing.
+    """
+    eligible_ids = {asset.id for asset in get_page_eligible_assets(db, project_id)}
+    existing_asset_ids = {
+        str(candidate.get("asset_id"))
+        for candidate in candidates
+        if candidate.get("asset_id")
+    }
+    project_assets = (
+        db.query(Asset)
+        .filter(Asset.project_id == project_id, Asset.mime_type.like("image/%"))
+        .order_by(Asset.is_representative.desc(), Asset.created_at.asc())
+        .all()
+    )
+    result = list(candidates)
+    for asset in project_assets:
+        if asset.id in existing_asset_ids:
+            continue
+        eligible = asset.id in eligible_ids
+        result.append(
+            {
+                "candidate_id": f"asset:{asset.id}",
+                "slot_id": section.section_type,
+                "asset_id": asset.id,
+                "label": asset.filename,
+                "source_type": asset.source_type,
+                "usage_status": resolved_asset_usage_status(asset),
+                "eligible": eligible,
+                "block_reason": None if eligible else _asset_candidate_block_reason(asset),
+                "asset_role": asset.asset_role,
+                "is_recommended": _asset_candidate_recommended(section, asset),
+                "recommendation_reason": (
+                    f"{asset.asset_role or '미분류'} 역할이 {section.section_type} 섹션과 일치합니다."
+                    if _asset_candidate_recommended(section, asset)
+                    else None
+                ),
+                "needs_identity_review": asset.identity_status != "confirmed",
+                "status": "available" if eligible else "blocked",
+                "quality_warnings": asset.quality_warnings or [],
+                "source_asset_id": asset.source_asset_id,
+                "cutout_status": asset.cutout_status,
+                "background_removed": asset.background_removed,
+                "product_identity_preserved": asset.product_identity_preserved,
+            }
+        )
+    return result
 
 
 def get_image_candidates_for_section(
@@ -415,7 +598,9 @@ def get_image_candidates_for_section(
                 cand_dict["background_removed"] = linked_asset.background_removed
                 cand_dict["product_identity_preserved"] = linked_asset.product_identity_preserved
             enriched_candidates.append(cand_dict)
-        return enriched_candidates
+        return _with_project_asset_candidates(
+            enriched_candidates, section, db, project_id
+        )
     
     candidates = []
     if job_records:
@@ -466,7 +651,7 @@ def get_image_candidates_for_section(
                 cand_dict["background_removed"] = asset.background_removed
                 cand_dict["product_identity_preserved"] = asset.product_identity_preserved
         enriched_candidates.append(cand_dict)
-    return enriched_candidates
+    return _with_project_asset_candidates(enriched_candidates, section, db, project_id)
 
 
 def build_section_response(section: PageSection, db: Session) -> SectionResponseSchema:
@@ -483,6 +668,11 @@ def build_section_response(section: PageSection, db: Session) -> SectionResponse
     matched_facts = map_section_to_facts(text, facts_list)
     
     candidates_list = get_image_candidates_for_section(section, db, project_id)
+    associated_fact_texts = [
+        fact.fact_text
+        for fact in confirmed_facts
+        if fact.id in (section.associated_fact_ids or [])
+    ]
 
     return SectionResponseSchema(
         id=section.id,
@@ -490,6 +680,7 @@ def build_section_response(section: PageSection, db: Session) -> SectionResponse
         title=section.title,
         body_copy=section.body_copy,
         associated_fact_ids=section.associated_fact_ids,
+        associated_fact_texts=associated_fact_texts,
         image_asset_id=section.image_asset_id,
         visual_kind=section.visual_kind or ("image" if section.image_asset_id else None),
         visual_payload=section.visual_payload or {},
@@ -527,6 +718,11 @@ def build_page_response(page: ProductPage, db: Session) -> PageResponseSchema:
         text = f"{section.title or ''} {section.body_copy or ''}"
         g_warnings = detect_claim_risks(text, facts_list)
         matched_facts = map_section_to_facts(text, facts_list)
+        associated_fact_texts = [
+            fact.fact_text
+            for fact in confirmed_facts
+            if fact.id in (section.associated_fact_ids or [])
+        ]
 
         for fact in matched_facts:
             used_facts.add(fact)
@@ -540,6 +736,7 @@ def build_page_response(page: ProductPage, db: Session) -> PageResponseSchema:
             title=section.title,
             body_copy=section.body_copy,
             associated_fact_ids=section.associated_fact_ids,
+            associated_fact_texts=associated_fact_texts,
             image_asset_id=section.image_asset_id,
             visual_kind=section.visual_kind or ("image" if section.image_asset_id else None),
             visual_payload=section.visual_payload or {},
@@ -804,6 +1001,7 @@ def create_page_draft(
                     "role_confidence": a.role_confidence,
                     "quality_status": a.quality_status,
                     "quality_warnings": a.quality_warnings or [],
+                    "content_hash": a.content_hash,
                     "ocr_text": a.ocr_text,
                     "is_representative": a.is_representative,
                 }
@@ -852,6 +1050,94 @@ def get_page_details(
     clear_unconfirmed_low_quality_hero_assignments(db, project_id)
     page = get_visual_ready_page_or_404(db, project_id, workspace.id)
     return build_page_response(page, db)
+
+
+@router.get("/projects/{project_id}/page/content-quality")
+def get_page_content_quality(
+    project_id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    page = get_visual_ready_page_or_404(db, project_id, auth_ctx["workspace"].id)
+    from src.services.commerce_content_quality_service import inspect_content_quality
+    return inspect_content_quality(page, db)
+
+
+@router.post("/projects/{project_id}/page/content-quality/acknowledge")
+def acknowledge_page_content_quality(
+    project_id: str,
+    payload: ContentQualityAcknowledgementSchema,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    page = get_visual_ready_page_or_404(db, project_id, auth_ctx["workspace"].id)
+    section = next((item for item in page.sections if item.id == payload.section_id), None)
+    if not section:
+        raise HTTPException(status_code=404, detail="Section not found")
+    from src.services.commerce_content_quality_service import inspect_content_quality
+    current_quality = inspect_content_quality(page, db)
+    acknowledgeable_codes = {
+        "duplicate_asset", "duplicate_asset_group", "foreign_text_exposed",
+        "phone_number_exposed", "price_exposed", "qr_code_review",
+        "market_or_competitor_text", "supplier_text_exposed",
+    }
+    matching_issue = next(
+        (
+            issue for issue in current_quality["reviews"]
+            if issue["section_id"] == payload.section_id
+            and issue["code"] == payload.code
+            and issue.get("asset_id") == payload.asset_id
+        ),
+        None,
+    )
+    if payload.code not in acknowledgeable_codes or not matching_issue:
+        raise HTTPException(status_code=422, detail="This quality item must be corrected rather than acknowledged")
+    entries = list((section.visual_payload or {}).get("ux2d_quality_acknowledgements", []))
+    marker = {
+        "code": payload.code,
+        "asset_id": payload.asset_id,
+        "acknowledged_by": auth_ctx["user"].id,
+        "acknowledged_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if not any(item.get("code") == marker["code"] and item.get("asset_id") == marker["asset_id"] for item in entries if isinstance(item, dict)):
+        entries.append(marker)
+    section.visual_payload = {**dict(section.visual_payload or {}), "ux2d_quality_acknowledgements": entries}
+    db.commit()
+    from src.services.page_version_service import create_page_version
+    quality = inspect_content_quality(page, db)
+    snapshot = create_page_snapshot(page, db)
+    snapshot["ux2d_content_quality"] = quality
+    create_page_version(
+        project_id=project_id,
+        name="판매용 품질 확인",
+        sections=snapshot,
+        style_key=page.project.selected_style or "problem_solution",
+        db=db,
+    )
+    return quality
+
+
+@router.get(
+    "/projects/{project_id}/page/commerce-artifact",
+    response_model=CommerceRendererArtifactSchema,
+)
+def get_commerce_renderer_artifact(
+    project_id: str,
+    template_key: Literal["commerce_story", "commerce_story_soft", "commerce_story_bold"] = "commerce_story",
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Return the immutable snapshot consumed by preview and export.
+
+    This is intentionally read-only: page edits continue through PATCH and
+    create a normal DetailPageVersion afterwards.  The response gives the UI a
+    single contract for export/readiness messages and prevents supplier
+    reference files from slipping into an output renderer.
+    """
+    workspace = auth_ctx["workspace"]
+    page = get_visual_ready_page_or_404(db, project_id, workspace.id)
+    assets = db.query(Asset).filter(Asset.project_id == project_id).all()
+    return build_commerce_artifact(page, assets, template_key=template_key)
 
 
 @router.get("/projects/{project_id}/page/readiness", response_model=PageReadiness)
@@ -1021,6 +1307,17 @@ def finalize_page_endpoint(
     get_project_or_404(db, project_id, workspace.id)
     get_visual_ready_page_or_404(db, project_id, workspace.id)
 
+    from src.services.commerce_content_quality_service import inspect_content_quality
+    page = get_visual_ready_page_or_404(db, project_id, workspace.id)
+    quality = inspect_content_quality(page, db)
+    if not quality["ready_for_sale"]:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "판매용 품질 확인 항목을 해결하거나 사용 확인한 뒤 최종본을 만들 수 있습니다.",
+                "content_quality": quality,
+            },
+        )
     try:
         return finalize_page(db, project_id)
     except PageDraftNotFoundError as exc:
@@ -1059,6 +1356,23 @@ def save_page_details(
     if not page:
         raise HTTPException(status_code=404, detail="Page draft not found")
 
+    if req.expected_version_id:
+        latest_version = (
+            db.query(DetailPageVersion)
+            .filter(DetailPageVersion.project_id == project_id)
+            .order_by(DetailPageVersion.created_at.desc())
+            .first()
+        )
+        if latest_version and latest_version.id != req.expected_version_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "page_version_conflict",
+                    "message": "다른 수정이 먼저 저장되었습니다. 최신 버전을 불러온 뒤 다시 저장해 주세요.",
+                    "latest_version_id": latest_version.id,
+                },
+            )
+
     # 2. 현재 페이지 정보 업데이트
     if req.theme_color is not None:
         page.theme_color = req.theme_color
@@ -1067,6 +1381,8 @@ def save_page_details(
 
     # 3. 개별 섹션 정보 루프 업데이트
     sections_dict = {sec.id: sec for sec in page.sections}
+    from src.services.rule_based_copy_service import unsupported_claims
+    acknowledged_claims_by_section: dict[str, list[str]] = {}
     for sec_update in req.sections:
         if sec_update.id not in sections_dict:
             raise HTTPException(
@@ -1077,10 +1393,20 @@ def save_page_details(
             db, project_id, sec_update.image_asset_id
         ):
             raise HTTPException(
-                status_code=400,
+                status_code=422,
                 detail="Image asset is not eligible for page rendering",
             )
-        if sec_update.image_asset_id and sections_dict[sec_update.id].section_type == "hero":
+        current_section = sections_dict[sec_update.id]
+        requested_image_asset_id = sec_update.image_asset_id or None
+        image_asset_changed = (
+            "image_asset_id" in sec_update.model_fields_set
+            and requested_image_asset_id != current_section.image_asset_id
+        )
+        if (
+            image_asset_changed
+            and requested_image_asset_id
+            and current_section.section_type == "hero"
+        ):
             asset = get_page_eligible_asset(db, project_id, sec_update.image_asset_id)
             hero_warning_codes = {
                 "LOW_RESOLUTION",
@@ -1098,6 +1424,20 @@ def save_page_details(
                     status_code=409,
                     detail="This image has quality warnings. Confirm before using it as the HERO image.",
                 )
+        edited_text = f"{sec_update.title or ''} {sec_update.body_copy or ''}"
+        unsupported = unsupported_claims(edited_text)
+        if unsupported and not req.confirm_unsupported_claims:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "unsupported_claim_requires_review",
+                    "section_id": sec_update.id,
+                    "claims": unsupported,
+                    "message": "근거가 확인되지 않은 효능·인증·보증 표현입니다. 사실 근거를 확인한 뒤 다시 입력해 주세요.",
+                },
+            )
+        if unsupported:
+            acknowledged_claims_by_section[sec_update.id] = unsupported
 
     requested_by_id = {section.id: section for section in req.sections}
     candidate_sections = [
@@ -1118,22 +1458,33 @@ def save_page_details(
 
     for sec_update in req.sections:
         sec = sections_dict[sec_update.id]
+        selection_marker: dict[str, Any] | None = None
+        image_asset_changed = False
         if sec_update.title is not None:
             sec.title = sec_update.title
         if sec_update.body_copy is not None:
             sec.body_copy = sec_update.body_copy
-        if sec_update.image_asset_id is not None:
-            sec.image_asset_id = sec_update.image_asset_id or None
+        if "image_asset_id" in sec_update.model_fields_set:
+            requested_image_asset_id = sec_update.image_asset_id or None
+            image_asset_changed = requested_image_asset_id != sec.image_asset_id
+            if image_asset_changed:
+                sec.image_asset_id = requested_image_asset_id
+                selection_marker = {
+                    "ux2c_selection_state": (
+                        "manual_image" if sec.image_asset_id else "manual_text"
+                    ),
+                    "asset_id": sec.image_asset_id,
+                }
             # Selecting a real candidate resolves the temporary Sprint 1
             # photo/source-approval placeholder. Keep the visual payload from
             # advertising a missing image after the asset has been applied.
-            if sec.image_asset_id and sec.visual_payload:
+            if image_asset_changed and sec.image_asset_id and sec.visual_payload:
                 sec.visual_payload = {
                     key: value
                     for key, value in sec.visual_payload.items()
                     if key != "missing_state"
                 }
-            if sec.section_type == "hero":
+            if image_asset_changed and sec.section_type == "hero":
                 payload = dict(sec.visual_payload or {})
                 selected_asset = (
                     get_page_eligible_asset(db, project_id, sec.image_asset_id)
@@ -1159,7 +1510,30 @@ def save_page_details(
         if sec_update.visual_kind is not None:
             sec.visual_kind = sec_update.visual_kind
         if sec_update.visual_payload is not None:
-            sec.visual_payload = sec_update.visual_payload
+            # Keep server-owned review evidence even when the client sends its
+            # full visual payload back with an otherwise unrelated edit.
+            server_payload = dict(sec.visual_payload or {})
+            sec.visual_payload = dict(sec_update.visual_payload)
+            if server_payload.get("low_quality_hero_confirmed"):
+                sec.visual_payload["low_quality_hero_confirmed"] = True
+            # Quality acknowledgements are server evidence. A broad client
+            # PATCH (for example changing a title) must not erase who checked
+            # an OCR/duplicate warning or when they checked it.
+            if server_payload.get("ux2d_quality_acknowledgements"):
+                sec.visual_payload["ux2d_quality_acknowledgements"] = server_payload["ux2d_quality_acknowledgements"]
+        if selection_marker is not None:
+            sec.visual_payload = {
+                **dict(sec.visual_payload or {}),
+                **selection_marker,
+            }
+        if sec.id in acknowledged_claims_by_section:
+            payload = dict(sec.visual_payload or {})
+            payload["unsupported_claim_review"] = {
+                "claims": acknowledged_claims_by_section[sec.id],
+                "acknowledged_by": user.id,
+                "status": "seller_reconfirmation_required",
+            }
+            sec.visual_payload = payload
 
         # Validate visual contract if visual fields are provided
         if sec_update.visual_kind is not None or sec_update.visual_payload is not None:
@@ -1211,6 +1585,25 @@ def list_page_versions_endpoint(
     versions = get_versions(project_id, db=db)
     versions = sorted(versions, key=lambda v: v.created_at, reverse=True)
     return versions
+
+
+@router.get("/projects/{project_id}/page/versions/{version_id}", response_model=PageVersionSnapshotSchema)
+def get_page_version_snapshot_endpoint(
+    project_id: str,
+    version_id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Return a read-only snapshot for Sprint 6 before/after comparison."""
+    workspace = auth_ctx["workspace"]
+    get_project_or_404(db, project_id, workspace.id)
+    version = db.query(DetailPageVersion).filter(
+        DetailPageVersion.id == version_id,
+        DetailPageVersion.project_id == project_id,
+    ).first()
+    if not version:
+        raise HTTPException(status_code=404, detail="Page version not found")
+    return version
 
 
 @router.post(
@@ -1402,13 +1795,27 @@ def restore_page_version_endpoint(
             body_copy=sec_snap.get("body_copy") or sec_snap.get("body"),
             associated_fact_ids=sec_snap.get("associated_fact_ids") or [],
             image_asset_id=sec_snap.get("image_asset_id"),
+            visual_kind=sec_snap.get("visual_kind"),
+            visual_payload=sec_snap.get("visual_payload") or {},
             sort_order=sec_snap.get("sort_order", idx),
-            is_visible=sec_snap.get("is_visible", True)
+            is_visible=sec_snap.get("is_visible", True),
+            facts_stale=bool(sec_snap.get("facts_stale", False)),
         )
         db.add(restored_section)
 
     db.commit()
     db.refresh(page)
+
+    # Restoring is itself an edit and must be recoverable like all other
+    # Sprint 6 block operations.
+    from src.services.page_version_service import create_page_version
+    create_page_version(
+        project_id=project_id,
+        name="버전 복원",
+        sections=create_page_snapshot(page, db),
+        style_key=page.project.selected_style or "commerce_story",
+        db=db,
+    )
 
     return build_page_response(page, db)
 
@@ -1520,15 +1927,16 @@ def auto_map_images_endpoint(
             "role_confidence": asset.role_confidence,
             "quality_status": asset.quality_status,
             "quality_warnings": asset.quality_warnings or [],
+            "content_hash": asset.content_hash,
             "ocr_text": asset.ocr_text,
             "is_representative": asset.is_representative,
         })
 
     from src.services.image_asset_mapper import (
         find_missing_image_roles,
-        map_image_assets_to_sections,
+        map_with_upload_order_fallback,
     )
-    assignments = map_image_assets_to_sections(sections_data, assets_data)
+    assignments = map_with_upload_order_fallback(sections_data, assets_data)
     missing_roles = find_missing_image_roles(
         sections_data, assets_data, assignments
     )
@@ -1546,12 +1954,26 @@ def auto_map_images_endpoint(
         if not sec:
             continue
 
-        # If not overwrite and already has image_asset_id, skip it
-        if not payload.overwrite and sec.image_asset_id:
+        # Preserve both an explicit photo and an explicit text-only choice.
+        selection_state = dict(sec.visual_payload or {}).get("ux2c_selection_state")
+        if not payload.overwrite and (
+            sec.image_asset_id or selection_state in {"manual_image", "manual_text"}
+        ):
             skipped_count += 1
             continue
 
         sec.image_asset_id = assignment["asset_id"]
+        sec.visual_kind = "image"
+        sec.visual_payload = {
+            **dict(sec.visual_payload or {}),
+            "asset_id": assignment["asset_id"],
+            "image_assignment": {
+                "asset_role": assignment["asset_role"],
+                "confidence": assignment["confidence"],
+                "reason": assignment["reason"],
+            },
+            "ux2c_selection_state": "automatic",
+        }
         assigned_count += 1
         result_assignments.append(ImageAssignmentSchema(
             section_id=sec_id,
@@ -2298,7 +2720,8 @@ def create_planning_draft(
         ProductFact.verification_status.in_(CONFIRMED_FACT_STATUSES),
     ).all()
 
-    draft = PlanningDraftService.generate_draft(project, confirmed_facts, db)
+    assets = db.query(Asset).filter(Asset.project_id == project_id).all()
+    draft = generate_storyboard(project, confirmed_facts, assets, db, auth_ctx["user"].id)
     project.planning_draft = draft
     db.commit()
     db.refresh(project)
@@ -2316,25 +2739,253 @@ def update_planning_draft(
     workspace = auth_ctx["workspace"]
     project = get_project_or_404(db, project_id, workspace.id)
 
-    project.planning_draft = payload.model_dump()
+    existing = project.planning_draft or {}
+    draft = {**existing, **payload.model_dump(exclude_unset=True)}
+    draft["revision_history"] = existing.get("revision_history") or []
+    confirmed_facts = db.query(ProductFact).filter(
+        ProductFact.project_id == project_id,
+        ProductFact.verification_status.in_(CONFIRMED_FACT_STATUSES),
+    ).all()
+    assets = db.query(Asset).filter(Asset.project_id == project_id).all()
+    try:
+        validate_storyboard(draft, assets, {fact.id for fact in confirmed_facts if not fact.needs_review})
+    except StoryboardValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    draft["status"] = "draft"
+    draft = record_storyboard_revision(draft, "edited")
+    project.planning_draft = draft
     db.commit()
     db.refresh(project)
 
     return PlanningDraftSchema(**project.planning_draft)
 
 
+@router.get("/projects/{project_id}/generation-plan", response_model=ApiReadyGenerationPlanSchema)
+def get_generation_plan(
+    project_id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Return the provider-free UX-2E-0 brief and scene plan."""
+    from src.services.api_ready_generation_service import get_generation_plan as get_stored_plan
+
+    project = get_project_or_404(db, project_id, auth_ctx["workspace"].id)
+    plan = get_stored_plan(project)
+    if not plan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="AI 생성 준비 계획이 없습니다.")
+    return ApiReadyGenerationPlanSchema(**plan)
+
+
+@router.post("/projects/{project_id}/generation-plan", response_model=ApiReadyGenerationPlanSchema)
+def create_generation_plan(
+    project_id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Create/refresh a deterministic plan; this endpoint never calls an AI provider."""
+    from src.services.api_ready_generation_service import create_or_refresh_generation_plan
+
+    project = get_project_or_404(db, project_id, auth_ctx["workspace"].id)
+    plan = create_or_refresh_generation_plan(project, db)
+    db.commit()
+    db.refresh(project)
+    return ApiReadyGenerationPlanSchema(**plan)
+
+
+@router.patch("/projects/{project_id}/generation-plan", response_model=ApiReadyGenerationPlanSchema)
+def update_generation_plan(
+    project_id: str,
+    payload: GenerationPlanUpdateSchema,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    from src.services.api_ready_generation_service import update_generation_plan as update_stored_plan
+
+    project = get_project_or_404(db, project_id, auth_ctx["workspace"].id)
+    try:
+        plan = update_stored_plan(
+            project,
+            db,
+            [item.model_dump(exclude_unset=True) for item in payload.scenes],
+            payload.product_brief.model_dump(exclude_unset=True) if payload.product_brief else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    db.commit()
+    db.refresh(project)
+    return ApiReadyGenerationPlanSchema(**plan)
+
+
+@router.post("/projects/{project_id}/generation-plan/copy-drafts", response_model=GroundedCopyDraftResponseSchema)
+def create_generation_plan_copy_drafts(
+    project_id: str,
+    payload: GroundedCopyDraftRequestSchema,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Create seller-review-only Korean drafts from confirmed fact IDs."""
+    project = get_project_or_404(db, project_id, auth_ctx["workspace"].id)
+    if auth_ctx.get("role") not in {"owner", "admin", "member", "editor"}:
+        raise HTTPException(status_code=403, detail="카피 생성에는 편집 권한이 필요합니다.")
+    from src.services.api_ready_generation_service import get_generation_plan, save_generation_plan
+    from src.services.ocr_copy_generation_service import create_grounded_copy_drafts
+    plan = get_generation_plan(project)
+    if not plan:
+        raise HTTPException(status_code=409, detail="상품 브리프·장면 계획을 먼저 만드세요.")
+    try:
+        result = create_grounded_copy_drafts(db, project, plan, payload.scene_ids or None, payload.seller_cost_approved, auth_ctx["user"].id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    save_generation_plan(project, result["plan"])
+    db.commit()
+    return GroundedCopyDraftResponseSchema(**result)
+
+
+@router.get("/projects/{project_id}/generation-plan/copy-drafts/estimate", response_model=GroundedCopyDraftEstimateSchema)
+def estimate_generation_plan_copy_drafts(
+    project_id: str,
+    scene_ids: list[str] | None = None,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    project = get_project_or_404(db, project_id, auth_ctx["workspace"].id)
+    from src.services.api_ready_generation_service import get_generation_plan
+    from src.services.ocr_copy_generation_service import estimate_grounded_copy_drafts
+    plan = get_generation_plan(project)
+    if not plan:
+        raise HTTPException(status_code=409, detail="상품 브리프·장면 계획을 먼저 만드세요.")
+    return GroundedCopyDraftEstimateSchema(**estimate_grounded_copy_drafts(project, plan, scene_ids))
+
+
+@router.patch("/projects/{project_id}/generation-plan/copy-drafts/{scene_id}")
+def decide_generation_plan_copy_draft(
+    project_id: str,
+    scene_id: str,
+    payload: GroundedCopyDraftDecisionSchema,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    project = get_project_or_404(db, project_id, auth_ctx["workspace"].id)
+    if auth_ctx.get("role") not in {"owner", "admin", "member", "editor"}:
+        raise HTTPException(status_code=403, detail="카피 승인에는 편집 권한이 필요합니다.")
+    from src.services.api_ready_generation_service import get_generation_plan, save_generation_plan
+    from src.services.ocr_copy_generation_service import decide_copy_draft
+    plan = get_generation_plan(project)
+    if not plan:
+        raise HTTPException(status_code=409, detail="상품 브리프·장면 계획을 먼저 만드세요.")
+    try:
+        draft = decide_copy_draft(db, project, plan, scene_id, payload.seller_approved)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    save_generation_plan(project, plan)
+    db.commit()
+    return {"scene_id": scene_id, "copy_draft": draft}
+
+
+@router.post("/projects/{project_id}/storyboard/recommendations", response_model=PlanningDraftSchema)
+def regenerate_storyboard_recommendations(
+    project_id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Build provider-free Sprint 4 candidates from approved facts and assets."""
+    workspace = auth_ctx["workspace"]
+    project = get_project_or_404(db, project_id, workspace.id)
+    confirmed_facts = db.query(ProductFact).filter(
+        ProductFact.project_id == project_id,
+        ProductFact.verification_status.in_(CONFIRMED_FACT_STATUSES),
+    ).all()
+    assets = db.query(Asset).filter(Asset.project_id == project_id).all()
+    project.planning_draft = generate_storyboard(project, confirmed_facts, assets, db, auth_ctx["user"].id)
+    db.commit()
+    db.refresh(project)
+    return PlanningDraftSchema(**project.planning_draft)
+
+
+@router.post("/projects/{project_id}/storyboard/select", response_model=PlanningDraftSchema)
+def select_storyboard_recommendation(
+    project_id: str,
+    payload: StoryboardRecommendationSelectSchema,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    workspace = auth_ctx["workspace"]
+    project = get_project_or_404(db, project_id, workspace.id)
+    if not project.planning_draft:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Storyboard not found for this project")
+    try:
+        project.planning_draft = select_recommendation(project.planning_draft, payload.candidate_key)
+    except StoryboardValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    db.commit()
+    db.refresh(project)
+    return PlanningDraftSchema(**project.planning_draft)
+
+
+@router.post("/projects/{project_id}/storyboard/restore", response_model=PlanningDraftSchema)
+def restore_storyboard_draft(
+    project_id: str,
+    payload: StoryboardRestoreSchema,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    workspace = auth_ctx["workspace"]
+    project = get_project_or_404(db, project_id, workspace.id)
+    if not project.planning_draft:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Storyboard not found for this project")
+    try:
+        restored = restore_storyboard_revision(project.planning_draft, payload.revision)
+        facts = db.query(ProductFact).filter(
+            ProductFact.project_id == project_id,
+            ProductFact.verification_status.in_(CONFIRMED_FACT_STATUSES),
+        ).all()
+        assets = db.query(Asset).filter(Asset.project_id == project_id).all()
+        validate_storyboard(restored, assets, {fact.id for fact in facts if not fact.needs_review})
+        project.planning_draft = restored
+    except StoryboardValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    db.commit()
+    db.refresh(project)
+    return PlanningDraftSchema(**project.planning_draft)
+
+
+@router.post("/projects/{project_id}/storyboard/approve", response_model=PlanningDraftSchema)
+def approve_storyboard_draft(
+    project_id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Approve only the storyboard; Sprint 5 owns actual image generation."""
+    workspace = auth_ctx["workspace"]
+    project = get_project_or_404(db, project_id, workspace.id)
+    if not project.planning_draft:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="승인할 스토리보드가 없습니다.")
+    facts = db.query(ProductFact).filter(ProductFact.project_id == project_id).all()
+    assets = db.query(Asset).filter(Asset.project_id == project_id).all()
+    try:
+        approve_storyboard(project, assets, facts, db, auth_ctx["user"].id)
+    except StoryboardValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    db.commit()
+    db.refresh(project)
+    return PlanningDraftSchema(**project.planning_draft)
+
+
 @router.post("/projects/{project_id}/planning-draft/approve")
 def approve_planning_draft(
     project_id: str,
+    payload: PlanningDraftApprovalRequest | None = None,
     db: Session = Depends(get_db),
     auth_ctx: dict = Depends(get_current_user_and_workspace),
 ):
     import datetime
     from src.db.models import DetailPageVersion, ImageGenerationJobRecord
     from src.services.image_generation_service import execute_image_generation, sync_job_to_project_json
+    from src.services.storyboard_image_generation_service import SCENE_ROLES
 
     workspace = auth_ctx["workspace"]
     project = get_project_or_404(db, project_id, workspace.id)
+    allow_pending_images = bool(payload and payload.allow_pending_images)
 
     if not project.planning_draft:
         raise HTTPException(
@@ -2346,9 +2997,45 @@ def approve_planning_draft(
     enabled_cards = [card for card in cards if card.get("is_enabled", True)]
     enabled_cards.sort(key=lambda card: card.get("sort_order", 0))
 
+    # Preserve Sprint 5/7 scene approvals.  The old assembler deleted every
+    # image job, then recreated legacy jobs, which disconnected the approved
+    # scene images from the page that is assembled below.
+    storyboard_jobs = (
+        db.query(ImageGenerationJobRecord)
+        .filter(
+            ImageGenerationJobRecord.project_id == project_id,
+            ImageGenerationJobRecord.job_id.like("s5-%"),
+        )
+        .all()
+    )
+    storyboard_scene_jobs = {
+        job.section_id: job for job in storyboard_jobs if job.section_id
+    }
+    if storyboard_scene_jobs:
+        unfinished_scene_cards = []
+        for card in enabled_cards:
+            card_id = card.get("id")
+            if not card_id or (card.get("type") or "") not in SCENE_ROLES:
+                continue
+            job = storyboard_scene_jobs.get(card_id)
+            if job and (job.status != "approved" or not job.output_asset_id):
+                unfinished_scene_cards.append(card.get("title") or card.get("label") or card_id)
+        if unfinished_scene_cards and not allow_pending_images:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "승인 이미지로 상세페이지를 만들기 전에 모든 준비 장면의 최종 이미지를 "
+                    "업로드하고 '외형 확인 후 사용'을 완료해 주세요: "
+                    + ", ".join(unfinished_scene_cards)
+                ),
+            )
+
     # 기존 상세페이지와 이미지 생성 job을 교체해 중복 생성을 막는다.
     db.query(ProductPage).filter(ProductPage.project_id == project_id).delete()
-    db.query(ImageGenerationJobRecord).filter(ImageGenerationJobRecord.project_id == project_id).delete()
+    db.query(ImageGenerationJobRecord).filter(
+        ImageGenerationJobRecord.project_id == project_id,
+        ImageGenerationJobRecord.job_id.like("planning-%"),
+    ).delete(synchronize_session=False)
     db.flush()
 
     page = ProductPage(
@@ -2375,6 +3062,14 @@ def approve_planning_draft(
         if asset.source_type in {"self_shot", "uploaded", "url-extracted", "url-imported", "sourced"}
     ]
     product_reference_asset_ids = cutout_asset_ids or uploaded_product_asset_ids
+    # A Sprint 5-approved manual upload or provider output is already a final
+    # scene asset.  Rebuilding the page must keep it instead of queueing a
+    # second image-provider request (which is especially important for the
+    # provider-free manual-upload flow).
+    final_assets_by_id = {
+        asset.id: asset
+        for asset in get_page_eligible_assets(db, project_id)
+    }
     identity_preserving_card_types = {
         "hero",
         "lifestyle_scene",
@@ -2384,17 +3079,44 @@ def approve_planning_draft(
         "features",
         "cta",
     }
+    seen_body_copies: set[str] = set()
 
     for idx, card in enumerate(enabled_cards):
         visual_strategy = card.get("visual_strategy") or "text_only"
         card_type = card.get("type") or ""
+        selected_asset_id = card.get("image_asset_id")
+        selected_asset = final_assets_by_id.get(selected_asset_id) if selected_asset_id else None
         if card_type in {"specifications", "comparison", "pre_purchase", "product_information"}:
             needs_image = False
             visual_kind = "html_graphic"
         else:
-            needs_image = visual_strategy in {"image_overlay", "lifestyle_image", "graphic_chart"}
-            visual_kind = "image" if needs_image else "html_graphic"
+            needs_image = (
+                visual_strategy in {"image_overlay", "lifestyle_image", "graphic_chart"}
+                and selected_asset is None
+            )
+            visual_kind = "image" if needs_image or selected_asset else "html_graphic"
+        # "생성 대기 상태" is a strict no-provider path.  This applies not
+        # only to Sprint 5 scene jobs but also to legacy image-oriented cards
+        # (for example target_customer/lifestyle cards) that would otherwise
+        # create and synchronously execute a planning-* generation job below.
+        image_generation_pending = bool(
+            allow_pending_images
+            and not selected_asset
+            and (needs_image or (storyboard_scene_jobs and card_type in SCENE_ROLES))
+        )
+        if image_generation_pending:
+            needs_image = False
+            visual_kind = "html_graphic"
         body_copy = format_planning_card_body_copy(card)
+        normalized_body = " ".join(body_copy.split()).strip().lower()
+        if normalized_body and normalized_body in seen_body_copies:
+            # Repeating the same single fact in HERO and feature cards makes
+            # the freshly assembled page fail its own sale-quality gate. The
+            # title/visual still carries the section purpose, so omit only the
+            # redundant body instead of inventing replacement copy.
+            body_copy = ""
+        elif normalized_body:
+            seen_body_copies.add(normalized_body)
 
         section = PageSection(
             page_id=page.id,
@@ -2402,14 +3124,58 @@ def approve_planning_draft(
             title=card.get("title") or "",
             body_copy=body_copy,
             associated_fact_ids=card.get("source_fact_ids") or [],
-            image_asset_id=None,
+            image_asset_id=selected_asset.id if selected_asset else None,
             visual_kind=visual_kind,
-            visual_payload={"strategy": visual_strategy},
+            visual_payload={
+                "strategy": visual_strategy,
+                "image_generation_pending": image_generation_pending,
+                "facts_intentionally_empty": not bool(card.get("source_fact_ids")),
+                # A HERO selected through the storyboard's explicit
+                # "외형 확인 후 사용" flow is not an automatic low-quality
+                # assignment.  Retain that seller decision when the normal
+                # page-readiness cleanup runs.
+                **(
+                    {"low_quality_hero_confirmed": True}
+                    if (
+                        card_type == "hero"
+                        and selected_asset is not None
+                        and card.get("image_requirement") == "asset_ready"
+                    )
+                    else {}
+                ),
+                # Text-first narrative cards are valid HTML visuals even when
+                # they intentionally have no linked product fact or image.
+                **(
+                    {"layout_variant": "image_text"}
+                    if (
+                        visual_kind == "html_graphic"
+                        and visual_strategy == "text_only"
+                        and card_type in {
+                            "problem",
+                            "target_customer",
+                            "caution",
+                            "cta",
+                            "overall_summary",
+                        }
+                    )
+                    else {}
+                ),
+            },
             sort_order=idx,
             is_visible=True,
         )
         db.add(section)
         db.flush()
+
+        if needs_image and storyboard_scene_jobs and not allow_pending_images:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "승인된 장면 이미지를 찾을 수 없습니다. 스토리보드에서 해당 장면의 "
+                    "최종 이미지를 승인한 뒤 다시 상세페이지를 만들어 주세요: "
+                    + (card.get("title") or card.get("label") or card_type)
+                ),
+            )
 
         if needs_image:
             job_id = f"planning-{project_id}-{section.id}"
@@ -2461,7 +3227,7 @@ def approve_planning_draft(
             "body": body_copy,
             "body_copy": body_copy,
             "associated_fact_ids": section.associated_fact_ids or [],
-            "image_asset_id": None,
+            "image_asset_id": selected_asset.id if selected_asset else None,
             "visual_kind": visual_kind,
             "visual_payload": section.visual_payload or {},
             "sort_order": idx,

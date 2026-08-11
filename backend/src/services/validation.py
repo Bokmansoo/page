@@ -5,6 +5,7 @@ from fastapi import HTTPException, UploadFile
 from src.config import settings
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+REVIEW_DOCUMENT_EXTENSIONS = {".csv", ".txt", ".xlsx"}
 
 
 def validate_external_url(url: str) -> str:
@@ -51,7 +52,12 @@ def validate_external_url(url: str) -> str:
     return hostname
 
 
-def validate_file_upload(file: UploadFile, file_size: int) -> None:
+def validate_file_upload(
+    file: UploadFile,
+    file_size: int,
+    *,
+    allowed_extensions: set[str] | None = None,
+) -> None:
     """
     Validates the uploaded file for type and size constraints.
     Raises HTTPException 400 if validation fails.
@@ -61,10 +67,11 @@ def validate_file_upload(file: UploadFile, file_size: int) -> None:
     ext = ""
     if "." in filename:
         ext = filename.rsplit(".", 1)[-1]
-    if not ext or f".{ext.lower()}" not in ALLOWED_EXTENSIONS:
+    allowed = allowed_extensions or ALLOWED_EXTENSIONS
+    if not ext or f".{ext.lower()}" not in allowed:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid file type. Allowed types are: {', '.join(ALLOWED_EXTENSIONS)}"
+            detail=f"Invalid file type. Allowed types are: {', '.join(sorted(allowed))}"
         )
 
     # Check size

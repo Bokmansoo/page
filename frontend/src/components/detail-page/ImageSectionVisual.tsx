@@ -20,6 +20,7 @@ export default function ImageSectionVisual({
   const title = section.title || "";
   const body = section.body_copy || section.body || "";
   const isAiRedesignRequired = payload.missing_state === "ai_redesign_required";
+  const imageFit = payload.image_fit === "cover" ? "object-cover" : "object-contain";
 
   if (!imageSrc) {
     return (
@@ -49,7 +50,7 @@ export default function ImageSectionVisual({
       <img
         src={imageSrc}
         alt={section.title || ""}
-        className="aspect-[4/3] w-full bg-white object-contain"
+        className={`aspect-[4/3] w-full bg-white ${imageFit}`}
       />
       <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-slate-950/85 via-slate-950/25 to-transparent" />
       <figcaption className="absolute inset-x-0 bottom-0 p-5 text-white">

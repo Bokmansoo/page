@@ -4,6 +4,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from src.db.models import DetailPageVersion, ProductFact, ProductPage
+from src.services.commerce_renderer_service import build_commerce_artifact
 from src.services.page_asset_policy import get_page_eligible_assets
 
 
@@ -21,7 +22,13 @@ def build_final_page_snapshot(db: Session, page: ProductPage) -> dict[str, Any]:
     assets = get_page_eligible_assets(db, page.project_id)
     eligible_asset_ids = {asset.id for asset in assets}
 
-    return {
+    # Keep the renderer input in the final version as well as the legacy
+    # section snapshot.  The preview/export route reads this immutable
+    # contract first, so a later database edit cannot silently alter a paid
+    # export that was already finalized.
+    commerce_renderer = build_commerce_artifact(page, assets)
+
+    snapshot = {
         "theme_color": page.theme_color,
         "font_family": page.font_family,
         "style_key": page.project.selected_style if page.project else None,
@@ -76,7 +83,22 @@ def build_final_page_snapshot(db: Session, page: ProductPage) -> dict[str, Any]:
             }
             for asset in assets
         ],
+        "commerce_renderer": commerce_renderer,
     }
+    # UX-2D freezes the same content-quality decision with the immutable
+    # export snapshot.  A later draft edit therefore cannot silently change
+    # what was approved for sale or downloaded.
+    from src.services.commerce_content_quality_service import inspect_content_quality
+    from src.services.api_ready_generation_service import generation_rendering_contract, get_generation_plan
+    snapshot["ux2d_content_quality"] = inspect_content_quality(page, db)
+    generation_plan = get_generation_plan(page.project)
+    if generation_plan:
+        snapshot["ux2e0_generation_plan"] = generation_plan
+        # Export consumes ``commerce_renderer`` from this immutable snapshot.
+        # Store the pending-scene fallback policy beside it so JPG/ZIP exports
+        # can never be mistaken for completed AI-generated assets.
+        snapshot["commerce_renderer"]["api_generation"] = generation_rendering_contract(generation_plan)
+    return snapshot
 
 
 def get_final_page_version(db: Session, project_id: str) -> DetailPageVersion:

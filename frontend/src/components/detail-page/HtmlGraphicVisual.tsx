@@ -135,6 +135,17 @@ export default function HtmlGraphicVisual({ section }: HtmlGraphicVisualProps) {
   const payload = (section.visual_payload || {}) as Record<string, unknown>;
   const layoutVariant = (payload.layout_variant as string) || "image_text";
 
+  // DetailPageDocument already renders the title and formatted body copy.
+  // Text-only/fallback layouts have no additional graphic to render; drawing
+  // the body here again duplicated every paragraph in preview and export.
+  if (
+    payload.strategy === "text_only" ||
+    layoutVariant === "image_text" ||
+    layoutVariant === "hero_overlay"
+  ) {
+    return null;
+  }
+
   return (
     <div data-section-visual="html_graphic">
       {layoutVariant === "comparison_cards" && payload.cards ? (
@@ -154,11 +165,6 @@ export default function HtmlGraphicVisual({ section }: HtmlGraphicVisualProps) {
       ) : null}
       {layoutVariant === "checklist" && payload.items ? (
         <Checklist items={payload.items as VisualChecklistItem[]} />
-      ) : null}
-      {layoutVariant === "hero_overlay" || layoutVariant === "image_text" || layoutVariant === "text_only" || (!payload.cards && !payload.highlights && !payload.table_rows && !payload.steps && !payload.items) ? (
-        <div className="mt-8 text-sm text-slate-500">
-          <p>{section.body_copy || section.body || ""}</p>
-        </div>
       ) : null}
     </div>
   );
