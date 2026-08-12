@@ -21,7 +21,7 @@ from src.db.models import (
     ProductProject,
 )
 from src.services.channel_export_service import image_sha256
-from src.services.commerce_policy import is_asset_final_output_eligible
+from src.services.commerce_policy import REFERENCE_SOURCE_TYPES, is_asset_final_output_eligible
 from src.services.commerce_renderer_service import build_commerce_artifact
 from src.services.page_asset_policy import ORIGINAL_IMAGE_SOURCE_TYPES, get_page_eligible_assets
 from src.services.page_visual_contract import (
@@ -202,6 +202,7 @@ def _brand_asset_identity(asset: Asset) -> dict[str, str] | None:
     content_hash = str(asset.content_hash or "")
     if (
         (asset.usage_status or "").lower() not in {"seller_owned", "rights_confirmed"}
+        or (asset.source_type or "").lower() in {*REFERENCE_SOURCE_TYPES, "supplier"}
         or not asset.mime_type.startswith("image/")
         or not _SHA256_HEX.fullmatch(content_hash)
     ):
@@ -647,6 +648,37 @@ def _lg10_preview_sections(rendering: dict[str, Any]) -> list[dict[str, Any]]:
     return sections
 
 
+def _lg10_preview_brand_assets(rendering: dict[str, Any]) -> dict[str, dict[str, str] | None]:
+    """Keep only the renderer's frozen, hash-addressed Brand Kit identities."""
+
+    asset_layer = dict((rendering.get("brand_tokens") or {}).get("asset_layer") or {})
+    renderer_html = str(rendering.get("html") or "")
+    assets: dict[str, dict[str, str] | None] = {"logo": None, "watermark": None}
+    for role in assets:
+        placement = "header" if role == "logo" else "watermark"
+        identity = asset_layer.get(role)
+        if identity is None:
+            continue
+        if (
+            not isinstance(identity, dict)
+            or not str(identity.get("asset_id") or "")
+            or not _SHA256_HEX.fullmatch(str(identity.get("asset_content_hash") or ""))
+        ):
+            raise PageAssemblyInputError("LG-10 Brand Kit asset identity must be a stable SHA-256 reference.")
+        if not re.search(
+            rf'<(?:header|aside)\b(?=[^>]*data-brand-placement="{placement}")'
+            rf'(?=[^>]*data-asset-id="{re.escape(str(identity["asset_id"]))}")'
+            rf'(?=[^>]*data-asset-content-hash="{identity["asset_content_hash"]}")[^>]*>',
+            renderer_html,
+        ):
+            raise PageAssemblyInputError("LG-10 Brand Kit asset must be placed by the canonical renderer.")
+        assets[role] = {
+            "asset_id": str(identity["asset_id"]),
+            "asset_content_hash": str(identity["asset_content_hash"]),
+        }
+    return assets
+
+
 def persist_lg10_detail_page_version(
     *,
     run: AgentRun,
@@ -679,6 +711,7 @@ def persist_lg10_detail_page_version(
     version_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"sellform:lg10:{run.id}:{render_hash}"))
     brand_tokens = dict(rendering.get("brand_tokens") or {})
     preview_sections = _lg10_preview_sections(rendering)
+    preview_brand_assets = _lg10_preview_brand_assets(rendering)
     snapshot_payload = {
         "schema_version": LG10_DETAIL_PAGE_VERSION_SCHEMA_VERSION,
         "lg10": {
@@ -693,6 +726,7 @@ def persist_lg10_detail_page_version(
         "commerce_renderer": {
             "theme_color": str((brand_tokens.get("color_tokens") or {}).get("surface") or "#ffffff"),
             "font_family": str((brand_tokens.get("typography") or {}).get("body_font") or "system-ui, sans-serif"),
+            "brand_assets": preview_brand_assets,
             "sections": preview_sections,
         },
         "sections": preview_sections,

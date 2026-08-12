@@ -30,6 +30,7 @@ test("LG-10 completion exports only the frozen version and exposes both download
   };
   const htmlDownloadUrl = `/api/v1/projects/${projectId}/page/export/download/${frozenVersionId}-html`;
   const zipDownloadUrl = `/api/v1/projects/${projectId}/page/export/download/${frozenVersionId}-zip`;
+  const copyableHtml = `<div data-sellform-detail-page-version-id="${frozenVersionId}"><style>.sf-page{max-width:760px}</style><main class="sf-page"><table class="sf-spec-table"><tbody><tr><th>규격</th><td>고정 사양</td></tr></tbody></table><img src="data:image/png;base64,AAAA" alt="승인 이미지"></main></div>`;
 
   await page.route(`**/api/v1/projects/${projectId}/planning-draft`, (route) => route.fulfill({ status: 404, body: "{}" }));
   await page.route(`**/api/v1/projects/${projectId}/assets`, (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
@@ -45,6 +46,7 @@ test("LG-10 completion exports only the frozen version and exposes both download
       body: JSON.stringify({
         detail_page_version_id: frozenVersionId,
         approved_asset_manifest_hash: "a".repeat(64),
+        copyable_html: copyableHtml,
         html_download_url: htmlDownloadUrl,
         zip_download_url: zipDownloadUrl,
         warnings: [],
@@ -76,8 +78,14 @@ test("LG-10 completion exports only the frozen version and exposes both download
 
   await expect(page.getByTestId("lg10-copyable-html-download")).toHaveAttribute("href", new RegExp(`${frozenVersionId}-html$`));
   await expect(page.getByTestId("lg10-standalone-zip-download")).toHaveAttribute("href", new RegExp(`${frozenVersionId}-zip$`));
+  await expect(page.getByTestId("lg10-copyable-html-code")).toHaveValue(copyableHtml);
   expect(standaloneRequests).toEqual([{ final_version_id: frozenVersionId }]);
   expect(JSON.stringify(standaloneRequests)).not.toContain(otherVersionId);
+
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await page.getByTestId("lg10-copyable-html-copy").click();
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(copyableHtml);
+  await expect(page.getByRole("status")).toContainText("복사했습니다");
 
   await Promise.all([
     page.waitForEvent("download"),

@@ -15,6 +15,7 @@ interface FinalPageResponse {
     commerce_renderer?: {
       theme_color?: string;
       font_family?: string;
+      brand_assets?: DetailPageData["brand_assets"];
       sections?: DetailPageData["sections"];
     };
   };
@@ -50,6 +51,7 @@ export default function DetailPageRenderClient() {
           project_id: projectId,
           theme_color: rendererSnapshot?.theme_color || finalPage.sections_json.theme_color,
           font_family: rendererSnapshot?.font_family || finalPage.sections_json.font_family,
+          brand_assets: rendererSnapshot?.brand_assets,
           sections: rendererSnapshot?.sections || finalPage.sections_json.sections || [],
         });
         setAssets(assetsRes.ok ? await assetsRes.json() : []);

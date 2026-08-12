@@ -41,7 +41,16 @@ export interface DetailPageData {
   project_id: string;
   theme_color: string;
   font_family: string;
+  brand_assets?: {
+    logo?: DetailPageBrandAsset | null;
+    watermark?: DetailPageBrandAsset | null;
+  };
   sections: DetailPageSection[];
+}
+
+export interface DetailPageBrandAsset {
+  asset_id: string;
+  asset_content_hash: string;
 }
 
 export interface DetailPageAsset {
@@ -209,6 +218,8 @@ export default function DetailPageDocument({
       });
     })
     .sort((a, b) => a.sort_order - b.sort_order);
+  const logo = page.brand_assets?.logo;
+  const watermark = page.brand_assets?.watermark;
 
   useEffect(() => {
     if (!exportMode) return;
@@ -234,10 +245,21 @@ export default function DetailPageDocument({
 
   return (
     <article
-      className="mx-auto w-full max-w-[760px] overflow-hidden border border-slate-200 bg-white shadow-sm"
+      className="relative mx-auto w-full max-w-[760px] overflow-hidden border border-slate-200 bg-white shadow-sm"
       style={{ fontFamily: page.font_family }}
       data-detail-page-document="true"
     >
+      {logo ? (
+        <header className="flex items-center bg-white px-6 py-4" data-detail-page-brand-logo="true">
+          <img
+            src={detailAssetUrl({ id: logo.asset_id }, logo.asset_content_hash)}
+            alt="브랜드 로고"
+            className="max-h-14 max-w-[180px] object-contain"
+            data-asset-id={logo.asset_id}
+            data-asset-content-hash={logo.asset_content_hash}
+          />
+        </header>
+      ) : null}
       {exportMode && exportErrors.length > 0 ? (
         <div
           role="alert"
@@ -352,6 +374,20 @@ export default function DetailPageDocument({
           </section>
         );
       })}
+      {watermark ? (
+        <aside
+          className="pointer-events-none absolute bottom-4 right-4 z-10 opacity-20"
+          data-detail-page-brand-watermark="true"
+        >
+          <img
+            src={detailAssetUrl({ id: watermark.asset_id }, watermark.asset_content_hash)}
+            alt="브랜드 워터마크"
+            className="max-h-16 max-w-[132px] object-contain"
+            data-asset-id={watermark.asset_id}
+            data-asset-content-hash={watermark.asset_content_hash}
+          />
+        </aside>
+      ) : null}
     </article>
   );
 }

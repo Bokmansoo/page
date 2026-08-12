@@ -24,6 +24,7 @@ from src.services.export_service import (
     FrozenExportSnapshotError,
     _LG10_COPYABLE_HTML_ARTIFACT,
     _LG10_STANDALONE_PACKAGE_ARTIFACT,
+    build_lg10_copyable_html,
     build_lg10_standalone_export_bundle,
 )
 
@@ -79,6 +80,7 @@ class StandaloneExportRequest(BaseModel):
 class StandaloneExportResponse(BaseModel):
     detail_page_version_id: str
     approved_asset_manifest_hash: Optional[str]
+    copyable_html: str
     html_download_url: str
     zip_download_url: str
     warnings: List[str]
@@ -556,9 +558,18 @@ def create_lg10_standalone_export(
         )
         return artifact, asset
 
+    try:
+        copyable = build_lg10_copyable_html(
+            db=db,
+            project_id=project_id,
+            version=version,
+        )
+    except FrozenExportSnapshotError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     html_artifact, html_asset = _artifact_asset(_LG10_COPYABLE_HTML_ARTIFACT)
     zip_artifact, zip_asset = _artifact_asset(_LG10_STANDALONE_PACKAGE_ARTIFACT)
-    warnings: list[str] = []
+    warnings: list[str] = list(copyable["warnings"])
     if not html_asset or not zip_asset:
         try:
             bundle = build_lg10_standalone_export_bundle(
@@ -568,7 +579,7 @@ def create_lg10_standalone_export(
             )
         except FrozenExportSnapshotError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        warnings = list(bundle["warnings"])
+        warnings.extend(bundle["warnings"])
 
         def _persist_asset(*, path: str, source_type: str, mime_type: str) -> Asset:
             existing = db.query(Asset).filter_by(project_id=project_id, file_path=path).first()
@@ -623,9 +634,10 @@ def create_lg10_standalone_export(
     return StandaloneExportResponse(
         detail_page_version_id=version.id,
         approved_asset_manifest_hash=manifest.get("manifest_hash"),
+        copyable_html=copyable["html"],
         html_download_url=html_url,
         zip_download_url=zip_url,
-        warnings=warnings,
+        warnings=sorted(set(warnings)),
     )
 
 

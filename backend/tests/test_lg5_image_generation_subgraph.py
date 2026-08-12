@@ -440,6 +440,15 @@ def test_lg10_brand_tokens_use_only_rights_confirmed_assets_and_safe_fallback(
     assert blocked["asset_layer"] == {"logo": None, "watermark": None, "font_assets": []}
     assert blocked_logo.id not in repr(blocked["asset_layer"])
 
+    reference_logo.usage_status = "seller_owned"
+    supplier_with_claimed_rights = resolve_lg10_brand_renderer_tokens(
+        run=run,
+        brand_kit_ref={"brand_kit_version_id": trusted_version.id, "brand_kit_hash": trusted_version.content_hash},
+        db=db_session,
+    )
+    assert supplier_with_claimed_rights["asset_layer"]["logo"]["asset_id"] == trusted_logo.id
+    assert reference_logo.id not in repr(supplier_with_claimed_rights["asset_layer"])
+
 
 @pytest.mark.lg9_fake_e2e
 @pytest.mark.lg10_fake_e2e
@@ -614,6 +623,9 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
         "asset_id": brand_logo.id, "asset_content_hash": brand_logo.content_hash,
     }
     assert rendering["brand_tokens"]["asset_layer"]["watermark"] == rendering["brand_tokens"]["asset_layer"]["logo"]
+    assert f'data-asset-id="{brand_logo.id}"' in rendering["html"]
+    assert 'data-brand-placement="header"' in rendering["html"]
+    assert 'data-brand-placement="watermark"' in rendering["html"]
     assert rendering["canonical_input_ref"]["input_hash"] == canonical_input["input_hash"]
     assert rendering["page_assembly_ref"]["assembly_hash"] == assembly["assembly_hash"]
     assert re.fullmatch(r"[0-9a-f]{64}", rendering["render_hash"])
@@ -658,6 +670,26 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
     assert [section["section_type"] for section in version_snapshot["commerce_renderer"]["sections"]] == [
         section["section_id"] for section in rendering["sections"]
     ]
+    assert version_snapshot["commerce_renderer"]["brand_assets"] == {
+        "logo": {"asset_id": brand_logo.id, "asset_content_hash": brand_logo.content_hash},
+        "watermark": {"asset_id": brand_logo.id, "asset_content_hash": brand_logo.content_hash},
+    }
+    brand_logo_path = Path(brand_logo.file_path)
+    original_brand_logo_bytes = brand_logo_path.read_bytes()
+    try:
+        preview_brand_asset = client.get(
+            f"/api/v1/files/assets/{brand_logo.id}?expected_content_hash={brand_logo.content_hash}",
+            headers=auth_headers,
+        )
+        assert preview_brand_asset.status_code == 200
+        brand_logo_path.write_bytes(b"tampered-frozen-brand-logo")
+        rejected_preview_brand_asset = client.get(
+            f"/api/v1/files/assets/{brand_logo.id}?expected_content_hash={brand_logo.content_hash}",
+            headers=auth_headers,
+        )
+        assert rejected_preview_brand_asset.status_code == 409
+    finally:
+        brand_logo_path.write_bytes(original_brand_logo_bytes)
     assert {
         section["image_asset_id"]
         for section in version_snapshot["commerce_renderer"]["sections"]

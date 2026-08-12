@@ -95,6 +95,7 @@ type UploadAsset = {
 };
 
 type StandaloneExport = {
+  copyable_html: string;
   html_download_url: string;
   zip_download_url: string;
 };
@@ -140,6 +141,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   const [standaloneExport, setStandaloneExport] = useState<StandaloneExport | null>(null);
   const [standaloneExporting, setStandaloneExporting] = useState(false);
   const inFlightRef = useRef(false);
+  const copyableHtmlRef = useRef<HTMLTextAreaElement | null>(null);
   const resolvedRunIdRef = useRef<string | null>(runId ?? null);
 
   const recoveryStorageKey = useCallback(
@@ -327,6 +329,25 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     }
   };
 
+  const copyLg10Html = async () => {
+    const html = standaloneExport?.copyable_html;
+    if (!html) return;
+    try {
+      await navigator.clipboard.writeText(html);
+      setMessage("쇼핑몰 HTML 편집기에 붙여넣을 코드를 복사했습니다.");
+    } catch {
+      const textarea = copyableHtmlRef.current;
+      if (!textarea) {
+        setMessage("HTML 코드를 선택해 직접 복사해 주세요.");
+        return;
+      }
+      textarea.focus();
+      textarea.select();
+      const copied = document.execCommand("copy");
+      setMessage(copied ? "쇼핑몰 HTML 편집기에 붙여넣을 코드를 복사했습니다." : "HTML 코드를 선택해 직접 복사해 주세요.");
+    }
+  };
+
   if (loading) return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-500">LangGraph 승인 상태를 확인하는 중...</section>;
   if (view?.status === "failed") {
     const failure = view.values.execution?.last_error;
@@ -370,8 +391,10 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
         {detailPageVersionId ? <div className="mt-4 flex flex-wrap gap-2">
           <a href={`/workspace/projects/${projectId}/render?version_id=${encodeURIComponent(detailPageVersionId)}`} className="inline-flex rounded-lg bg-emerald-700 px-3 py-2 text-xs font-bold text-white">완성 상세페이지 미리보기</a>
           <button type="button" data-testid="lg10-standalone-export" onClick={() => void createStandaloneExport(detailPageVersionId)} disabled={standaloneExporting} className="rounded-lg border border-emerald-300 bg-white px-3 py-2 text-xs font-bold text-emerald-800 disabled:opacity-50">{standaloneExporting ? "HTML/ZIP 준비 중..." : "HTML/ZIP 내보내기"}</button>
-          {standaloneExport ? <><a data-testid="lg10-copyable-html-download" href={apiUrl(standaloneExport.html_download_url)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-800">HTML 다운로드</a><a data-testid="lg10-standalone-zip-download" href={apiUrl(standaloneExport.zip_download_url)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-800">ZIP 다운로드</a></> : null}
+          {standaloneExport ? <><button type="button" data-testid="lg10-copyable-html-copy" onClick={() => void copyLg10Html()} className="rounded-lg border border-emerald-300 bg-white px-3 py-2 text-xs font-bold text-emerald-800">쇼핑몰 HTML 코드 복사</button><a data-testid="lg10-copyable-html-download" href={apiUrl(standaloneExport.html_download_url)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-800">독립 실행 HTML 다운로드</a><a data-testid="lg10-standalone-zip-download" href={apiUrl(standaloneExport.zip_download_url)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-800">독립 실행 ZIP 다운로드</a></> : null}
         </div> : null}
+        {standaloneExport ? <details className="mt-3 rounded-lg border border-emerald-100 bg-white p-3 text-xs text-slate-700"><summary className="cursor-pointer font-bold text-emerald-800">복사할 쇼핑몰 HTML 코드 보기</summary><textarea ref={copyableHtmlRef} data-testid="lg10-copyable-html-code" readOnly value={standaloneExport.copyable_html} className="mt-3 h-40 w-full rounded border border-slate-200 p-2 font-mono text-[10px] text-slate-700" aria-label="쇼핑몰에 붙여넣을 HTML 코드" /></details> : null}
+        {message ? <p role="status" className="mt-3 text-xs font-semibold text-emerald-800">{message}</p> : null}
       </section>;
     }
     return null;

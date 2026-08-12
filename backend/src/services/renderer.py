@@ -180,7 +180,7 @@ def render_lg10_canonical_page_html(
     if logo:
         brand_html += (
             '<header class="sf-brand-logo" data-asset-id="{asset_id}" '
-            'data-asset-content-hash="{asset_hash}"></header>'
+            'data-asset-content-hash="{asset_hash}" data-brand-placement="header"></header>'
         ).format(
             asset_id=escape(str(logo["asset_id"]), quote=True),
             asset_hash=escape(str(logo["asset_content_hash"]), quote=True),
@@ -188,13 +188,17 @@ def render_lg10_canonical_page_html(
     if watermark:
         brand_html += (
             '<aside class="sf-brand-watermark" data-asset-id="{asset_id}" '
-            'data-asset-content-hash="{asset_hash}"></aside>'
+            'data-asset-content-hash="{asset_hash}" data-brand-placement="watermark"></aside>'
         ).format(
             asset_id=escape(str(watermark["asset_id"]), quote=True),
             asset_hash=escape(str(watermark["asset_content_hash"]), quote=True),
         )
     css = (
-        ".sf-page{{max-width:760px;margin:0 auto;font-family:{font};color:{text};background:{surface};}}"
+        ".sf-page{{position:relative;max-width:760px;margin:0 auto;font-family:{font};color:{text};background:{surface};}}"
+        ".sf-brand-logo{{display:flex;align-items:center;padding:18px 24px;background:{surface};}}"
+        ".sf-brand-logo img{{display:block;max-width:180px;max-height:56px;object-fit:contain;}}"
+        ".sf-brand-watermark{{position:absolute;right:18px;bottom:18px;z-index:1;opacity:.16;pointer-events:none;}}"
+        ".sf-brand-watermark img{{display:block;max-width:132px;max-height:64px;object-fit:contain;}}"
         ".sf-section{{padding:{spacing}px 24px;border-bottom:1px solid #e5e7eb;background:{surface};}}"
         ".sf-asset-layer{{min-height:{media_height}px;margin:0 0 20px;background:{muted};border-radius:12px;}}"
         ".sf-text-layer{{line-height:1.65;white-space:pre-wrap;}}"

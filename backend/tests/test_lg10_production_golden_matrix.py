@@ -275,7 +275,13 @@ def test_lg10_fake_provider_production_golden_matrix(
     assert assembly["approved_asset_manifest_ref"] == {"manifest_hash": manifest["manifest_hash"]}
     assert re.search(r"[가-힣]", rendering["html"])
     assert all(section["component_id"] in {"media_with_copy", "information_only"} for section in rendering["sections"])
-    assert ".sf-page{max-width:760px" in rendering["css"]
+    page_rule = re.search(r"\.sf-page\s*\{(?P<declarations>[^}]*)\}", rendering["css"])
+    assert page_rule, "The deterministic renderer must emit the .sf-page selector."
+    assert re.search(r"max-width\s*:\s*760px(?:;|$)", page_rule["declarations"])
+    assert re.search(r"position\s*:\s*relative(?:;|$)", page_rule["declarations"])
+    assert re.fullmatch(r"[0-9a-f]{64}", rendering["render_hash"])
+    assert rendering["canonical_input_ref"]["input_hash"] == generation["canonical_page_assembly_input"]["input_hash"]
+    assert rendering["page_assembly_ref"]["assembly_hash"] == assembly["assembly_hash"]
 
     version_id = rendering["detail_page_version"]["id"]
     version = db_session.query(DetailPageVersion).filter_by(id=version_id, project_id=run.project_id).one()

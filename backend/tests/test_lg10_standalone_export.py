@@ -13,6 +13,7 @@ from src.db.models import Asset, Brand, DetailPageVersion, ExportArtifact, Produ
 from src.services.export_service import (
     _LG10_COPYABLE_HTML_ARTIFACT,
     _LG10_STANDALONE_PACKAGE_ARTIFACT,
+    build_lg10_copyable_html,
     build_lg10_standalone_export_bundle,
     sanitize_copyable_html,
     FrozenExportSnapshotError,
@@ -91,6 +92,49 @@ def _seed_lg10_version(db_session, tmp_path):
     return user, workspace, project, version, first, second
 
 
+def _attach_frozen_brand_assets(db_session, tmp_path, project, version, *, usage_status="seller_owned", source_type="uploaded"):
+    """Add only renderer-placed Brand Kit identities to a frozen test snapshot."""
+
+    logo_path = tmp_path / "brand-logo.png"
+    unused_path = tmp_path / "unused-brand-logo.png"
+    logo_bytes = _png(logo_path, (14, 120, 96))
+    unused_bytes = _png(unused_path, (180, 20, 80))
+    logo = Asset(
+        id="lg10-brand-logo", project_id=project.id, source_type=source_type, usage_status=usage_status,
+        filename=logo_path.name, file_path=str(logo_path), mime_type="image/png", file_size=len(logo_bytes),
+        content_hash=hashlib.sha256(logo_bytes).hexdigest(), quality_status="usable",
+    )
+    unused = Asset(
+        id="lg10-unused-brand-logo", project_id=project.id, source_type="uploaded", usage_status="seller_owned",
+        filename=unused_path.name, file_path=str(unused_path), mime_type="image/png", file_size=len(unused_bytes),
+        content_hash=hashlib.sha256(unused_bytes).hexdigest(), quality_status="usable",
+    )
+    db_session.add_all([logo, unused])
+    db_session.flush()
+    rendering = version.sections_json["lg10"]["canonical_rendering"]
+    rendering["brand_tokens"] = {
+        "typography": {"body_font": "system-ui, sans-serif"},
+        "asset_layer": {
+            "logo": {"asset_id": logo.id, "asset_content_hash": logo.content_hash},
+            "watermark": {"asset_id": logo.id, "asset_content_hash": logo.content_hash},
+            "font_assets": [],
+        },
+    }
+    rendering["html"] = rendering["html"].replace(
+        '<main class="sf-page">',
+        (
+            '<main class="sf-page">'
+            f'<header class="sf-brand-logo" data-asset-id="{logo.id}" data-asset-content-hash="{logo.content_hash}" data-brand-placement="header"></header>'
+        ),
+    ).replace(
+        "</main>",
+        f'<aside class="sf-brand-watermark" data-asset-id="{logo.id}" data-asset-content-hash="{logo.content_hash}" data-brand-placement="watermark"></aside></main>',
+    )
+    flag_modified(version, "sections_json")
+    db_session.commit()
+    return logo, unused
+
+
 def test_lg10_standalone_bundle_is_local_sanitized_and_manifest_bound(db_session, tmp_path):
     _, _, project, version, first, second = _seed_lg10_version(db_session, tmp_path)
 
@@ -148,6 +192,90 @@ def test_lg10_standalone_zip_renders_locally_without_network_requests(db_session
         assert requested_urls
         assert all(url.startswith("file://") for url in requested_urls)
         browser.close()
+
+
+def test_lg10_copyable_html_embeds_frozen_assets_and_styles_for_marketplace_paste(db_session, tmp_path):
+    _, _, project, version, first, _ = _seed_lg10_version(db_session, tmp_path)
+    rendering = version.sections_json["lg10"]["canonical_rendering"]
+    rendering["html"] = rendering["html"].replace(
+        "</main>",
+        '<table class="sf-text-layer sf-spec-table"><tbody><tr><th>규격</th><td>고정 사양</td></tr></tbody></table></main>',
+    )
+    flag_modified(version, "sections_json")
+    db_session.commit()
+
+    result = build_lg10_copyable_html(db=db_session, project_id=project.id, version=version)
+    html = result["html"]
+    assert result["detail_page_version_id"] == version.id
+    assert f'data-sellform-detail-page-version-id="{version.id}"' in html
+    assert '<style data-sellform-copyable-html="true">' in html
+    assert "한국어 고정 카피" in html
+    assert "sf-spec-table" in html
+    assert "data:image/png;base64," in html
+    assert "assets/" not in html
+    assert "https://expired.example" not in html
+    assert "javascript:" not in html
+
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        page.set_content(html)
+        assert page.locator(".sf-page").evaluate("element => getComputedStyle(element).maxWidth") == "760px"
+        image = page.locator("img").first
+        assert image.evaluate("element => element.complete && element.naturalWidth > 0") is True
+        assert page.locator(".sf-spec-table").count() == 1
+        browser.close()
+
+
+def test_lg10_brand_assets_are_embedded_and_packaged_only_when_frozen_and_approved(db_session, tmp_path):
+    _, _, project, version, _, _ = _seed_lg10_version(db_session, tmp_path)
+    logo, unused = _attach_frozen_brand_assets(db_session, tmp_path, project, version)
+
+    copyable = build_lg10_copyable_html(db=db_session, project_id=project.id, version=version)
+    assert copyable["detail_page_version_id"] == version.id
+    assert copyable["html"].count(f'data-asset-id="{logo.id}"') == 2
+    assert copyable["html"].count("data:image/png;base64,") >= 3
+    assert unused.id not in copyable["html"]
+
+    bundle = build_lg10_standalone_export_bundle(
+        db=db_session, project_id=project.id, version=version, output_dir=str(tmp_path / "brand-exports"),
+    )
+    with zipfile.ZipFile(bundle["zip_path"]) as archive:
+        names = set(archive.namelist())
+        assert f"assets/{logo.id}.png" in names
+        assert f"assets/{unused.id}.png" not in names
+        copyable_html = archive.read("copyable.html").decode("utf-8")
+        assert copyable_html.count(f'img src="assets/{logo.id}.png"') == 2
+        manifest = json.loads(archive.read("approved-asset-manifest.json"))
+        assert manifest["brand_assets"] == [
+            {"role": "logo", "asset_id": logo.id, "asset_content_hash": logo.content_hash},
+            {"role": "watermark", "asset_id": logo.id, "asset_content_hash": logo.content_hash},
+        ]
+        assert {entry["asset_id"] for entry in manifest["bundled_assets"]} >= {logo.id}
+
+    Path(logo.file_path).write_bytes(b"brand-asset-replaced")
+    with pytest.raises(FrozenExportSnapshotError, match="Brand Kit asset bytes"):
+        build_lg10_copyable_html(db=db_session, project_id=project.id, version=version)
+
+
+@pytest.mark.parametrize(
+    ("usage_status", "source_type"),
+    (("reference_only", "sourced"), ("blocked", "uploaded")),
+)
+def test_lg10_brand_assets_reject_reference_or_blocked_snapshot_identities(
+    db_session, tmp_path, usage_status, source_type,
+):
+    _, _, project, version, _, _ = _seed_lg10_version(db_session, tmp_path)
+    logo, _ = _attach_frozen_brand_assets(
+        db_session, tmp_path, project, version, usage_status=usage_status, source_type=source_type,
+    )
+    assert logo.usage_status == usage_status
+    with pytest.raises(FrozenExportSnapshotError, match="Brand Kit asset bytes"):
+        build_lg10_standalone_export_bundle(
+            db=db_session, project_id=project.id, version=version, output_dir=str(tmp_path / "blocked-brand-exports"),
+        )
 
 
 def test_lg10_standalone_export_uses_static_fallback_for_unsupported_component(db_session, tmp_path):
@@ -219,6 +347,9 @@ def test_lg10_standalone_export_api_reuses_the_same_frozen_version_history(
     )
     assert first.status_code == second.status_code == 200
     assert first.json()["detail_page_version_id"] == second.json()["detail_page_version_id"] == version.id
+    assert "<style data-sellform-copyable-html=\"true\">" in first.json()["copyable_html"]
+    assert "data:image/png;base64," in first.json()["copyable_html"]
+    assert "assets/" not in first.json()["copyable_html"]
     assert first.json()["html_download_url"] == second.json()["html_download_url"]
     assert first.json()["zip_download_url"] == second.json()["zip_download_url"]
     assert {

@@ -1,3 +1,4 @@
+import base64
 import os
 import hashlib
 import json
@@ -15,7 +16,7 @@ from urllib.parse import urlencode
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from sqlalchemy.orm import Session
 from src.db.models import Asset, ExportArtifact
-from src.services.commerce_policy import is_asset_final_output_eligible
+from src.services.commerce_policy import REFERENCE_SOURCE_TYPES, is_asset_final_output_eligible
 from src.services.page_asset_policy import get_page_eligible_assets
 from src.services.channel_export_service import image_sha256
 
@@ -30,8 +31,50 @@ class FrozenExportSnapshotError(ValueError):
     """The immutable LG-10 version cannot safely be converted to a package."""
 
 
+def _frozen_lg10_brand_assets(rendering: dict[str, Any]) -> list[dict[str, str]]:
+    """Return the Brand Kit image identities actually placed by the frozen renderer."""
+
+    asset_layer = dict((rendering.get("brand_tokens") or {}).get("asset_layer") or {})
+    renderer_html = str(rendering.get("html") or "")
+    assets: list[dict[str, str]] = []
+    for role in ("logo", "watermark"):
+        placement = "header" if role == "logo" else "watermark"
+        identity = asset_layer.get(role)
+        if identity is None:
+            continue
+        if (
+            not isinstance(identity, dict)
+            or not str(identity.get("asset_id") or "")
+            or not _SHA256_HEX.fullmatch(str(identity.get("asset_content_hash") or ""))
+        ):
+            raise FrozenExportSnapshotError("Frozen Brand Kit asset identity is invalid.")
+        if not re.search(
+            rf'<(?:header|aside)\b(?=[^>]*data-brand-placement="{placement}")'
+            rf'(?=[^>]*data-asset-id="{re.escape(str(identity["asset_id"]))}")'
+            rf'(?=[^>]*data-asset-content-hash="{identity["asset_content_hash"]}")[^>]*>',
+            renderer_html,
+        ):
+            raise FrozenExportSnapshotError("Frozen Brand Kit asset is not placed by the canonical renderer.")
+        assets.append({
+            "role": role,
+            "asset_id": str(identity["asset_id"]),
+            "asset_content_hash": str(identity["asset_content_hash"]),
+        })
+    return assets
+
+
+def _is_lg10_brand_asset_eligible(asset: Asset) -> bool:
+    """Brand marks are seller-rights assets, never supplier/reference imagery."""
+
+    return (
+        (asset.usage_status or "").lower() in {"seller_owned", "rights_confirmed"}
+        and (asset.source_type or "").lower() not in {*REFERENCE_SOURCE_TYPES, "supplier"}
+        and bool(asset.mime_type and asset.mime_type.startswith("image/"))
+    )
+
+
 class _CopyableHtmlSanitizer(HTMLParser):
-    """Allow only static detail-page markup and relative bundled images."""
+    """Allow only static detail-page markup and mapped frozen images."""
 
     _allowed_tags = {
         "main", "header", "aside", "section", "figure", "img", "div", "h2",
@@ -197,6 +240,87 @@ def _copyable_html_from_frozen_renderer(
     return sanitize_copyable_html(str(rendering.get("html") or ""), asset_paths=asset_paths)
 
 
+def build_lg10_copyable_html(
+    *,
+    db: Session,
+    project_id: str,
+    version,
+) -> dict[str, Any]:
+    """Build paste-ready HTML from one frozen LG-10 version.
+
+    Unlike the standalone ZIP, this artifact has no local file dependency:
+    approved asset bytes are embedded only after their frozen SHA-256 identity
+    has been rechecked.  It intentionally never resolves mutable page state or
+    creates a public asset URL.
+    """
+
+    _, rendering, manifest = _frozen_lg10_export_inputs(version)
+    entries = [dict(item) for item in manifest.get("assets") or [] if isinstance(item, dict)]
+    brand_assets = _frozen_lg10_brand_assets(rendering)
+    asset_ids = [str(item.get("asset_id") or "") for item in entries]
+    brand_asset_ids = [str(item.get("asset_id") or "") for item in brand_assets]
+    if not all(asset_ids) or len(set(asset_ids)) != len(asset_ids) or not all(brand_asset_ids):
+        raise FrozenExportSnapshotError("Approved manifest contains invalid asset identities.")
+
+    assets = {
+        asset.id: asset
+        for asset in db.query(Asset).filter(
+            Asset.project_id == project_id,
+            Asset.id.in_([*asset_ids, *brand_asset_ids]),
+        ).all()
+    }
+    embedded_sources: dict[str, str] = {}
+    for entry in entries:
+        asset_id = str(entry.get("asset_id") or "")
+        expected_hash = str(entry.get("asset_content_hash") or "")
+        asset = assets.get(asset_id)
+        if (
+            asset is None
+            or not is_asset_final_output_eligible(asset)
+            or not _SHA256_HEX.fullmatch(expected_hash)
+            or asset.content_hash != expected_hash
+            or not asset.mime_type.startswith("image/")
+            or not asset.file_path
+            or not os.path.isfile(asset.file_path)
+            or image_sha256(asset.file_path) != expected_hash
+        ):
+            raise FrozenExportSnapshotError("Approved asset bytes no longer match the frozen DetailPageVersion.")
+        encoded = base64.b64encode(Path(asset.file_path).read_bytes()).decode("ascii")
+        embedded_sources[asset.id] = f"data:{asset.mime_type};base64,{encoded}"
+
+    for entry in brand_assets:
+        asset_id = entry["asset_id"]
+        expected_hash = entry["asset_content_hash"]
+        asset = assets.get(asset_id)
+        if (
+            asset is None
+            or not _is_lg10_brand_asset_eligible(asset)
+            or asset.content_hash != expected_hash
+            or not asset.file_path
+            or not os.path.isfile(asset.file_path)
+            or image_sha256(asset.file_path) != expected_hash
+        ):
+            raise FrozenExportSnapshotError("Brand Kit asset bytes no longer match the frozen DetailPageVersion.")
+        encoded = base64.b64encode(Path(asset.file_path).read_bytes()).decode("ascii")
+        embedded_sources[asset.id] = f"data:{asset.mime_type};base64,{encoded}"
+
+    fragment, warnings = _copyable_html_from_frozen_renderer(rendering, embedded_sources)
+    css, css_warnings = _sanitize_copyable_css(str(rendering.get("css") or ""))
+    warnings.extend(css_warnings)
+    if not fragment.strip() or not css.strip():
+        raise FrozenExportSnapshotError("Frozen renderer output cannot produce copyable HTML.")
+    copyable_html = (
+        f'<div data-sellform-detail-page-version-id="{escape(str(version.id), quote=True)}">'
+        f'<style data-sellform-copyable-html="true">{css}</style>{fragment}</div>'
+    )
+    return {
+        "detail_page_version_id": version.id,
+        "html": copyable_html,
+        "warnings": sorted(set(warnings)),
+        "approved_asset_manifest": manifest,
+    }
+
+
 def _safe_asset_extension(asset) -> str:
     extension = Path(asset.filename).suffix.lower()
     allowed = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -269,20 +393,23 @@ def build_lg10_standalone_export_bundle(
 ) -> dict[str, Any]:
     """Build a local-only HTML/CSS/image package from one frozen LG-10 version.
 
-    This deliberately consumes only the version's approved manifest. It never
-    resolves preview URLs, current page state, or non-manifest Brand Kit assets.
+    This deliberately consumes only frozen asset identities. It never resolves
+    preview URLs or mutable page state; Brand Kit images are included only when
+    the frozen renderer actually placed them.
     """
     _, rendering, manifest = _frozen_lg10_export_inputs(version)
     entries = [dict(item) for item in manifest.get("assets") or [] if isinstance(item, dict)]
+    brand_assets = _frozen_lg10_brand_assets(rendering)
     asset_ids = [str(item.get("asset_id") or "") for item in entries]
-    if not all(asset_ids) or len(set(asset_ids)) != len(asset_ids):
+    brand_asset_ids = [str(item.get("asset_id") or "") for item in brand_assets]
+    if not all(asset_ids) or len(set(asset_ids)) != len(asset_ids) or not all(brand_asset_ids):
         raise FrozenExportSnapshotError("Approved manifest contains invalid asset identities.")
 
     assets = {
         asset.id: asset
         for asset in db.query(Asset).filter(
             Asset.project_id == project_id,
-            Asset.id.in_(asset_ids),
+            Asset.id.in_([*asset_ids, *brand_asset_ids]),
         ).all()
     }
     output_root = Path(output_dir or os.path.join(os.getcwd(), "uploads", "exports"))
@@ -315,6 +442,30 @@ def build_lg10_standalone_export_bundle(
             "path": relative_path,
         })
 
+    for entry in brand_assets:
+        asset_id = entry["asset_id"]
+        expected_hash = entry["asset_content_hash"]
+        asset = assets.get(asset_id)
+        if (
+            asset is None
+            or not _is_lg10_brand_asset_eligible(asset)
+            or asset.content_hash != expected_hash
+            or not asset.file_path
+            or not os.path.isfile(asset.file_path)
+            or image_sha256(asset.file_path) != expected_hash
+        ):
+            raise FrozenExportSnapshotError("Brand Kit asset bytes no longer match the frozen DetailPageVersion.")
+        if asset_id in asset_paths:
+            continue
+        relative_path = f"assets/{asset.id}{_safe_asset_extension(asset)}"
+        shutil.copyfile(asset.file_path, package_root / relative_path)
+        asset_paths[asset.id] = relative_path
+        bundled_assets.append({
+            "asset_id": asset.id,
+            "asset_content_hash": expected_hash,
+            "path": relative_path,
+        })
+
     copyable_html, warnings = _copyable_html_from_frozen_renderer(rendering, asset_paths)
     css, css_warnings = _sanitize_copyable_css(str(rendering.get("css") or ""))
     warnings.extend(css_warnings)
@@ -325,6 +476,7 @@ def build_lg10_standalone_export_bundle(
         "schema_version": "lg10-standalone-export-v1",
         "detail_page_version_id": version.id,
         "approved_asset_manifest": manifest,
+        "brand_assets": brand_assets,
         "bundled_assets": bundled_assets,
     }
     font_manifest = {
