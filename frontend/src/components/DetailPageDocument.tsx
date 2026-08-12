@@ -26,6 +26,7 @@ export interface DetailPageSection {
   body?: string | null;
   body_copy?: string | null;
   image_asset_id?: string | null;
+  image_asset_content_hash?: string | null;
   visual_kind?: VisualKind | null;
   visual_payload?: Record<string, unknown> | null;
   sort_order: number;
@@ -87,11 +88,17 @@ function sourceLabel(sourceType: string): string {
   }
 }
 
-export function detailAssetUrl(asset: DetailPageAsset | { id: string; file_path?: string }): string {
-  if (asset.file_path && asset.file_path.startsWith("http")) {
+export function detailAssetUrl(
+  asset: DetailPageAsset | { id: string; file_path?: string },
+  expectedContentHash?: string | null,
+): string {
+  if (!expectedContentHash && asset.file_path && asset.file_path.startsWith("http")) {
     return asset.file_path;
   }
-  return apiUrl(`/api/v1/files/assets/${asset.id}`);
+  const url = apiUrl(`/api/v1/files/assets/${asset.id}`);
+  return expectedContentHash
+    ? `${url}?expected_content_hash=${encodeURIComponent(expectedContentHash)}`
+    : url;
 }
 
 function sectionTheme(sectionType: string, index: number) {
@@ -247,9 +254,9 @@ export default function DetailPageDocument({
         const imageSrc = isLegacyMockVisual
           ? null
           : matchedAsset
-          ? detailAssetUrl(matchedAsset)
+          ? detailAssetUrl(matchedAsset, section.image_asset_content_hash)
           : section.image_asset_id
-            ? detailAssetUrl({ id: section.image_asset_id })
+            ? detailAssetUrl({ id: section.image_asset_id }, section.image_asset_content_hash)
             : null;
         const title = section.title || "";
         const body = section.body_copy || section.body || "";

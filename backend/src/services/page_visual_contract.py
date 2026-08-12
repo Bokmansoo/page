@@ -16,6 +16,44 @@ PRODUCT_FITS = {"contain"}
 TEXT_SAFE_AREAS = {"left", "bottom"}
 BACKGROUND_TOKENS = {"surface_mint", "surface_ink", "surface_sand"}
 
+# LG-10 Page Assembly may select only these stable renderer-facing structures.
+# The next renderer task owns their concrete HTML/CSS representation.
+LG10_PAGE_ASSEMBLY_COMPONENTS = {
+    "media_with_copy": "image_text",
+    "information_only": "spec_table",
+}
+
+# LG-10.4 deliberately exposes a small, fixed renderer vocabulary.  The
+# direction selects token values only; it never accepts a free-form layout.
+LG10_DESIGN_DIRECTIONS = frozenset({"safe_information", "image_centric", "balanced_sale"})
+LG10_DESIGN_DIRECTION_ALIASES = {
+    # Existing storyboard choices are normalized before they enter the frozen
+    # LG-10 contract.  The contract itself contains only the three values
+    # above.
+    "visual_story": "image_centric",
+    "balanced_sales": "balanced_sale",
+}
+LG10_RENDERER_DIRECTION_TOKENS = {
+    "safe_information": {
+        "renderer_token": "safe_information_v1",
+        "media_min_height": 220,
+        "section_spacing": 32,
+        "title_scale": "compact",
+    },
+    "image_centric": {
+        "renderer_token": "image_centric_v1",
+        "media_min_height": 360,
+        "section_spacing": 40,
+        "title_scale": "comfortable",
+    },
+    "balanced_sale": {
+        "renderer_token": "balanced_sale_v1",
+        "media_min_height": 280,
+        "section_spacing": 36,
+        "title_scale": "balanced",
+    },
+}
+
 _SECTION_DEFAULT_LAYOUT = {
     "comparison": "comparison_cards",
     "detail_1": "benefit_cards",
@@ -144,3 +182,45 @@ def validate_visual(visual: dict[str, Any]) -> list[str]:
                 issues.append("html_checklist_grounding_required")
 
     return issues
+
+
+def normalize_lg10_design_direction(value: str | None) -> str:
+    """Return the only design-direction values permitted by the LG-10 contract."""
+
+    normalized = (value or "safe_information").strip().lower()
+    normalized = LG10_DESIGN_DIRECTION_ALIASES.get(normalized, normalized)
+    if normalized not in LG10_DESIGN_DIRECTIONS:
+        raise ValueError(f"LG-10 does not support design direction: {value}")
+    return normalized
+
+
+def lg10_renderer_direction_tokens(*, design_direction: str | None) -> dict[str, Any]:
+    """Return a copy of the fixed renderer tokens for one allowed direction."""
+
+    return dict(LG10_RENDERER_DIRECTION_TOKENS[normalize_lg10_design_direction(design_direction)])
+
+
+def select_lg10_page_assembly_component(
+    *,
+    rendering_mode: str,
+    design_direction: str | None = None,
+) -> dict[str, str]:
+    """Return the sole allowed component/layout choice for an assembly section.
+
+    This is intentionally deterministic: LG-10.2 persists a constrained
+    structural choice, not generated markup or a free-form layout proposal.
+    """
+
+    direction = normalize_lg10_design_direction(design_direction)
+    if rendering_mode in {"approved_asset", "seller_owned_fallback"}:
+        component_id = "media_with_copy"
+    elif rendering_mode == "information_only":
+        component_id = "information_only"
+    else:
+        raise ValueError(f"LG-10 cannot select a component for rendering mode: {rendering_mode}")
+    return {
+        "component_id": component_id,
+        "layout_token": LG10_PAGE_ASSEMBLY_COMPONENTS[component_id],
+        "design_direction": direction,
+        "renderer_token": str(LG10_RENDERER_DIRECTION_TOKENS[direction]["renderer_token"]),
+    }

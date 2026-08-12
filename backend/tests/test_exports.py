@@ -70,6 +70,33 @@ def test_local_download_is_not_blocked_by_qa_compliance():
 
 
 @patch("src.api.exports.get_current_user_and_workspace", Depends=mock_auth)
+def test_legacy_final_version_keeps_readiness_gate(mock_dep, client, db_session, test_setup):
+    """LG-10's frozen-version path must not bypass a legacy final version's gate."""
+
+    from src.api.auth import get_current_user_and_workspace
+    from src.db.models import DetailPageVersion
+
+    project = test_setup["project"]
+    db_session.add(DetailPageVersion(
+        project_id=project.id,
+        name="Legacy final",
+        style_key="modern",
+        sections_json=[{"key": "features", "title": "legacy", "body": "legacy"}],
+        is_final=True,
+    ))
+    db_session.commit()
+    client.app.dependency_overrides[get_current_user_and_workspace] = mock_auth
+
+    response = client.post(
+        f"/api/v1/projects/{project.id}/page/export",
+        json={"preset_name": "coupang", "final_version_id": db_session.query(DetailPageVersion).one().id},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["message"] == "Page is not ready for export. Resolve blockers first."
+
+
+@patch("src.api.exports.get_current_user_and_workspace", Depends=mock_auth)
 def test_compliance_and_export_blocker(mock_dep, client, db_session, test_setup):
     page = test_setup["page"]
     project = test_setup["project"]

@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 from typing import Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
@@ -11,6 +12,7 @@ from src.db.database import get_db
 from src.db.models import ProductProject, ProductPage, PageSection, Asset, AuditLog
 from src.services.validation import ALLOWED_EXTENSIONS, REVIEW_DOCUMENT_EXTENSIONS, validate_file_upload
 from src.services.commerce_policy import initial_asset_usage_status
+from src.services.channel_export_service import image_sha256
 
 router = APIRouter(prefix="/files", tags=["files"])
 
@@ -304,6 +306,7 @@ def apply_upscaled_asset(
 @router.get("/assets/{asset_id}")
 def get_asset_file(
     asset_id: str,
+    expected_content_hash: Optional[str] = None,
     db: Session = Depends(get_db),
     auth_ctx: dict = Depends(get_current_user_and_workspace),
 ):
@@ -327,6 +330,21 @@ def get_asset_file(
     file_path = asset.file_path
     if not file_path or not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Asset file not found")
+
+    # LG-10 immutable previews/export renders pin a final asset hash in their
+    # DetailPageVersion.  Legacy callers omit this optional query parameter
+    # and retain the existing file-serving behavior.
+    if expected_content_hash is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_content_hash):
+            raise HTTPException(status_code=400, detail="Expected asset content hash must be a lowercase SHA-256 hex value")
+        if image_sha256(file_path) != expected_content_hash:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "asset_snapshot_hash_mismatch",
+                    "message": "Asset bytes no longer match the finalized detail page version.",
+                },
+            )
 
     return FileResponse(
         file_path,

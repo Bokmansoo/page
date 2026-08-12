@@ -2,8 +2,15 @@ from __future__ import annotations
 
 from base64 import b64decode
 from contextlib import contextmanager
+from copy import deepcopy
+import hashlib
+from html import escape
 from io import BytesIO
+import json
+from pathlib import Path
 import re
+import zipfile
+from unittest.mock import patch
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
@@ -12,6 +19,9 @@ from PIL import Image, ImageDraw
 from src.db.models import (
     AgentRun,
     Asset,
+    BrandKit,
+    BrandKitVersion,
+    DetailPageVersion,
     FactEvidence,
     ImageGenerationCostApprovalRecord,
     ImageGenerationJobRecord,
@@ -153,15 +163,314 @@ def _to_generation_pending(client, headers, run_id: str, db_session=None, *, min
     return state
 
 
+def test_lg10_page_assembly_route_is_lg10_compiled_graph_only():
+    """Existing compiled graphs must retain their original terminal route."""
+
+    from src.agents.langgraph_runtime import (
+        _lg5_image_review_route,
+        _lg10_image_review_route,
+        build_lg5_compiled_graph,
+        build_lg6_compiled_graph,
+        build_lg7_compiled_graph,
+        build_lg8_compiled_graph,
+        build_lg10_compiled_graph,
+    )
+
+    approved_state = {
+        "generation": {
+            "next_action": "finalize",
+            "canonical_page_assembly_input": {"input_hash": "a" * 64},
+        },
+    }
+    assert _lg5_image_review_route(approved_state) == "finalize_run"
+    for builder in (
+        build_lg5_compiled_graph,
+        build_lg6_compiled_graph,
+        build_lg7_compiled_graph,
+        build_lg8_compiled_graph,
+    ):
+        assert "page_assembly" not in builder(checkpointer=InMemorySaver()).get_graph().nodes
+    lg10_graph = build_lg10_compiled_graph(checkpointer=InMemorySaver())
+    assert "page_assembly" in lg10_graph.get_graph().nodes
+    assert _lg10_image_review_route(approved_state) == "page_assembly"
+    assert _lg10_image_review_route({"generation": {"next_action": "finalize"}}) == "image_review"
+
+
+def test_lg10_page_assembly_rejects_invalid_canonical_input_in_production_graph():
+    """A malformed frozen input cannot become an assembly state or final run."""
+
+    from src.agents.langgraph_runtime import build_lg10_compiled_graph
+    from src.services.page_finalization_service import PageAssemblyInputError, build_page_assembly_structure
+
+    invalid_input = {"schema_version": "invalid"}
+    with pytest.raises(PageAssemblyInputError):
+        build_page_assembly_structure(canonical_page_assembly_input=invalid_input)
+
+    graph = build_lg10_compiled_graph(checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "lg10-invalid-canonical-test"}}
+    graph.update_state(
+        config,
+        {
+            "run_id": "invalid-run",
+            "project_id": "invalid-project",
+            "workspace_id": "invalid-workspace",
+            "mode": "mock",
+            "generation": {
+                "next_action": "finalize",
+                "canonical_page_assembly_input": invalid_input,
+            },
+        },
+        as_node="image_review",
+    )
+    with pytest.raises(PageAssemblyInputError):
+        graph.invoke(None, config)
+    assert not graph.get_state(config).values.get("page_assembly")
+
+
+def test_lg10_canonical_renderer_keeps_korean_text_and_assets_separate():
+    """Renderer output is deterministic and leaves image identities out of the text layer."""
+
+    from src.services.renderer import render_lg10_canonical_page_html
+
+    canonical_input = {
+        "design_direction": "balanced_sale",
+        "sections": [
+            {
+                "section_id": "hero",
+                "sort_order": 0,
+                "copy_ref": {"fields": ["hero_title", "hero_body"]},
+                "approved_assets": [{"asset_id": "asset-hero", "asset_content_hash": "a" * 64}],
+            },
+            {
+                "section_id": "product_information",
+                "sort_order": 1,
+                "copy_ref": {"fields": ["specification", "caution"]},
+                "approved_assets": [],
+            },
+        ],
+    }
+    assembly = {
+        "sections": [
+            {"section_id": "hero", "sort_order": 0, "component_id": "media_with_copy", "layout_token": "image_text", "design_direction": "balanced_sale", "renderer_token": "balanced_sale_v1"},
+            {"section_id": "product_information", "sort_order": 1, "component_id": "information_only", "layout_token": "spec_table", "design_direction": "balanced_sale", "renderer_token": "balanced_sale_v1"},
+        ],
+    }
+    copy_set = {
+        "hero_title": "강력한 바람을 빠르게 전달합니다",
+        "hero_body": "집과 사무실에서 간편하게 사용하세요.",
+        "specification": "정격 입력: DC 5V 2A",
+        "caution": "주의: 충전 중에는 물에 닿지 않게 하세요.",
+    }
+    brand_tokens = {
+        "brand_kit_version_id": None,
+        "color_tokens": {"accent": "#0f766e", "text": "#172033", "surface": "#ffffff", "muted_surface": "#eef2f7"},
+        "typography": {"body_font": "system-ui, sans-serif"},
+        "asset_layer": {"logo": None, "watermark": None, "font_assets": []},
+        "fallback": True,
+    }
+
+    rendered = render_lg10_canonical_page_html(
+        canonical_page_assembly_input=canonical_input,
+        page_assembly=assembly,
+        copy_set=copy_set,
+        brand_tokens=brand_tokens,
+    )
+    assert rendered == render_lg10_canonical_page_html(
+        canonical_page_assembly_input=canonical_input,
+        page_assembly=assembly,
+        copy_set=copy_set,
+        brand_tokens=brand_tokens,
+    )
+    assert [section["section_id"] for section in rendered["sections"]] == ["hero", "product_information"]
+    assert rendered["sections"][0]["asset_layer"] == [{"asset_id": "asset-hero", "asset_content_hash": "a" * 64}]
+    assert rendered["sections"][0]["text_layer"] == [
+        {"field": "hero_title", "text": copy_set["hero_title"]},
+        {"field": "hero_body", "text": copy_set["hero_body"]},
+    ]
+    assert rendered["sections"][1]["asset_layer"] == []
+    for text in copy_set.values():
+        assert escape(text) in rendered["html"]
+    information_start = rendered["html"].index('data-section-id="product_information"')
+    information_end = rendered["html"].index("</section>", information_start)
+    assert "sf-asset-layer" not in rendered["html"][information_start:information_end]
+    assert "<img" not in rendered["html"]
+    assert re.search(r'<figure class="sf-asset-layer"[^>]*></figure>', rendered["html"])
+
+
+def test_lg10_renderer_accepts_only_three_fixed_design_directions():
+    """Each allowed direction has a deterministic token; arbitrary layouts cannot enter rendering."""
+
+    from src.services.page_visual_contract import (
+        lg10_renderer_direction_tokens,
+        select_lg10_page_assembly_component,
+    )
+    from src.services.renderer import render_lg10_canonical_page_html
+
+    brand_tokens = {
+        "brand_kit_version_id": None,
+        "color_tokens": {"accent": "#0f766e", "text": "#172033", "surface": "#ffffff", "muted_surface": "#eef2f7"},
+        "typography": {"body_font": "system-ui, sans-serif"},
+        "asset_layer": {"logo": None, "watermark": None, "font_assets": []},
+        "fallback": True,
+    }
+    for direction in ("safe_information", "image_centric", "balanced_sale"):
+        selected = select_lg10_page_assembly_component(
+            rendering_mode="approved_asset",
+            design_direction=direction,
+        )
+        canonical_input = {
+            "design_direction": direction,
+            "sections": [{
+                "section_id": "hero", "sort_order": 0,
+                "copy_ref": {"fields": ["hero_title"]},
+                "approved_assets": [{"asset_id": "asset-hero", "asset_content_hash": "a" * 64}],
+            }],
+        }
+        rendered = render_lg10_canonical_page_html(
+            canonical_page_assembly_input=canonical_input,
+            page_assembly={"sections": [{"section_id": "hero", "sort_order": 0, **selected}]},
+            copy_set={"hero_title": "검증된 한국어 제목"},
+            brand_tokens=brand_tokens,
+        )
+        assert rendered["design_direction"] == direction
+        assert rendered["renderer_tokens"] == lg10_renderer_direction_tokens(design_direction=direction)
+        assert f'data-design-direction="{direction}"' in rendered["html"]
+
+        if direction in {"safe_information", "image_centric"}:
+            information_selected = select_lg10_page_assembly_component(
+                rendering_mode="information_only",
+                design_direction=direction,
+            )
+            information_rendered = render_lg10_canonical_page_html(
+                canonical_page_assembly_input={
+                    "design_direction": direction,
+                    "sections": [{
+                        "section_id": "product_information", "sort_order": 0,
+                        "copy_ref": {"fields": ["specification"]}, "approved_assets": [],
+                    }],
+                },
+                page_assembly={"sections": [{
+                    "section_id": "product_information", "sort_order": 0, **information_selected,
+                }]},
+                copy_set={"specification": "정격 입력: DC 5V 2A"},
+                brand_tokens=brand_tokens,
+            )
+            assert information_rendered["sections"][0]["component_id"] == "information_only"
+            assert information_rendered["sections"][0]["layout_token"] == "spec_table"
+            assert "sf-asset-layer" not in information_rendered["html"]
+
+    with pytest.raises(ValueError):
+        select_lg10_page_assembly_component(
+            rendering_mode="approved_asset",
+            design_direction="freeform_canvas",
+        )
+    with pytest.raises(ValueError, match="invalid component selection"):
+        render_lg10_canonical_page_html(
+            canonical_page_assembly_input=canonical_input,
+            page_assembly={"sections": [{
+                "section_id": "hero", "sort_order": 0, **selected, "layout_token": "freeform_canvas",
+            }]},
+            copy_set={"hero_title": "검증된 한국어 제목"},
+            brand_tokens=brand_tokens,
+        )
+
+
+def test_lg10_brand_tokens_use_only_rights_confirmed_assets_and_safe_fallback(
+    client, auth_headers, db_session, tmp_path
+):
+    """Logo/watermark identities cannot include reference-only assets."""
+
+    from src.services.page_finalization_service import resolve_lg10_brand_renderer_tokens
+
+    run = _create_run(client, auth_headers, db_session, tmp_path)
+    logo_file = tmp_path / "brand-logo.jpg"
+    logo_file.write_bytes(JPEG)
+    trusted_logo = Asset(
+        project_id=run.project_id, source_type="uploaded", usage_status="seller_owned",
+        filename=logo_file.name, file_path=str(logo_file), mime_type="image/jpeg", file_size=len(JPEG),
+        content_hash=hashlib.sha256(JPEG).hexdigest(), quality_status="usable",
+    )
+    reference_logo = Asset(
+        project_id=run.project_id, source_type="sourced", usage_status="reference_only",
+        filename="supplier-logo.jpg", file_path=str(tmp_path / "supplier-logo.jpg"), mime_type="image/jpeg",
+        file_size=len(JPEG), content_hash="b" * 64, quality_status="usable",
+    )
+    blocked_logo = Asset(
+        project_id=run.project_id, source_type="uploaded", usage_status="blocked",
+        filename="blocked-logo.jpg", file_path=str(tmp_path / "blocked-logo.jpg"), mime_type="image/jpeg",
+        file_size=len(JPEG), content_hash="f" * 64, quality_status="usable",
+    )
+    kit = BrandKit(workspace_id=run.workspace_id, name="LG10 renderer kit", created_by=run.created_by)
+    db_session.add_all([trusted_logo, reference_logo, blocked_logo, kit])
+    db_session.flush()
+    trusted_version = BrandKitVersion(
+        brand_kit_id=kit.id, workspace_id=run.workspace_id, version=1, status="active",
+        scope="workspace", logo_asset_ids=[trusted_logo.id, reference_logo.id],
+        color_tokens={"primary": "#2563EB", "secondary": "#EFF6FF"},
+        typography={"font_family": "Arial"}, watermark_policy={"mode": "logo_subtle"},
+        content_hash="c" * 64, created_by=run.created_by,
+    )
+    blocked_version = BrandKitVersion(
+        brand_kit_id=kit.id, workspace_id=run.workspace_id, version=2, status="draft",
+        scope="workspace", logo_asset_ids=[blocked_logo.id], content_hash="d" * 64,
+        created_by=run.created_by,
+    )
+    db_session.add_all([trusted_version, blocked_version])
+    db_session.commit()
+
+    trusted = resolve_lg10_brand_renderer_tokens(
+        run=run,
+        brand_kit_ref={"brand_kit_version_id": trusted_version.id, "brand_kit_hash": trusted_version.content_hash},
+        db=db_session,
+    )
+    assert trusted["fallback"] is False
+    assert trusted["color_tokens"]["accent"] == "#2563eb"
+    assert trusted["asset_layer"]["logo"] == {
+        "asset_id": trusted_logo.id, "asset_content_hash": trusted_logo.content_hash,
+    }
+    assert trusted["asset_layer"]["watermark"] == trusted["asset_layer"]["logo"]
+    assert reference_logo.id not in repr(trusted["asset_layer"])
+
+    blocked = resolve_lg10_brand_renderer_tokens(
+        run=run,
+        brand_kit_ref={"brand_kit_version_id": blocked_version.id, "brand_kit_hash": blocked_version.content_hash},
+        db=db_session,
+    )
+    assert blocked["fallback"] is True
+    assert blocked["asset_layer"] == {"logo": None, "watermark": None, "font_assets": []}
+    assert blocked_logo.id not in repr(blocked["asset_layer"])
+
+
 @pytest.mark.lg9_fake_e2e
+@pytest.mark.lg10_fake_e2e
 def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
-    client, auth_headers, db_session, lg5_runtime, tmp_path
+    client, auth_headers, db_session, lg5_runtime, testing_session_local, tmp_path
 ):
     run = _create_run(client, auth_headers, db_session, tmp_path)
+    project = db_session.query(ProductProject).filter(ProductProject.id == run.project_id).one()
+    brand_logo = db_session.query(Asset).filter(
+        Asset.project_id == run.project_id, Asset.asset_role == "product_main"
+    ).one()
+    brand_logo.content_hash = hashlib.sha256(JPEG).hexdigest()
+    kit = BrandKit(workspace_id=run.workspace_id, name="LG10 production renderer kit", created_by=run.created_by)
+    db_session.add(kit)
+    db_session.flush()
+    brand_version = BrandKitVersion(
+        brand_kit_id=kit.id, workspace_id=run.workspace_id, version=1, status="active",
+        scope="workspace", logo_asset_ids=[brand_logo.id],
+        color_tokens={"primary": "#2563EB", "secondary": "#EFF6FF"},
+        typography={"font_family": "Arial"}, watermark_policy={"mode": "logo_subtle"},
+        content_hash="e" * 64, created_by=run.created_by,
+    )
+    db_session.add(brand_version)
+    db_session.flush()
+    project.brand_kit_version_id = brand_version.id
+    run.input_snapshot = {**run.input_snapshot, "design_direction": "image_centric"}
+    db_session.commit()
     generation_wait = _to_generation_pending(
         client, auth_headers, run.id, db_session, minimum_generation_scenes=3
     )
-    project = db_session.query(ProductProject).filter(ProductProject.id == run.project_id).one()
+    db_session.refresh(project)
     assert project.planning_draft["status"] == "approved"
     assert db_session.query(ImageGenerationJobRecord).filter(ImageGenerationJobRecord.project_id == run.project_id).count() == 0
 
@@ -257,6 +566,162 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
     )
     assert all(re.fullmatch(r"[0-9a-f]{64}", item["asset_content_hash"]) for item in manifest["assets"])
     assert manifest["manifest_hash"]
+    canonical_input = image_review["values"]["generation"]["canonical_page_assembly_input"]
+    assert canonical_input["schema_version"] == "lg10-canonical-page-assembly-input-v1"
+    assert canonical_input["approved_asset_manifest"] == manifest
+    assert canonical_input["design_direction"] == "image_centric"
+    assert canonical_input["brand_kit_ref"] == {
+        "brand_kit_version_id": brand_version.id,
+        "brand_kit_hash": brand_version.content_hash,
+    }
+    assert re.fullmatch(r"[0-9a-f]{64}", canonical_input["input_hash"])
+    assert "brand_kit_version_id" in canonical_input["brand_kit_ref"]
+    assert canonical_input["channel_override_ref"]["channel_pack_version_id"]
+    assert [section["sort_order"] for section in canonical_input["sections"]] == list(
+        range(len(canonical_input["sections"]))
+    )
+    assert all(section["section_id"] and section["copy_ref"]["artifact_hash"] for section in canonical_input["sections"])
+    assert {
+        asset["asset_id"]
+        for section in canonical_input["sections"]
+        for asset in section["approved_assets"]
+    } == {asset["asset_id"] for asset in manifest["assets"]}
+    assembly = image_review["values"]["page_assembly"]
+    assert assembly["schema_version"] == "lg10-page-assembly-v1"
+    assert assembly["canonical_input_ref"] == {
+        "schema_version": canonical_input["schema_version"],
+        "input_hash": canonical_input["input_hash"],
+    }
+    assert assembly["design_direction"] == "image_centric"
+    assert assembly["brand_kit_ref"] == canonical_input["brand_kit_ref"]
+    assert assembly["approved_asset_manifest_ref"] == {"manifest_hash": manifest["manifest_hash"]}
+    assert all(
+        section["component_id"] in {"media_with_copy", "information_only"}
+        and section["layout_token"] in {"image_text", "spec_table"}
+        and section["design_direction"] == "image_centric"
+        and section["renderer_token"] == "image_centric_v1"
+        and section["selection_basis"] in {"approved_asset", "information_only"}
+        for section in assembly["sections"]
+    )
+    assert "html" not in repr(assembly).lower()
+    rendering = image_review["values"]["rendering"]
+    assert rendering["schema_version"] == "lg10-canonical-render-v1"
+    assert rendering["design_direction"] == "image_centric"
+    assert rendering["renderer_tokens"]["renderer_token"] == "image_centric_v1"
+    assert rendering["brand_tokens"]["brand_kit_version_id"] == brand_version.id
+    assert rendering["brand_tokens"]["brand_kit_hash"] == brand_version.content_hash
+    assert rendering["brand_tokens"]["asset_layer"]["logo"] == {
+        "asset_id": brand_logo.id, "asset_content_hash": brand_logo.content_hash,
+    }
+    assert rendering["brand_tokens"]["asset_layer"]["watermark"] == rendering["brand_tokens"]["asset_layer"]["logo"]
+    assert rendering["canonical_input_ref"]["input_hash"] == canonical_input["input_hash"]
+    assert rendering["page_assembly_ref"]["assembly_hash"] == assembly["assembly_hash"]
+    assert re.fullmatch(r"[0-9a-f]{64}", rendering["render_hash"])
+    assert [section["section_id"] for section in rendering["sections"]] == [
+        section["section_id"] for section in assembly["sections"]
+    ]
+    assert {
+        asset["asset_id"]
+        for section in rendering["sections"]
+        for asset in section["asset_layer"]
+    } == {asset["asset_id"] for asset in manifest["assets"]}
+    copy_output = (
+        db_session.query(AgentRun).filter(AgentRun.id == run.id).one().outputs_json[
+            "langgraph_commerce_planning_artifacts"
+        ]["copywriting"]["output"]
+    )
+    for section in rendering["sections"]:
+        canonical_section = next(
+            item for item in canonical_input["sections"] if item["section_id"] == section["section_id"]
+        )
+        assert section["text_layer"] == [
+            {"field": field, "text": str(copy_output[field] or "")}
+            for field in canonical_section["copy_ref"]["fields"]
+        ]
+    assert all(escape(item["text"]) in rendering["html"] for section in rendering["sections"] for item in section["text_layer"])
+    version_ref = rendering["detail_page_version"]
+    assert version_ref["schema_version"] == "lg10-detail-page-version-v1"
+    version = db_session.query(DetailPageVersion).filter(
+        DetailPageVersion.id == version_ref["id"],
+        DetailPageVersion.project_id == run.project_id,
+    ).one()
+    assert version.is_final is True
+    assert version.style_key == "image_centric"
+    version_snapshot = deepcopy(version.sections_json)
+    assert version_snapshot["schema_version"] == "lg10-detail-page-version-v1"
+    assert version_snapshot["snapshot_hash"] == version_ref["snapshot_hash"]
+    assert version_snapshot["lg10"]["canonical_page_assembly_input"] == canonical_input
+    assert version_snapshot["lg10"]["page_assembly"] == assembly
+    assert version_snapshot["lg10"]["canonical_rendering"] == {
+        key: value for key, value in rendering.items() if key != "detail_page_version"
+    }
+    assert [section["section_type"] for section in version_snapshot["commerce_renderer"]["sections"]] == [
+        section["section_id"] for section in rendering["sections"]
+    ]
+    assert {
+        section["image_asset_id"]
+        for section in version_snapshot["commerce_renderer"]["sections"]
+        if section["image_asset_id"]
+    } == {asset["asset_id"] for asset in manifest["assets"]}
+    assert {
+        section["image_asset_id"]: section["image_asset_content_hash"]
+        for section in version_snapshot["commerce_renderer"]["sections"]
+        if section["image_asset_id"]
+    } == {
+        asset["asset_id"]: asset["asset_content_hash"]
+        for asset in manifest["assets"]
+    }
+    version_response = client.get(
+        f"/api/v1/projects/{run.project_id}/page/final?version_id={version.id}",
+        headers=auth_headers,
+    )
+    assert version_response.status_code == 200, version_response.text
+    assert version_response.json()["id"] == version.id
+    assert version_response.json()["sections_json"] == version_snapshot
+    captured_exports: dict[str, dict[str, object]] = {}
+
+    def fake_capture(**kwargs):
+        output_format = str(kwargs["output_format"])
+        extension = "jpg" if output_format in {"jpg", "jpeg"} else "png"
+        image_path = tmp_path / f"lg10-preview.{extension}"
+        Image.new("RGB", (16, 16), color=(255, 255, 255)).save(
+            image_path, format="JPEG" if extension == "jpg" else "PNG"
+        )
+        zip_path = tmp_path / f"lg10-preview-{extension}-sections.zip"
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr(f"01-section.{extension}", image_path.read_bytes())
+        captured_exports[output_format] = dict(kwargs)
+        return {
+            "long_vertical_image": str(image_path),
+            "section_images_zip": str(zip_path),
+            "section_heights": [16],
+        }
+
+    with patch("src.api.exports.SessionLocal", testing_session_local), patch(
+        "src.services.export_service.capture_next_render_export", side_effect=fake_capture
+    ):
+        for output_format in ("png", "jpg"):
+            export_response = client.post(
+                f"/api/v1/projects/{run.project_id}/page/export",
+                headers=auth_headers,
+                json={
+                    "preset_name": "coupang",
+                    "output_format": output_format,
+                    "export_target": "local_download",
+                    "final_version_id": version.id,
+                },
+            )
+            assert export_response.status_code == 202, export_response.text
+            export_job = export_response.json()
+            assert export_job["status"] == "pending"
+            completed_export = client.get(
+                f"/api/v1/projects/{run.project_id}/page/export/jobs/{export_job['id']}", headers=auth_headers,
+            )
+            assert completed_export.status_code == 200, completed_export.text
+            assert completed_export.json()["status"] == "completed"
+    assert set(captured_exports) == {"png", "jpg"}
+    assert all(captured_exports[output_format]["version_id"] == version.id for output_format in captured_exports)
+    assert all(captured_exports[output_format]["project_id"] == run.project_id for output_format in captured_exports)
     assert db_session.query(ImageGenerationJobRecord).filter(
         ImageGenerationJobRecord.project_id == run.project_id,
         ImageGenerationJobRecord.status == "approved",
@@ -267,6 +732,14 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
     # must prefer the final checkpoint instead of resurrecting that stale job.
     db_session.expire_all()
     completed_run = db_session.query(AgentRun).filter(AgentRun.id == run.id).one()
+    mutable_outputs = dict(completed_run.outputs_json or {})
+    mutable_commerce = deepcopy(mutable_outputs["langgraph_commerce_planning_artifacts"])
+    mutable_commerce["copywriting"]["output"]["hero_title"] = "later mutable copy"
+    mutable_outputs["langgraph_commerce_planning_artifacts"] = mutable_commerce
+    completed_run.outputs_json = mutable_outputs
+    db_session.commit()
+    db_session.expire(version)
+    assert version.sections_json == version_snapshot
     outputs = dict(completed_run.outputs_json or {})
     review_output = dict(outputs.get("langgraph_review") or {})
     review_output["pending"] = stale_image_review_pending
@@ -277,6 +750,108 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
 
     db_session.refresh(completed_run)
     assert completed_run.outputs_json["langgraph_generation"]["approved_asset_manifest"] == manifest
+    assert completed_run.outputs_json["langgraph_generation"]["canonical_page_assembly_input"] == canonical_input
+    assert completed_run.outputs_json["langgraph_page_assembly"] == assembly
+    assert completed_run.outputs_json["langgraph_page_rendering"] == rendering
+
+    from src.services.page_finalization_service import build_canonical_page_assembly_input
+    invalid_manifest = deepcopy(manifest)
+    invalid_manifest["assets"][0]["asset_content_hash"] = "not-a-sha256"
+    invalid_payload = {key: value for key, value in invalid_manifest.items() if key != "manifest_hash"}
+    invalid_manifest["manifest_hash"] = hashlib.sha256(
+        json.dumps(invalid_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    from src.services.page_finalization_service import PageAssemblyInputError
+
+    with pytest.raises(PageAssemblyInputError):
+        build_canonical_page_assembly_input(
+            run=completed_run,
+            approved_asset_manifest=invalid_manifest,
+            db=db_session,
+        )
+    with pytest.raises(PageAssemblyInputError):
+        build_canonical_page_assembly_input(
+            run=completed_run,
+            approved_asset_manifest=None,
+            db=db_session,
+        )
+
+    # An image API is optional for LG-10 only when this run has no required
+    # image jobs. The fallback input then uses seller-owned originals and does
+    # not silently treat a required image scene as information-only.
+    for job in db_session.query(ImageGenerationJobRecord).filter(
+        ImageGenerationJobRecord.project_id == run.project_id,
+    ).all():
+        job.required_for_completion = False
+    supplier = Asset(
+        project_id=run.project_id,
+        source_type="sourced",
+        usage_status="reference_only",
+        filename="supplier-reference.jpg",
+        file_path=str(tmp_path / "supplier-reference.jpg"),
+        mime_type="image/jpeg",
+        file_size=len(JPEG),
+        quality_status="usable",
+        identity_status="confirmed",
+    )
+    (tmp_path / supplier.filename).write_bytes(JPEG)
+    rights_unconfirmed = Asset(
+        project_id=run.project_id,
+        source_type="uploaded",
+        usage_status="blocked",
+        filename="rights-unconfirmed.jpg",
+        file_path=str(tmp_path / "rights-unconfirmed.jpg"),
+        mime_type="image/jpeg",
+        file_size=len(JPEG),
+        quality_status="usable",
+        identity_status="confirmed",
+    )
+    (tmp_path / rights_unconfirmed.filename).write_bytes(JPEG)
+    db_session.add_all([supplier, rights_unconfirmed])
+    db_session.commit()
+
+    fallback_input = build_canonical_page_assembly_input(
+        run=completed_run,
+        approved_asset_manifest=None,
+        db=db_session,
+    )
+    assert build_canonical_page_assembly_input(
+        run=completed_run,
+        approved_asset_manifest=None,
+        db=db_session,
+    ) == fallback_input
+    fallback_assets = {
+        asset["asset_id"]
+        for section in fallback_input["sections"]
+        for asset in section["seller_owned_fallback_assets"]
+    }
+    assert fallback_assets
+    assert supplier.id not in fallback_assets
+    assert rights_unconfirmed.id not in fallback_assets
+    assert all(
+        re.fullmatch(r"[0-9a-f]{64}", asset["asset_content_hash"])
+        for section in fallback_input["sections"]
+        for asset in section["seller_owned_fallback_assets"]
+    )
+
+    for asset in db_session.query(Asset).filter(
+        Asset.project_id == run.project_id,
+        Asset.id.notin_([supplier.id, rights_unconfirmed.id]),
+    ).all():
+        if asset.source_type in {"uploaded", "self_shot", "local_upscaled"}:
+            asset.usage_status = "reference_only"
+    db_session.commit()
+    information_only_input = build_canonical_page_assembly_input(
+        run=completed_run,
+        approved_asset_manifest=None,
+        db=db_session,
+    )
+    assert any(section["rendering_mode"] == "information_only" for section in information_only_input["sections"])
+    assert all(
+        section["rendering_mode"] != "information_only"
+        for section in information_only_input["sections"]
+        if section["image_required"]
+    )
 
     refreshed = client.get(f"/api/v1/graph-runs/{run.id}", headers=auth_headers)
     assert refreshed.status_code == 200, refreshed.text
@@ -286,6 +861,9 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
     assert refreshed_state["values"]["generation"]["all_required_scenes_approved"] is True
     assert all(item["status"] == "approved" for item in refreshed_state["values"]["generation"]["jobs"])
     assert refreshed_state["values"]["generation"]["approved_asset_manifest"] == manifest
+    assert refreshed_state["values"]["generation"]["canonical_page_assembly_input"] == canonical_input
+    assert refreshed_state["values"]["page_assembly"] == assembly
+    assert refreshed_state["values"]["rendering"] == rendering
 
     # Simulate a process stopping after the LangGraph checkpoint commit but
     # before the AgentRun SQL projection was written. History replay must use
@@ -295,6 +873,8 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
     db_session.refresh(completed_run)
     outputs = dict(completed_run.outputs_json or {})
     outputs.pop("langgraph_generation", None)
+    outputs.pop("langgraph_page_assembly", None)
+    outputs.pop("langgraph_page_rendering", None)
     completed_run.outputs_json = outputs
     db_session.add(completed_run)
     db_session.commit()
@@ -306,6 +886,34 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
         LangGraphRunService._config(run.id),
     )
     assert rebuilt.outputs_json["langgraph_generation"]["approved_asset_manifest"] == manifest
+    assert rebuilt.outputs_json["langgraph_generation"]["canonical_page_assembly_input"] == canonical_input
+    assert rebuilt.outputs_json["langgraph_page_assembly"] == assembly
+    assert rebuilt.outputs_json["langgraph_page_rendering"] == rendering
+    rebuilt_version = db_session.query(DetailPageVersion).filter(DetailPageVersion.id == version.id).one()
+    assert rebuilt_version.sections_json == version_snapshot
+
+    # A final version's expected SHA-256 is checked against the bytes served to
+    # both preview and image export. An asset ID alone cannot silently accept
+    # replacement bytes.
+    manifest_asset = manifest["assets"][0]
+    final_asset = db_session.query(Asset).filter(Asset.id == manifest_asset["asset_id"]).one()
+    final_asset_path = Path(final_asset.file_path)
+    original_bytes = final_asset_path.read_bytes()
+    verified_asset = client.get(
+        f"/api/v1/files/assets/{final_asset.id}?expected_content_hash={manifest_asset['asset_content_hash']}",
+        headers=auth_headers,
+    )
+    assert verified_asset.status_code == 200
+    try:
+        final_asset_path.write_bytes(b"tampered-lg10-final-asset")
+        mismatch = client.get(
+            f"/api/v1/files/assets/{final_asset.id}?expected_content_hash={manifest_asset['asset_content_hash']}",
+            headers=auth_headers,
+        )
+        assert mismatch.status_code == 409
+        assert mismatch.json()["detail"]["code"] == "asset_snapshot_hash_mismatch"
+    finally:
+        final_asset_path.write_bytes(original_bytes)
 
     # Duplicate worker/webhook/poll effects are absorbed by the durable outbox.
     worker_db = SessionLocal()
@@ -320,6 +928,7 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
 
 
 @pytest.mark.lg9_fake_e2e
+@pytest.mark.lg10_fake_e2e
 def test_lg5r_reject_regenerates_only_target_and_manual_upload_uses_owned_asset(
     client, auth_headers, db_session, lg5_runtime, tmp_path
 ):
@@ -492,6 +1101,7 @@ def test_lg5r_worker_reconciles_completed_output_left_pending_before_provider_wa
 
 
 @pytest.mark.lg9_fake_e2e
+@pytest.mark.lg10_fake_e2e
 def test_lg5r_provider_failure_keeps_other_scene_output_for_review(
     monkeypatch, client, auth_headers, db_session, lg5_runtime, tmp_path
 ):
@@ -552,6 +1162,43 @@ def test_lg5r_provider_failure_keeps_other_scene_output_for_review(
     assert completed_job["status"] == "needs_review"
     assert completed_job["output_asset_id"] is not None
     assert "approved_asset_manifest" not in image_review["values"]["generation"]
+    assert "canonical_page_assembly_input" not in image_review["values"]["generation"]
+    assert not image_review["values"].get("page_assembly")
+    assert not image_review["values"].get("rendering")
+    assert "langgraph_page_assembly" not in (
+        db_session.query(AgentRun).filter(AgentRun.id == run.id).one().outputs_json or {}
+    )
+    assert "langgraph_page_rendering" not in (
+        db_session.query(AgentRun).filter(AgentRun.id == run.id).one().outputs_json or {}
+    )
+    from src.services.page_finalization_service import PageAssemblyInputError, build_canonical_page_assembly_input
+
+    run_record = db_session.query(AgentRun).filter(AgentRun.id == run.id).one()
+    with pytest.raises(PageAssemblyInputError):
+        build_canonical_page_assembly_input(
+            run=run_record,
+            approved_asset_manifest=None,
+            db=db_session,
+        )
+
+    failed_record = db_session.query(ImageGenerationJobRecord).filter(
+        ImageGenerationJobRecord.job_id == failed_job_id,
+    ).one()
+    completed_record = db_session.query(ImageGenerationJobRecord).filter(
+        ImageGenerationJobRecord.job_id == completed_job["job_id"],
+    ).one()
+    failed_record.status = "rejected"
+    completed_record.status = "approved"
+    db_session.commit()
+    with pytest.raises(PageAssemblyInputError):
+        build_canonical_page_assembly_input(
+            run=run_record,
+            approved_asset_manifest=None,
+            db=db_session,
+        )
+    failed_record.status = "failed"
+    completed_record.status = "needs_review"
+    db_session.commit()
 
     approved = _resume(client, auth_headers, image_review, "approve", job_id=completed_job["job_id"])
     assert approved.status_code == 200, approved.text
@@ -568,6 +1215,7 @@ def test_lg5r_provider_failure_keeps_other_scene_output_for_review(
     assert preserved["output_asset_id"] == completed_job["output_asset_id"]
     assert still_failed["status"] == "failed"
     assert "approved_asset_manifest" not in approved.json()["values"]["generation"]
+    assert "canonical_page_assembly_input" not in approved.json()["values"]["generation"]
     from src.services import langgraph_image_generation_service as image_graph
 
     retry_plan = image_graph.apply_image_review(

@@ -114,6 +114,12 @@ class SellformGraphState(TypedDict, total=False):
     # LG-5 stores compact job IDs/statuses and approved output asset IDs only.
     # Prompts, image bytes and provider secrets remain in domain records.
     generation: Annotated[dict[str, Any], _merge_discovery]
+    # LG-10 stores only constrained component/layout selections and immutable
+    # input references. Renderer markup stays outside the graph state.
+    page_assembly: Annotated[dict[str, Any], _merge_discovery]
+    # LG-10's deterministic HTML/CSS artifact remains separate from the
+    # approved image layer; the renderer node records its immutable version ref.
+    rendering: Annotated[dict[str, Any], _merge_discovery]
     # LG-6 stores classification confidence and immutable pack/Brand Kit
     # references only; full compiled prompts live in SQL artifacts.
     prompt_intelligence: Annotated[dict[str, Any], _merge_discovery]
@@ -630,9 +636,28 @@ def _lg5_generation_pending(state: SellformGraphState) -> dict[str, Any]:
     prior_generation = dict(state.get("generation") or {})
     scene_ids = list(prior_generation.get("regenerate_scene_ids") or []) or None
     cost_plan = ensure_generation_cost_plan(
-        run_id=state["run_id"], project_id=state["project_id"], db=db, scene_ids=scene_ids,
+        run_id=state["run_id"],
+        project_id=state["project_id"],
+        db=db,
+        scene_ids=scene_ids,
+        allow_no_required_scenes=bool(state.get("_lg10_allow_no_required_scenes")),
     )
     generation = {**prior_generation, "cost_plan": cost_plan, "cost_approved": False}
+    if int(cost_plan.get("scene_count") or 0) == 0:
+        generation.update({
+            "image_generation_required": False,
+            "completion_basis": "no_required_image_scenes",
+            "required_scene_count": 0,
+            "remaining_required_scene_ids": [],
+            "all_required_scenes_approved": True,
+            "next_action": "finalize",
+        })
+        return {
+            "current_stage": "generation_pending",
+            "status": "running",
+            "generation": generation,
+            "events": [_lg5_event("generation_pending")],
+        }
     reason = "장면별 모델과 예상 비용을 확인한 뒤 승인하거나 비용 없이 대기할 수 있습니다."
     raw_response = interrupt(review_interrupt_payload(
         "generation_pending", {**state, "generation": generation}, rejection_reason=reason,
@@ -671,6 +696,20 @@ def _lg5_generation_pending(state: SellformGraphState) -> dict[str, Any]:
 
 def _lg5_generation_pending_route(state: SellformGraphState) -> str:
     return "prepare_image_jobs" if (state.get("generation") or {}).get("cost_approved") else "generation_pending"
+
+
+def _lg10_generation_pending(state: SellformGraphState) -> dict[str, Any]:
+    """Enable the zero-provider branch only in the LG-10 compiled graph."""
+
+    return _lg5_generation_pending({**state, "_lg10_allow_no_required_scenes": True})
+
+
+def _lg10_generation_pending_route(state: SellformGraphState) -> str:
+    """Let only LG-10 continue when its approved plan needs no provider jobs."""
+
+    if (state.get("generation") or {}).get("image_generation_required") is False:
+        return "image_review"
+    return _lg5_generation_pending_route(state)
 
 
 def _lg5_prepare_image_jobs(state: SellformGraphState) -> dict[str, Any]:
@@ -752,18 +791,56 @@ def _lg5_validate_generated_images(state: SellformGraphState) -> dict[str, Any]:
 def _lg5_image_review(state: SellformGraphState) -> dict[str, Any]:
     from src.services.langgraph_discovery_service import current_langgraph_session
     from src.services.langgraph_image_generation_service import apply_image_review
+    from src.services.page_finalization_service import build_canonical_page_assembly_input
     from src.services.langgraph_review_service import review_interrupt_payload, validate_resume_payload
 
     db = current_langgraph_session()
     if db is None:
         raise RuntimeError("LG-5 image review requires the graph database session.")
     generation = dict(state.get("generation") or {})
+    if (
+        generation.get("image_generation_required") is False
+        and int(generation.get("required_scene_count") or 0) == 0
+    ):
+        from src.db.models import AgentRun
+
+        run = db.query(AgentRun).filter(AgentRun.id == state["run_id"]).one()
+        generation["canonical_page_assembly_input"] = build_canonical_page_assembly_input(
+            run=run,
+            approved_asset_manifest=None,
+            db=db,
+        )
+        generation.update({
+            "completion_basis": "no_required_image_scenes",
+            "all_required_scenes_approved": True,
+            "next_action": "finalize",
+        })
+        return {
+            "current_stage": "image_review",
+            "status": "running",
+            "generation": generation,
+            "events": [_lg5_event("image_review")],
+        }
     raw_response = interrupt(review_interrupt_payload("image_review", {**state, "generation": generation}))
     response = validate_resume_payload(raw_response, "image_review")
     generation = apply_image_review(
         run_id=state["run_id"], project_id=state["project_id"], decision=response.decision,
         job_id=response.job_id, asset_id=response.asset_id, seller_attested=response.seller_attested, db=db,
     )
+    # LG-10.1 freezes its assembly input only after LG-9 has completed every
+    # required approval. This stays in the existing generation state until the
+    # subsequent Page Assembly node is introduced; no downstream routing is
+    # changed here.
+    manifest = generation.get("approved_asset_manifest")
+    if isinstance(manifest, dict):
+        from src.db.models import AgentRun
+
+        run = db.query(AgentRun).filter(AgentRun.id == state["run_id"]).one()
+        generation["canonical_page_assembly_input"] = build_canonical_page_assembly_input(
+            run=run,
+            approved_asset_manifest=manifest,
+            db=db,
+        )
     return {
         "current_stage": "image_review",
         "status": "running",
@@ -777,6 +854,70 @@ def _lg5_image_review(state: SellformGraphState) -> dict[str, Any]:
     }
 
 
+def _lg10_page_assembly(state: SellformGraphState) -> dict[str, Any]:
+    """Advance a fully approved LG-9 run through constrained Page Assembly."""
+
+    from src.services.page_finalization_service import build_page_assembly_structure
+
+    canonical_input = (state.get("generation") or {}).get("canonical_page_assembly_input")
+    if not isinstance(canonical_input, dict):
+        raise RuntimeError("LG-10 Page Assembly requires the approved canonical assembly input.")
+    assembly = build_page_assembly_structure(canonical_page_assembly_input=canonical_input)
+    return {
+        "current_stage": "page_assembly",
+        "status": "running",
+        "page_assembly": assembly,
+        "events": [_lg2_event("page_assembly")],
+    }
+
+
+def _lg10_canonical_renderer(state: SellformGraphState) -> dict[str, Any]:
+    """Build the deterministic LG-10 text/asset layer artifact from frozen state."""
+
+    from src.db.models import AgentRun
+    from src.services.langgraph_discovery_service import current_langgraph_session
+    from src.services.page_finalization_service import (
+        build_canonical_page_rendering_artifact,
+        persist_lg10_detail_page_version,
+    )
+
+    db = current_langgraph_session()
+    if db is None:
+        raise RuntimeError("LG-10 canonical renderer requires the graph database session.")
+    canonical_input = (state.get("generation") or {}).get("canonical_page_assembly_input")
+    assembly = state.get("page_assembly")
+    if not isinstance(canonical_input, dict) or not isinstance(assembly, dict):
+        raise RuntimeError("LG-10 canonical renderer requires immutable assembly state.")
+    run = db.query(AgentRun).filter(AgentRun.id == state["run_id"]).one()
+    rendering = build_canonical_page_rendering_artifact(
+        run=run,
+        canonical_page_assembly_input=canonical_input,
+        page_assembly=assembly,
+        db=db,
+    )
+    version = persist_lg10_detail_page_version(
+        run=run,
+        canonical_page_assembly_input=canonical_input,
+        page_assembly=assembly,
+        rendering=rendering,
+        db=db,
+    )
+    rendering = {
+        **rendering,
+        "detail_page_version": {
+            "id": version.id,
+            "schema_version": "lg10-detail-page-version-v1",
+            "snapshot_hash": str((version.sections_json or {}).get("snapshot_hash") or ""),
+        },
+    }
+    return {
+        "current_stage": "canonical_renderer",
+        "status": "running",
+        "rendering": rendering,
+        "events": [_lg2_event("canonical_renderer")],
+    }
+
+
 def _lg5_image_review_route(state: SellformGraphState) -> str:
     action = str((state.get("generation") or {}).get("next_action") or "review")
     if action == "cost_approval":
@@ -784,6 +925,17 @@ def _lg5_image_review_route(state: SellformGraphState) -> str:
     if action == "finalize":
         return "finalize_run"
     return "image_review"
+
+
+def _lg10_image_review_route(state: SellformGraphState) -> str:
+    """Require the LG-10 immutable input before final Page Assembly can run."""
+
+    action = str((state.get("generation") or {}).get("next_action") or "review")
+    if action == "finalize":
+        return "page_assembly" if isinstance(
+            (state.get("generation") or {}).get("canonical_page_assembly_input"), dict
+        ) else "image_review"
+    return _lg5_image_review_route(state)
 
 
 def _lg2_has_reference_url(state: SellformGraphState) -> str:
@@ -1099,6 +1251,54 @@ def build_lg8_compiled_graph(*, checkpointer: BaseCheckpointSaver[Any]):
     graph.add_conditional_edges("image_review", _lg5_image_review_route, {
         "generation_pending": "generation_pending", "finalize_run": "finalize_run", "image_review": "image_review"})
     graph.add_edge("finalize_run", END)
+    return graph.compile(checkpointer=checkpointer)
+
+
+def build_lg10_compiled_graph(*, checkpointer: BaseCheckpointSaver[Any]):
+    """LG-10 runs constrained Page Assembly after every required image approval."""
+
+    graph = StateGraph(SellformGraphState)
+    for name, node in (
+        ("bootstrap_run", _lg1_bootstrap_run), ("input_review", _lg4_input_review),
+        ("input_router", _lg2_input_router), ("source_collection", _lg2_source_collection),
+        ("product_understanding", _lg2_product_understanding),
+        ("reference_analysis", _lg2_reference_analysis),
+        ("reference_analysis_skipped", _lg2_reference_analysis_skipped),
+        ("evidence_review", _lg4_evidence_review), ("category_classifier", _lg6_category_classifier),
+        ("prompt_pack_resolver", _lg6_prompt_pack_resolver),
+        ("creative_brief_compiler", _lg7_creative_brief_compiler),
+        ("sales_strategy", _lg3_sales_strategy), ("page_planning", _lg3_page_planning),
+        ("copywriting", _lg3_copywriting), ("visual_planning", _lg3_visual_planning),
+        ("visual_prompt_compiler", _lg8_visual_prompt_compiler),
+        ("planning_review", _lg4_planning_review), ("generation_pending", _lg10_generation_pending),
+        ("prepare_image_jobs", _lg5_prepare_image_jobs), ("dispatch_image_jobs", _lg5_dispatch_image_jobs),
+        ("provider_wait", _lg5_provider_wait), ("collect_image_results", _lg5_collect_image_results),
+        ("validate_generated_images", _lg5_validate_generated_images), ("image_review", _lg5_image_review),
+        ("page_assembly", _lg10_page_assembly), ("canonical_renderer", _lg10_canonical_renderer),
+        ("finalize_run", _lg2_finalize_run),
+    ):
+        graph.add_node(name, node)
+    graph.add_edge(START, "bootstrap_run"); graph.add_edge("bootstrap_run", "input_review")
+    graph.add_edge("input_review", "input_router"); graph.add_edge("input_router", "source_collection")
+    graph.add_edge("source_collection", "product_understanding")
+    graph.add_conditional_edges("product_understanding", _lg2_has_reference_url, {
+        "reference_analysis": "reference_analysis", "reference_analysis_skipped": "reference_analysis_skipped"})
+    graph.add_edge("reference_analysis", "evidence_review"); graph.add_edge("reference_analysis_skipped", "evidence_review")
+    graph.add_edge("evidence_review", "category_classifier"); graph.add_edge("category_classifier", "prompt_pack_resolver")
+    graph.add_edge("prompt_pack_resolver", "creative_brief_compiler"); graph.add_edge("creative_brief_compiler", "sales_strategy")
+    graph.add_edge("sales_strategy", "page_planning"); graph.add_edge("page_planning", "copywriting")
+    graph.add_edge("copywriting", "visual_planning"); graph.add_edge("visual_planning", "visual_prompt_compiler")
+    graph.add_edge("visual_prompt_compiler", "planning_review"); graph.add_edge("planning_review", "generation_pending")
+    graph.add_conditional_edges("generation_pending", _lg10_generation_pending_route, {
+        "generation_pending": "generation_pending", "prepare_image_jobs": "prepare_image_jobs",
+        "image_review": "image_review"})
+    graph.add_edge("prepare_image_jobs", "dispatch_image_jobs"); graph.add_edge("dispatch_image_jobs", "provider_wait")
+    graph.add_conditional_edges("provider_wait", _lg5_provider_wait_route, {
+        "provider_wait": "provider_wait", "collect_image_results": "collect_image_results"})
+    graph.add_edge("collect_image_results", "validate_generated_images"); graph.add_edge("validate_generated_images", "image_review")
+    graph.add_conditional_edges("image_review", _lg10_image_review_route, {
+        "generation_pending": "generation_pending", "page_assembly": "page_assembly", "finalize_run": "finalize_run", "image_review": "image_review"})
+    graph.add_edge("page_assembly", "canonical_renderer"); graph.add_edge("canonical_renderer", "finalize_run"); graph.add_edge("finalize_run", END)
     return graph.compile(checkpointer=checkpointer)
 
 

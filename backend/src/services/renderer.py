@@ -4,10 +4,15 @@ import zipfile
 import logging
 import datetime
 import time
+from html import escape
 from typing import List, Dict, Any, Tuple
 from sqlalchemy.orm import Session
 from PIL import Image, ImageDraw
 from src.services.page_asset_policy import get_page_eligible_asset
+from src.services.page_visual_contract import (
+    lg10_renderer_direction_tokens,
+    normalize_lg10_design_direction,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +33,203 @@ PRESETS = {
         "format": "PNG"
     }
 }
+
+
+LG10_CANONICAL_RENDER_SCHEMA_VERSION = "lg10-canonical-render-v1"
+
+
+def render_lg10_canonical_page_html(
+    *,
+    canonical_page_assembly_input: dict[str, Any],
+    page_assembly: dict[str, Any],
+    copy_set: dict[str, Any],
+    brand_tokens: dict[str, Any],
+) -> dict[str, Any]:
+    """Render only the immutable LG-10 structure into an editable text layer.
+
+    Approved image identities remain a separate asset layer represented by
+    stable data attributes. Resolving image URLs, screenshots, exports, and
+    page versions belongs to later LG-10 tasks.
+    """
+
+    design_direction = normalize_lg10_design_direction(
+        canonical_page_assembly_input.get("design_direction")
+    )
+    direction_tokens = lg10_renderer_direction_tokens(design_direction=design_direction)
+    expected_renderer_token = direction_tokens["renderer_token"]
+    canonical_sections = {
+        str(section.get("section_id") or ""): dict(section or {})
+        for section in (canonical_page_assembly_input.get("sections") or [])
+        if isinstance(section, dict) and section.get("section_id")
+    }
+    assembly_sections = sorted(
+        (dict(section or {}) for section in (page_assembly.get("sections") or []) if isinstance(section, dict)),
+        key=lambda section: int(section.get("sort_order") or 0),
+    )
+    if not canonical_sections or len(assembly_sections) != len(canonical_sections):
+        raise ValueError("LG-10 canonical renderer requires matching section contracts.")
+
+    rendered_sections: list[dict[str, Any]] = []
+    section_html: list[str] = []
+    for expected_order, assembly_section in enumerate(assembly_sections):
+        section_id = str(assembly_section.get("section_id") or "")
+        canonical_section = canonical_sections.get(section_id)
+        component_id = str(assembly_section.get("component_id") or "")
+        layout_token = str(assembly_section.get("layout_token") or "")
+        if (
+            canonical_section is None
+            or assembly_section.get("sort_order") != expected_order
+            or component_id not in {"media_with_copy", "information_only"}
+            or layout_token not in {"image_text", "spec_table"}
+            or assembly_section.get("design_direction") != design_direction
+            or assembly_section.get("renderer_token") != expected_renderer_token
+        ):
+            raise ValueError("LG-10 canonical renderer received an invalid component selection.")
+
+        text_layer = []
+        for field in list((canonical_section.get("copy_ref") or {}).get("fields") or []):
+            if field not in copy_set:
+                raise ValueError(f"LG-10 canonical renderer is missing immutable copy field: {field}")
+            text_layer.append({"field": str(field), "text": str(copy_set[field] or "")})
+
+        rendering_mode = str(
+            canonical_section.get("rendering_mode")
+            or ("approved_asset" if canonical_section.get("approved_assets") else "")
+        )
+        source_assets = (
+            canonical_section.get("approved_assets") or []
+            if rendering_mode == "approved_asset"
+            else canonical_section.get("seller_owned_fallback_assets") or []
+            if rendering_mode == "seller_owned_fallback"
+            else []
+        )
+        asset_layer = [
+            {
+                "asset_id": str(asset.get("asset_id") or ""),
+                "asset_content_hash": str(asset.get("asset_content_hash") or ""),
+            }
+            for asset in source_assets
+            if isinstance(asset, dict) and asset.get("asset_id")
+        ]
+        if component_id == "information_only":
+            asset_layer = []
+
+        asset_html = "".join(
+            (
+                '<figure class="sf-asset-layer" data-asset-id="{asset_id}" '
+                'data-asset-content-hash="{asset_hash}"></figure>'
+            ).format(
+                asset_id=escape(asset["asset_id"], quote=True),
+                asset_hash=escape(asset["asset_content_hash"], quote=True),
+            )
+            for asset in asset_layer
+        )
+        if layout_token == "spec_table":
+            text_html = "<table class=\"sf-text-layer sf-spec-table\"><tbody>{}</tbody></table>".format(
+                "".join(
+                    '<tr data-copy-field="{field}"><th>{field}</th><td contenteditable="true">{text}</td></tr>'.format(
+                        field=escape(item["field"], quote=True),
+                        text=escape(item["text"]),
+                    )
+                    for item in text_layer
+                )
+            )
+        else:
+            title = text_layer[0]["text"] if text_layer else ""
+            body_items = text_layer[1:] if text_layer else []
+            text_html = (
+                '<div class="sf-text-layer"><h2 contenteditable="true">{title}</h2>{body}</div>'
+            ).format(
+                title=escape(title),
+                body="".join(
+                    '<p data-copy-field="{field}" contenteditable="true">{text}</p>'.format(
+                        field=escape(item["field"], quote=True), text=escape(item["text"])
+                    )
+                    for item in body_items
+                ),
+            )
+        section_html.append(
+            '<section class="sf-section sf-component-{component}" data-section-id="{section_id}" '
+            'data-layout-token="{layout}">{asset_html}{text_html}</section>'.format(
+                component=escape(component_id, quote=True),
+                section_id=escape(section_id, quote=True),
+                layout=escape(layout_token, quote=True),
+                asset_html=asset_html,
+                text_html=text_html,
+            )
+        )
+        rendered_sections.append({
+            "section_id": section_id,
+            "sort_order": expected_order,
+            "component_id": component_id,
+            "layout_token": layout_token,
+            "asset_layer": asset_layer,
+            "text_layer": text_layer,
+        })
+
+    color_tokens = dict(brand_tokens.get("color_tokens") or {})
+    typography_tokens = dict(brand_tokens.get("typography") or {})
+    brand_asset_layer = dict(brand_tokens.get("asset_layer") or {})
+    logo = brand_asset_layer.get("logo") if isinstance(brand_asset_layer.get("logo"), dict) else None
+    watermark = (
+        brand_asset_layer.get("watermark")
+        if isinstance(brand_asset_layer.get("watermark"), dict)
+        else None
+    )
+    brand_html = ""
+    if logo:
+        brand_html += (
+            '<header class="sf-brand-logo" data-asset-id="{asset_id}" '
+            'data-asset-content-hash="{asset_hash}"></header>'
+        ).format(
+            asset_id=escape(str(logo["asset_id"]), quote=True),
+            asset_hash=escape(str(logo["asset_content_hash"]), quote=True),
+        )
+    if watermark:
+        brand_html += (
+            '<aside class="sf-brand-watermark" data-asset-id="{asset_id}" '
+            'data-asset-content-hash="{asset_hash}"></aside>'
+        ).format(
+            asset_id=escape(str(watermark["asset_id"]), quote=True),
+            asset_hash=escape(str(watermark["asset_content_hash"]), quote=True),
+        )
+    css = (
+        ".sf-page{{max-width:760px;margin:0 auto;font-family:{font};color:{text};background:{surface};}}"
+        ".sf-section{{padding:{spacing}px 24px;border-bottom:1px solid #e5e7eb;background:{surface};}}"
+        ".sf-asset-layer{{min-height:{media_height}px;margin:0 0 20px;background:{muted};border-radius:12px;}}"
+        ".sf-text-layer{{line-height:1.65;white-space:pre-wrap;}}"
+        ".sf-text-layer h2{{margin:0 0 12px;font-size:{title_size}px;color:{accent};}}"
+        ".sf-text-layer p{{margin:0 0 10px;}}"
+        ".sf-spec-table{{width:100%;border-collapse:collapse;}}"
+        ".sf-spec-table th,.sf-spec-table td{{padding:10px;border-bottom:1px solid #dbe3ee;text-align:left;}}"
+    ).format(
+        font=escape(str(typography_tokens.get("body_font") or "system-ui, sans-serif"), quote=True),
+        text=escape(str(color_tokens.get("text") or "#172033"), quote=True),
+        surface=escape(str(color_tokens.get("surface") or "#ffffff"), quote=True),
+        muted=escape(str(color_tokens.get("muted_surface") or "#eef2f7"), quote=True),
+        accent=escape(str(color_tokens.get("accent") or "#0f766e"), quote=True),
+        spacing=direction_tokens["section_spacing"],
+        media_height=direction_tokens["media_min_height"],
+        title_size={"compact": 24, "comfortable": 30, "balanced": 28}[direction_tokens["title_scale"]],
+    )
+    html = (
+        '<main class="sf-page" data-design-direction="{direction}" '
+        'data-brand-kit-version-id="{brand_version}">{brand_html}{sections}</main>'
+    ).format(
+        direction=escape(design_direction, quote=True),
+        brand_version=escape(str(brand_tokens.get("brand_kit_version_id") or ""), quote=True),
+        brand_html=brand_html,
+        sections="".join(section_html),
+    )
+    return {
+        "schema_version": LG10_CANONICAL_RENDER_SCHEMA_VERSION,
+        "design_direction": design_direction,
+        "renderer_tokens": direction_tokens,
+        "brand_tokens": brand_tokens,
+        "sections": rendered_sections,
+        "css": css,
+        "html": html,
+    }
 
 class PageRendererService:
     def __init__(self, upload_dir: str = "uploads"):

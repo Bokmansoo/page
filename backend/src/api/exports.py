@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from src.api.auth import get_current_user_and_workspace
 from src.db.database import get_db, SessionLocal
-from src.db.models import ProductProject, ProductPage, ExportJob, ExportArtifact, Asset, User, WorkspaceMember
+from src.db.models import DetailPageVersion, ProductProject, ProductPage, ExportJob, ExportArtifact, Asset, User, WorkspaceMember
 from src.config import settings
 from src.services.auth_service import create_session
 from src.schemas.export_history import ExportHistoryItem, ExportHistoryResponse
@@ -19,6 +19,12 @@ from src.services.renderer import PageRendererService
 from src.services.page_finalization_service import (
     FinalPageNotFoundError,
     get_final_page_version,
+)
+from src.services.export_service import (
+    FrozenExportSnapshotError,
+    _LG10_COPYABLE_HTML_ARTIFACT,
+    _LG10_STANDALONE_PACKAGE_ARTIFACT,
+    build_lg10_standalone_export_bundle,
 )
 
 router = APIRouter(tags=["Exports"])
@@ -61,6 +67,21 @@ class ExportJobResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class StandaloneExportRequest(BaseModel):
+    final_version_id: Optional[str] = Field(
+        None,
+        description="The frozen LG-10 DetailPageVersion to package.",
+    )
+
+
+class StandaloneExportResponse(BaseModel):
+    detail_page_version_id: str
+    approved_asset_manifest_hash: Optional[str]
+    html_download_url: str
+    zip_download_url: str
+    warnings: List[str]
 
 
 @router.get("/export/channel-presets")
@@ -359,10 +380,9 @@ def request_page_export(
     from src.api.auth import check_workspace_limits
     check_workspace_limits(db, workspace.id)
 
-    page = get_page_or_404(db, project_id, workspace.id)
+    get_project_or_404(db, project_id, workspace.id)
+    final_version = None
     if req.final_version_id:
-        from src.db.models import DetailPageVersion
-
         requested_final = db.query(DetailPageVersion).filter(
             DetailPageVersion.id == req.final_version_id,
             DetailPageVersion.project_id == project_id,
@@ -384,40 +404,46 @@ def request_page_export(
                 },
             )
 
+        final_version = requested_final
+    else:
+        try:
+            final_version = get_final_page_version(db, project_id)
+        except FinalPageNotFoundError:
+            final_version = None
+
+    version_snapshot = (
+        final_version.sections_json if final_version and isinstance(final_version.sections_json, dict) else {}
+    )
+    is_lg10_version = version_snapshot.get("schema_version") == "lg10-detail-page-version-v1"
+    page = None if is_lg10_version else get_page_or_404(db, project_id, workspace.id)
+
     # 0. Readiness check (visual contract, edit markers, etc.)
-    readiness = inspect_page_readiness(page, db)
-    if not readiness.ready:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "message": "Page is not ready for export. Resolve blockers first.",
-                "blockers": [b.model_dump() for b in readiness.blockers],
-            },
-        )
+    if not is_lg10_version:
+        readiness = inspect_page_readiness(page, db)
+        if not readiness.ready:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "message": "Page is not ready for export. Resolve blockers first.",
+                    "blockers": [b.model_dump() for b in readiness.blockers],
+                },
+            )
 
     # 1. 검수 룰 재확인 (Blocker 있으면 차단)
-    compliance = PageComplianceChecker.inspect_page(db, page)
-    if should_block_export(compliance, req.export_target):
-        blockers = [issue for issue in compliance["issues"] if issue["severity"] == "Blocker"]
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "message": "Blocker compliance issues must be resolved before export.",
-                "issues": blockers
-            }
-        )
+    if not is_lg10_version:
+        compliance = PageComplianceChecker.inspect_page(db, page)
+        if should_block_export(compliance, req.export_target):
+            blockers = [issue for issue in compliance["issues"] if issue["severity"] == "Blocker"]
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "message": "Blocker compliance issues must be resolved before export.",
+                    "issues": blockers
+                }
+            )
 
     # An export is derived from the immutable final page version. Return the
     # previous exact artifact immediately rather than launching duplicate work.
-    final_version = None
-    try:
-        final_version = (
-            db.query(__import__("src.db.models", fromlist=["DetailPageVersion"]).DetailPageVersion)
-            .filter_by(id=req.final_version_id, project_id=project_id).first()
-            if req.final_version_id else get_final_page_version(db, project_id)
-        )
-    except FinalPageNotFoundError:
-        final_version = None
     if final_version:
         artifact_type = f"channel_long:{req.preset_name}:{req.output_format}"
         existing_artifact = (
@@ -469,15 +495,138 @@ def request_page_export(
     background_tasks.add_task(
         run_export_task,
         project_id=project_id,
-        page_id=page.id,
+        page_id=page.id if page else "",
         job_id=job.id,
         preset_name=req.preset_name,
         use_commerce_cut=req.use_commerce_cut,
         output_format=req.output_format,
-        final_version_id=req.final_version_id,
+        final_version_id=final_version.id if final_version else req.final_version_id,
     )
 
     return job
+
+
+@router.post(
+    "/projects/{project_id}/page/export/standalone",
+    response_model=StandaloneExportResponse,
+)
+def create_lg10_standalone_export(
+    project_id: str,
+    req: StandaloneExportRequest,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Create or re-download the clean HTML/ZIP for one frozen LG-10 version."""
+    user = auth_ctx["user"]
+    workspace = auth_ctx["workspace"]
+    role = auth_ctx.get("role") or "owner"
+    if role not in ["owner", "admin", "member"]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: Insufficient permissions for this workspace")
+    get_project_or_404(db, project_id, workspace.id)
+
+    if req.final_version_id:
+        version = db.query(DetailPageVersion).filter(
+            DetailPageVersion.id == req.final_version_id,
+            DetailPageVersion.project_id == project_id,
+            DetailPageVersion.is_final == True,  # noqa: E712
+        ).first()
+    else:
+        try:
+            version = get_final_page_version(db, project_id)
+        except FinalPageNotFoundError:
+            version = None
+    if not version:
+        raise HTTPException(status_code=409, detail="A finalized LG-10 detail page version is required for standalone export.")
+
+    snapshot = version.sections_json if isinstance(version.sections_json, dict) else {}
+    if snapshot.get("schema_version") != "lg10-detail-page-version-v1":
+        raise HTTPException(status_code=409, detail="Standalone export is available only for frozen LG-10 DetailPageVersion snapshots.")
+
+    def _artifact_asset(artifact_type: str) -> tuple[ExportArtifact | None, Asset | None]:
+        artifact = (
+            db.query(ExportArtifact)
+            .filter_by(project_id=project_id, version_id=version.id, artifact_type=artifact_type)
+            .order_by(ExportArtifact.created_at.desc())
+            .first()
+        )
+        asset = (
+            db.query(Asset).filter_by(project_id=project_id, file_path=artifact.file_path).first()
+            if artifact and os.path.isfile(artifact.file_path)
+            else None
+        )
+        return artifact, asset
+
+    html_artifact, html_asset = _artifact_asset(_LG10_COPYABLE_HTML_ARTIFACT)
+    zip_artifact, zip_asset = _artifact_asset(_LG10_STANDALONE_PACKAGE_ARTIFACT)
+    warnings: list[str] = []
+    if not html_asset or not zip_asset:
+        try:
+            bundle = build_lg10_standalone_export_bundle(
+                db=db,
+                project_id=project_id,
+                version=version,
+            )
+        except FrozenExportSnapshotError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        warnings = list(bundle["warnings"])
+
+        def _persist_asset(*, path: str, source_type: str, mime_type: str) -> Asset:
+            existing = db.query(Asset).filter_by(project_id=project_id, file_path=path).first()
+            if existing:
+                return existing
+            asset = Asset(
+                project_id=project_id,
+                source_type=source_type,
+                usage_status="blocked",
+                filename=os.path.basename(path),
+                file_path=path,
+                mime_type=mime_type,
+                file_size=os.path.getsize(path),
+            )
+            db.add(asset)
+            db.flush()
+            return asset
+
+        html_asset = _persist_asset(
+            path=bundle["html_path"], source_type="exported_html", mime_type="text/html; charset=utf-8"
+        )
+        zip_asset = _persist_asset(
+            path=bundle["zip_path"], source_type="exported_standalone_zip", mime_type="application/zip"
+        )
+        if not html_artifact:
+            db.add(ExportArtifact(project_id=project_id, version_id=version.id, artifact_type=_LG10_COPYABLE_HTML_ARTIFACT, file_path=bundle["html_path"]))
+        if not zip_artifact:
+            db.add(ExportArtifact(project_id=project_id, version_id=version.id, artifact_type=_LG10_STANDALONE_PACKAGE_ARTIFACT, file_path=bundle["zip_path"]))
+        db.commit()
+
+    html_url = f"/api/v1/projects/{project_id}/page/export/download/{html_asset.id}"
+    zip_url = f"/api/v1/projects/{project_id}/page/export/download/{zip_asset.id}"
+    # A completed job makes the package durable in the existing export history
+    # without changing the legacy image-export data model.
+    db.add(ExportJob(
+        project_id=project_id,
+        preset_name="lg10_standalone",
+        status="completed",
+        created_by=user.id,
+        zip_asset_id=zip_asset.id,
+        output_images=[html_url, zip_url],
+        completed_at=datetime.datetime.utcnow(),
+    ))
+    db.commit()
+    manifest = (
+        ((snapshot.get("lg10") or {}).get("canonical_page_assembly_input") or {})
+        .get("page_asset_manifest")
+        or ((snapshot.get("lg10") or {}).get("canonical_page_assembly_input") or {})
+        .get("approved_asset_manifest")
+        or {}
+    )
+    return StandaloneExportResponse(
+        detail_page_version_id=version.id,
+        approved_asset_manifest_hash=manifest.get("manifest_hash"),
+        html_download_url=html_url,
+        zip_download_url=zip_url,
+        warnings=warnings,
+    )
 
 
 @router.get("/projects/{project_id}/page/export/jobs", response_model=List[ExportJobResponse])
@@ -564,13 +713,48 @@ def get_sales_package(
 
 def _to_export_history_item(job: ExportJob, db: Session) -> ExportHistoryItem:
     download_url = None
+    package_download_url = None
     if job.output_images and len(job.output_images) > 0:
         download_url = job.output_images[0]
+    if job.output_images and len(job.output_images) > 1:
+        package_download_url = job.output_images[1]
 
     image_asset = _exported_image_asset_for_job(db, job)
     image_format = _image_format_from_asset(image_asset)
     if image_asset:
         download_url = f"/api/v1/projects/{job.project_id}/page/export/download/{image_asset.id}"
+
+    output_asset_ids = [
+        asset_id
+        for asset_id in (_asset_id_from_download_url(url) for url in (job.output_images or []))
+        if asset_id
+    ]
+    output_paths = [
+        asset.file_path
+        for asset in db.query(Asset).filter(
+            Asset.project_id == job.project_id,
+            Asset.id.in_(output_asset_ids),
+        ).all()
+    ]
+    artifact = (
+        db.query(ExportArtifact)
+        .filter(
+            ExportArtifact.project_id == job.project_id,
+            ExportArtifact.file_path.in_(output_paths),
+        )
+        .order_by(ExportArtifact.created_at.desc())
+        .first()
+        if output_paths
+        else None
+    )
+    version_snapshot = artifact.version.sections_json if artifact and isinstance(artifact.version.sections_json, dict) else {}
+    approved_asset_manifest = (
+        ((version_snapshot.get("lg10") or {}).get("canonical_page_assembly_input") or {})
+        .get("page_asset_manifest")
+        or ((version_snapshot.get("lg10") or {}).get("canonical_page_assembly_input") or {})
+        .get("approved_asset_manifest")
+        or {}
+    )
 
     return ExportHistoryItem(
         id=job.id,
@@ -581,6 +765,9 @@ def _to_export_history_item(job: ExportJob, db: Session) -> ExportHistoryItem:
         filename=image_asset.filename if image_asset else None,
         content_type=image_asset.mime_type if image_asset else None,
         download_url=download_url,
+        package_download_url=package_download_url,
+        version_id=artifact.version_id if artifact else None,
+        approved_asset_manifest_hash=approved_asset_manifest.get("manifest_hash") if artifact else None,
         error_message=job.error_message,
         created_at=job.created_at.isoformat() if job.created_at else "",
         completed_at=job.completed_at.isoformat() if job.completed_at else None,

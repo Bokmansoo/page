@@ -1,14 +1,372 @@
 import os
+import hashlib
+import json
+import re
+import shutil
 import zipfile
 import uuid
 import datetime
 from io import BytesIO
-from typing import Literal
+from html import escape
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Any, Literal
 from urllib.parse import urlencode
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from sqlalchemy.orm import Session
-from src.db.models import ExportArtifact
+from src.db.models import Asset, ExportArtifact
+from src.services.commerce_policy import is_asset_final_output_eligible
 from src.services.page_asset_policy import get_page_eligible_assets
+from src.services.channel_export_service import image_sha256
+
+
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+_LG10_DETAIL_PAGE_VERSION_SCHEMA = "lg10-detail-page-version-v1"
+_LG10_COPYABLE_HTML_ARTIFACT = "lg10_copyable_html"
+_LG10_STANDALONE_PACKAGE_ARTIFACT = "lg10_standalone_package"
+
+
+class FrozenExportSnapshotError(ValueError):
+    """The immutable LG-10 version cannot safely be converted to a package."""
+
+
+class _CopyableHtmlSanitizer(HTMLParser):
+    """Allow only static detail-page markup and relative bundled images."""
+
+    _allowed_tags = {
+        "main", "header", "aside", "section", "figure", "img", "div", "h2",
+        "p", "table", "tbody", "tr", "th", "td",
+    }
+    _void_tags = {"img"}
+    _allowed_attrs = {
+        "class", "data-section-id", "data-layout-token", "data-static-fallback",
+        "data-asset-id", "data-asset-content-hash", "src", "alt",
+    }
+    _dropped_content_tags = {"script", "style", "iframe", "object", "embed", "link", "meta"}
+
+    def __init__(self, asset_paths: dict[str, str] | None = None):
+        super().__init__(convert_charrefs=False)
+        self.asset_paths = asset_paths or {}
+        self.parts: list[str] = []
+        self.warnings: list[str] = []
+        self._dropped_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag in self._dropped_content_tags:
+            self._dropped_depth += 1
+            self.warnings.append(f"Removed unsupported {tag} markup from copyable HTML.")
+            return
+        if self._dropped_depth:
+            return
+        if tag not in self._allowed_tags:
+            self.warnings.append(f"Removed unsupported {tag} markup from copyable HTML.")
+            return
+
+        clean_attrs: list[tuple[str, str]] = []
+        attrs_by_name: dict[str, str] = {}
+        for name, value in attrs:
+            name = name.lower()
+            value = value or ""
+            if name.startswith("on") or name == "style" or name not in self._allowed_attrs:
+                self.warnings.append(f"Removed unsafe {name} attribute from copyable HTML.")
+                continue
+            if name == "src" and not value.startswith("assets/"):
+                self.warnings.append("Removed a non-bundled image URL from copyable HTML.")
+                continue
+            attrs_by_name[name] = value
+            clean_attrs.append((name, value))
+
+        rendered_attrs = "".join(
+            f' {name}="{escape(value, quote=True)}"' for name, value in clean_attrs
+        )
+        self.parts.append(f"<{tag}{rendered_attrs}>")
+        asset_id = attrs_by_name.get("data-asset-id")
+        if tag in {"figure", "header", "aside"} and asset_id:
+            relative_path = self.asset_paths.get(asset_id)
+            if relative_path:
+                self.parts.append(
+                    f'<img src="{escape(relative_path, quote=True)}" alt="승인 이미지">'
+                )
+            else:
+                self.warnings.append(
+                    f"Excluded non-manifest asset {asset_id} from the standalone package."
+                )
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        if tag.lower() not in self._void_tags:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in self._dropped_content_tags and self._dropped_depth:
+            self._dropped_depth -= 1
+            return
+        if self._dropped_depth or tag not in self._allowed_tags or tag in self._void_tags:
+            return
+        self.parts.append(f"</{tag}>")
+
+    def handle_data(self, data: str) -> None:
+        if not self._dropped_depth:
+            self.parts.append(escape(data))
+
+    def handle_entityref(self, name: str) -> None:
+        if not self._dropped_depth:
+            self.parts.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        if not self._dropped_depth:
+            self.parts.append(f"&#{name};")
+
+
+def sanitize_copyable_html(
+    html: str,
+    *,
+    asset_paths: dict[str, str] | None = None,
+) -> tuple[str, list[str]]:
+    """Return static markup without executable content or remote asset URLs."""
+    sanitizer = _CopyableHtmlSanitizer(asset_paths=asset_paths)
+    sanitizer.feed(html)
+    sanitizer.close()
+    return "".join(sanitizer.parts), sanitizer.warnings
+
+
+def _sanitize_copyable_css(css: str) -> tuple[str, list[str]]:
+    """Keep the deterministic renderer stylesheet local and non-executable."""
+    warnings: list[str] = []
+    safe_rules: list[str] = []
+    for rule in str(css or "").split("}"):
+        if not rule.strip():
+            continue
+        candidate = f"{rule}}}"
+        if re.search(r"@import|url\s*\(|expression\s*\(|behavior\s*:", candidate, re.I):
+            warnings.append("Removed unsafe stylesheet rule from standalone export.")
+            continue
+        safe_rules.append(candidate)
+    return "".join(safe_rules), warnings
+
+
+def _static_fallback_html(
+    sections: list[dict[str, Any]],
+    asset_paths: dict[str, str],
+) -> str:
+    """Render a fixed safe section when a channel cannot use a component."""
+    fragments: list[str] = []
+    for section in sections:
+        section_id = escape(str(section.get("section_id") or "section"), quote=True)
+        text_layer = list(section.get("text_layer") or [])
+        title = escape(str((text_layer[0] if text_layer else {}).get("text") or ""))
+        body = "".join(
+            f"<p>{escape(str(item.get('text') or ''))}</p>"
+            for item in text_layer[1:]
+            if isinstance(item, dict)
+        )
+        images = "".join(
+            f'<figure class="sf-asset-layer"><img src="{escape(asset_paths[asset_id], quote=True)}" alt="승인 이미지"></figure>'
+            for asset in (section.get("asset_layer") or [])
+            if isinstance(asset, dict)
+            for asset_id in [str(asset.get("asset_id") or "")]
+            if asset_id in asset_paths
+        )
+        fragments.append(
+            f'<section class="sf-section sf-component-information_only" data-section-id="{section_id}" '
+            f'data-static-fallback="unsupported_channel_component">{images}'
+            f'<div class="sf-text-layer"><h2>{title}</h2>{body}</div></section>'
+        )
+    return '<main class="sf-page">' + "".join(fragments) + "</main>"
+
+
+def _copyable_html_from_frozen_renderer(
+    rendering: dict[str, Any],
+    asset_paths: dict[str, str],
+) -> tuple[str, list[str]]:
+    sections = [dict(item) for item in (rendering.get("sections") or []) if isinstance(item, dict)]
+    supported = all(
+        section.get("component_id") in {"media_with_copy", "information_only"}
+        and section.get("layout_token") in {"image_text", "spec_table"}
+        for section in sections
+    )
+    if not supported:
+        fallback_html = _static_fallback_html(sections, asset_paths)
+        clean_html, warnings = sanitize_copyable_html(fallback_html, asset_paths=asset_paths)
+        return clean_html, [
+            "Unsupported channel component was replaced with the fixed static fallback.",
+            *warnings,
+        ]
+    return sanitize_copyable_html(str(rendering.get("html") or ""), asset_paths=asset_paths)
+
+
+def _safe_asset_extension(asset) -> str:
+    extension = Path(asset.filename).suffix.lower()
+    allowed = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+    if extension not in allowed:
+        raise FrozenExportSnapshotError("Approved asset has an unsupported standalone image format.")
+    return extension
+
+
+def _frozen_lg10_export_inputs(version) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    snapshot = version.sections_json if isinstance(version.sections_json, dict) else {}
+    if snapshot.get("schema_version") != _LG10_DETAIL_PAGE_VERSION_SCHEMA:
+        raise FrozenExportSnapshotError("Standalone exports require an LG-10 frozen DetailPageVersion.")
+    lg10 = snapshot.get("lg10") if isinstance(snapshot.get("lg10"), dict) else {}
+    canonical_input = lg10.get("canonical_page_assembly_input")
+    rendering = lg10.get("canonical_rendering")
+    approved_manifest = canonical_input.get("approved_asset_manifest") if isinstance(canonical_input, dict) else None
+    page_manifest = (
+        canonical_input.get("page_asset_manifest") or approved_manifest
+        if isinstance(canonical_input, dict)
+        else None
+    )
+    image_contract = (
+        canonical_input.get("image_generation_contract")
+        if isinstance(canonical_input, dict)
+        else None
+    )
+    if isinstance(image_contract, dict):
+        required_scene_count = int(image_contract.get("required_scene_count") or 0)
+        completion_basis = str(image_contract.get("completion_basis") or "")
+    elif isinstance(approved_manifest, dict):
+        required_scene_count = len(approved_manifest.get("assets") or [])
+        completion_basis = "approved_required_scenes"
+    else:
+        required_scene_count = -1
+        completion_basis = ""
+    if not isinstance(rendering, dict) or not isinstance(page_manifest, dict):
+        raise FrozenExportSnapshotError("Frozen DetailPageVersion is missing the LG-10 rendering or page asset manifest.")
+    if required_scene_count > 0:
+        if (
+            completion_basis != "approved_required_scenes"
+            or not isinstance(approved_manifest, dict)
+            or page_manifest != approved_manifest
+        ):
+            raise FrozenExportSnapshotError("Standalone exports require approved final assets.")
+    elif (
+        required_scene_count != 0
+        or completion_basis != "no_required_image_scenes"
+        or approved_manifest is not None
+    ):
+        raise FrozenExportSnapshotError("Standalone export cannot bypass an incomplete required image manifest.")
+    entries = list(page_manifest.get("assets") or [])
+    manifest_without_hash = dict(page_manifest)
+    manifest_hash = str(manifest_without_hash.pop("manifest_hash", "") or "")
+    expected_manifest_hash = hashlib.sha256(
+        json.dumps(manifest_without_hash, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if not _SHA256_HEX.fullmatch(manifest_hash) or manifest_hash != expected_manifest_hash:
+        raise FrozenExportSnapshotError("Standalone exports require an untampered page asset manifest.")
+    if required_scene_count > 0 and not entries:
+        raise FrozenExportSnapshotError("Standalone exports require approved final assets.")
+    return snapshot, rendering, page_manifest
+
+
+def build_lg10_standalone_export_bundle(
+    *,
+    db: Session,
+    project_id: str,
+    version,
+    output_dir: str | None = None,
+) -> dict[str, Any]:
+    """Build a local-only HTML/CSS/image package from one frozen LG-10 version.
+
+    This deliberately consumes only the version's approved manifest. It never
+    resolves preview URLs, current page state, or non-manifest Brand Kit assets.
+    """
+    _, rendering, manifest = _frozen_lg10_export_inputs(version)
+    entries = [dict(item) for item in manifest.get("assets") or [] if isinstance(item, dict)]
+    asset_ids = [str(item.get("asset_id") or "") for item in entries]
+    if not all(asset_ids) or len(set(asset_ids)) != len(asset_ids):
+        raise FrozenExportSnapshotError("Approved manifest contains invalid asset identities.")
+
+    assets = {
+        asset.id: asset
+        for asset in db.query(Asset).filter(
+            Asset.project_id == project_id,
+            Asset.id.in_(asset_ids),
+        ).all()
+    }
+    output_root = Path(output_dir or os.path.join(os.getcwd(), "uploads", "exports"))
+    package_root = output_root / f"lg10-{project_id}-{version.id}-standalone"
+    asset_root = package_root / "assets"
+    asset_root.mkdir(parents=True, exist_ok=True)
+
+    asset_paths: dict[str, str] = {}
+    bundled_assets: list[dict[str, str]] = []
+    for entry in entries:
+        asset_id = str(entry.get("asset_id") or "")
+        expected_hash = str(entry.get("asset_content_hash") or "")
+        asset = assets.get(asset_id)
+        if (
+            asset is None
+            or not is_asset_final_output_eligible(asset)
+            or not _SHA256_HEX.fullmatch(expected_hash)
+            or asset.content_hash != expected_hash
+            or not asset.file_path
+            or not os.path.isfile(asset.file_path)
+            or image_sha256(asset.file_path) != expected_hash
+        ):
+            raise FrozenExportSnapshotError("Approved asset bytes no longer match the frozen DetailPageVersion.")
+        relative_path = f"assets/{asset.id}{_safe_asset_extension(asset)}"
+        shutil.copyfile(asset.file_path, package_root / relative_path)
+        asset_paths[asset.id] = relative_path
+        bundled_assets.append({
+            "asset_id": asset.id,
+            "asset_content_hash": expected_hash,
+            "path": relative_path,
+        })
+
+    copyable_html, warnings = _copyable_html_from_frozen_renderer(rendering, asset_paths)
+    css, css_warnings = _sanitize_copyable_css(str(rendering.get("css") or ""))
+    warnings.extend(css_warnings)
+    if not copyable_html.strip() or not css.strip():
+        raise FrozenExportSnapshotError("Frozen renderer output cannot produce a standalone export.")
+
+    manifest_payload = {
+        "schema_version": "lg10-standalone-export-v1",
+        "detail_page_version_id": version.id,
+        "approved_asset_manifest": manifest,
+        "bundled_assets": bundled_assets,
+    }
+    font_manifest = {
+        "schema_version": "lg10-font-manifest-v1",
+        "detail_page_version_id": version.id,
+        "typography": dict((rendering.get("brand_tokens") or {}).get("typography") or {}),
+        "bundled_fonts": [],
+        "note": "No remote font files are loaded by the standalone package.",
+    }
+    index_html = (
+        "<!doctype html><html lang=\"ko\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        "<link rel=\"stylesheet\" href=\"styles.css\"></head><body>"
+        f"{copyable_html}</body></html>"
+    )
+    html_path = package_root / "copyable.html"
+    css_path = package_root / "styles.css"
+    index_path = package_root / "index.html"
+    manifest_path = package_root / "approved-asset-manifest.json"
+    font_manifest_path = package_root / "font-manifest.json"
+    html_path.write_text(copyable_html, encoding="utf-8")
+    css_path.write_text(css, encoding="utf-8")
+    index_path.write_text(index_html, encoding="utf-8")
+    manifest_path.write_text(json.dumps(manifest_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    font_manifest_path.write_text(json.dumps(font_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    (package_root / "README.txt").write_text(
+        "Open index.html locally. All images and CSS are bundled with relative paths; no API call is required.\n",
+        encoding="utf-8",
+    )
+
+    zip_path = output_root / f"lg10-{project_id}-{version.id}-standalone.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(package_root.rglob("*")):
+            if path.is_file():
+                archive.write(path, path.relative_to(package_root).as_posix())
+    return {
+        "html_path": str(html_path),
+        "zip_path": str(zip_path),
+        "warnings": sorted(set(warnings)),
+        "detail_page_version_id": version.id,
+        "approved_asset_manifest": manifest,
+    }
 
 
 def build_export_render_path(project_id: str) -> str:

@@ -56,6 +56,9 @@ export type GraphView = {
         status: string;
       };
     };
+    rendering?: {
+      detail_page_version?: { id?: string };
+    };
     execution?: {
       recoverable?: boolean;
       last_error?: GraphExecutionError | null;
@@ -89,6 +92,11 @@ type UploadAsset = {
   source_type: string;
   usage_status: string;
   mime_type?: string;
+};
+
+type StandaloneExport = {
+  html_download_url: string;
+  zip_download_url: string;
 };
 
 type Props = {
@@ -129,6 +137,8 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   const [recoveryNotice, setRecoveryNotice] = useState<string | null>(null);
   const [uploadAssets, setUploadAssets] = useState<UploadAsset[]>([]);
   const [uploadByJob, setUploadByJob] = useState<Record<string, string>>({});
+  const [standaloneExport, setStandaloneExport] = useState<StandaloneExport | null>(null);
+  const [standaloneExporting, setStandaloneExporting] = useState(false);
   const inFlightRef = useRef(false);
   const resolvedRunIdRef = useRef<string | null>(runId ?? null);
 
@@ -295,6 +305,28 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     }
   };
 
+  const createStandaloneExport = async (detailPageVersionId: string) => {
+    setStandaloneExporting(true);
+    setMessage(null);
+    try {
+      const response = await fetch(apiUrl(`/api/v1/projects/${projectId}/page/export/standalone`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ final_version_id: detailPageVersionId }),
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(typeof payload?.detail === "string" ? payload.detail : "HTML/ZIP 내보내기를 준비하지 못했습니다.");
+      }
+      setStandaloneExport(payload as StandaloneExport);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "HTML/ZIP 내보내기를 준비하지 못했습니다.");
+    } finally {
+      setStandaloneExporting(false);
+    }
+  };
+
   if (loading) return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-500">LangGraph 승인 상태를 확인하는 중...</section>;
   if (view?.status === "failed") {
     const failure = view.values.execution?.last_error;
@@ -322,18 +354,24 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   if (!view) return null;
   if (!pending) {
     const completedJobs = (view.values.generation?.jobs || []).filter((job) => job.output_asset_id);
-    if (view.status === "completed" && completedJobs.length > 0) {
+    const detailPageVersionId = view.values.rendering?.detail_page_version?.id;
+    if (view.status === "completed" && (completedJobs.length > 0 || detailPageVersionId)) {
       return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-950" data-testid="lg5r-completed-gallery">
-        <p className="text-xs font-bold text-emerald-700">LangGraph 이미지 생성 완료</p>
-        <h2 className="mt-1 font-black">승인된 장면 결과</h2>
-        <p className="mt-1 text-xs leading-5 text-slate-600">이 실행에서 승인한 이미지를 다시 확인할 수 있습니다.</p>
-        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+        <p className="text-xs font-bold text-emerald-700">LangGraph 상세페이지 생성 완료</p>
+        <h2 className="mt-1 font-black">{completedJobs.length > 0 ? "승인된 장면 결과" : "정보형 상세페이지 결과"}</h2>
+        <p className="mt-1 text-xs leading-5 text-slate-600">{completedJobs.length > 0 ? "이 실행에서 승인한 이미지를 다시 확인할 수 있습니다." : "추가 이미지 생성 없이 정보와 권리 보유 원본으로 상세페이지를 완성했습니다."}</p>
+        {completedJobs.length > 0 ? <div className="mt-4 grid gap-3 sm:grid-cols-2">
           {completedJobs.map((job) => <figure key={job.job_id} className="overflow-hidden rounded-lg border border-emerald-100 bg-white">
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img src={apiUrl(`/api/v1/files/assets/${job.output_asset_id}`)} alt={`${job.role || job.section_id || "장면"} 승인 이미지`} className="aspect-square w-full object-contain" loading="lazy" />
             <figcaption className="border-t border-emerald-100 px-3 py-2 text-xs"><b>{job.role || job.section_id || job.job_id}</b> · {job.status}</figcaption>
           </figure>)}
-        </div>
+        </div> : null}
+        {detailPageVersionId ? <div className="mt-4 flex flex-wrap gap-2">
+          <a href={`/workspace/projects/${projectId}/render?version_id=${encodeURIComponent(detailPageVersionId)}`} className="inline-flex rounded-lg bg-emerald-700 px-3 py-2 text-xs font-bold text-white">완성 상세페이지 미리보기</a>
+          <button type="button" data-testid="lg10-standalone-export" onClick={() => void createStandaloneExport(detailPageVersionId)} disabled={standaloneExporting} className="rounded-lg border border-emerald-300 bg-white px-3 py-2 text-xs font-bold text-emerald-800 disabled:opacity-50">{standaloneExporting ? "HTML/ZIP 준비 중..." : "HTML/ZIP 내보내기"}</button>
+          {standaloneExport ? <><a data-testid="lg10-copyable-html-download" href={apiUrl(standaloneExport.html_download_url)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-800">HTML 다운로드</a><a data-testid="lg10-standalone-zip-download" href={apiUrl(standaloneExport.zip_download_url)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-800">ZIP 다운로드</a></> : null}
+        </div> : null}
       </section>;
     }
     return null;

@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from src.agents.langgraph_runtime import (
     build_lg8_compiled_graph,
+    build_lg10_compiled_graph,
     build_lg7_compiled_graph,
     build_lg6_compiled_graph,
     build_lg5_compiled_graph,
@@ -240,6 +241,49 @@ class AgentRunGraphProjector:
                     **generation_delta,
                 },
             }
+        assembly_delta = update.get("page_assembly")
+        if isinstance(assembly_delta, dict) and assembly_delta:
+            projected_run.outputs_json = {
+                **projected_run.outputs_json,
+                "langgraph_page_assembly": {
+                    **((projected_run.outputs_json or {}).get("langgraph_page_assembly") or {}),
+                    **assembly_delta,
+                },
+            }
+        rendering_delta = update.get("rendering")
+        if isinstance(rendering_delta, dict) and rendering_delta:
+            # A graph checkpoint can commit before this SQL projection. Reuse
+            # the deterministic version persistence helper while replaying
+            # history so the frozen renderer state always points at a durable
+            # DetailPageVersion after restart.
+            generation = dict(update.get("generation") or {})
+            assembly = dict(update.get("page_assembly") or {})
+            canonical_input = generation.get("canonical_page_assembly_input")
+            if isinstance(canonical_input, dict) and assembly:
+                from src.services.page_finalization_service import persist_lg10_detail_page_version
+
+                version = persist_lg10_detail_page_version(
+                    run=projected_run,
+                    canonical_page_assembly_input=canonical_input,
+                    page_assembly=assembly,
+                    rendering=rendering_delta,
+                    db=db,
+                )
+                rendering_delta = {
+                    **rendering_delta,
+                    "detail_page_version": {
+                        "id": version.id,
+                        "schema_version": "lg10-detail-page-version-v1",
+                        "snapshot_hash": str((version.sections_json or {}).get("snapshot_hash") or ""),
+                    },
+                }
+            projected_run.outputs_json = {
+                **projected_run.outputs_json,
+                "langgraph_page_rendering": {
+                    **((projected_run.outputs_json or {}).get("langgraph_page_rendering") or {}),
+                    **rendering_delta,
+                },
+            }
         prompt_delta = update.get("prompt_intelligence")
         if isinstance(prompt_delta, dict):
             projected_run.outputs_json = {
@@ -366,7 +410,7 @@ class LangGraphRunService:
         """Use the migrated graph for the explicit LangGraph rollout."""
         if not langgraph_runtime_enabled():
             return build_lg1_compiled_graph(checkpointer=checkpointer)
-        builder = build_lg8_compiled_graph
+        builder = build_lg10_compiled_graph
         if build_lg5_compiled_graph is not _UNPATCHED_LG5_GRAPH_BUILDER:
             builder = build_lg5_compiled_graph
         return builder(checkpointer=checkpointer)
@@ -442,6 +486,8 @@ class LangGraphRunService:
                         "discovery": dict((snapshot.values or {}).get("discovery") or {}),
                         "commerce": dict((snapshot.values or {}).get("commerce") or {}),
                         "generation": dict((snapshot.values or {}).get("generation") or {}),
+                        "page_assembly": dict((snapshot.values or {}).get("page_assembly") or {}),
+                        "rendering": dict((snapshot.values or {}).get("rendering") or {}),
                     },
                 )
         return run

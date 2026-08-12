@@ -16,6 +16,7 @@ from test_lg5_image_generation_subgraph import (
 
 
 @pytest.mark.lg9_real_provider_smoke
+@pytest.mark.lg10_real_provider_smoke
 def test_lg9_real_provider_smoke_requires_explicit_opt_in(
     client, auth_headers, db_session, lg5_runtime, monkeypatch, tmp_path
 ):
@@ -79,3 +80,15 @@ def test_lg9_real_provider_smoke_requires_explicit_opt_in(
     state = image_review.json()
     assert state["current_stage"] == "image_review"
     assert state["values"]["generation"]["jobs"][0]["output_asset_id"]
+
+    completed = _resume(
+        client,
+        auth_headers,
+        state,
+        "approve",
+        job_id=state["values"]["generation"]["jobs"][0]["job_id"],
+    )
+    assert completed.status_code == 200, completed.text
+    assert completed.json()["status"] == "completed"
+    assert completed.json()["values"]["generation"]["approved_asset_manifest"]
+    assert completed.json()["values"]["rendering"]["detail_page_version"]["id"]

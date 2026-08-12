@@ -167,7 +167,9 @@ def _summary(rows: list[ImageGenerationJobRecord]) -> dict[str, Any]:
         "approved_count": sum(job.status == "approved" for job in required),
         "required_scene_count": len(required),
         "remaining_required_scene_ids": remaining,
-        "all_required_scenes_approved": bool(required) and not remaining,
+        "image_generation_required": bool(required),
+        "completion_basis": "approved_required_scenes" if required else "no_required_image_scenes",
+        "all_required_scenes_approved": not remaining,
         "approved_asset_ids": [job.output_asset_id for job in required if job.status == "approved" and job.output_asset_id],
         "review_asset_ids": [job.output_asset_id for job in latest if job.status == "needs_review" and job.output_asset_id],
         "failed_job_ids": [job.job_id for job in latest if job.status in FAILED_STATUSES],
@@ -243,7 +245,12 @@ def _pinned_brand_kit(run: AgentRun) -> tuple[str | None, str | None]:
 
 
 def ensure_generation_cost_plan(
-    *, run_id: str, project_id: str, db: Session, scene_ids: list[str] | None = None
+    *,
+    run_id: str,
+    project_id: str,
+    db: Session,
+    scene_ids: list[str] | None = None,
+    allow_no_required_scenes: bool = False,
 ) -> dict[str, Any]:
     """Persist the exact pre-dispatch cost snapshot without creating jobs."""
 
@@ -263,7 +270,29 @@ def ensure_generation_cost_plan(
     if wanted:
         contracts = [item for item in contracts if item["scene_id"] in wanted]
     if not contracts:
-        raise ImageGenerationGateError("NO_GENERATION_SCENES", "이미지 생성이 필요한 승인 장면이 없습니다.")
+        if not allow_no_required_scenes:
+            raise ImageGenerationGateError("NO_GENERATION_SCENES", "이미지 생성이 필요한 승인 장면이 없습니다.")
+        # A storyboard made entirely from information sections and explicitly
+        # seller-supplied photos is a valid zero-cost LG-10 input. Keep this
+        # distinct from failed or unapproved required jobs without creating a
+        # fake cost approval record or provider work item.
+        planning_hash = _hash(project.planning_draft or {})
+        plan_hash = _hash({"run_id": run_id, "planning_hash": planning_hash, "scenes": []})
+        run.estimated_cost = 0
+        run.cost_approval_status = "not_required"
+        db.add(run)
+        db.commit()
+        return {
+            "cost_plan_hash": plan_hash,
+            "planning_hash": planning_hash,
+            "provider": "none",
+            "model": "none",
+            "scene_count": 0,
+            "scenes": [],
+            "total_estimated_cost": 0.0,
+            "currency": "credit",
+            "status": "not_required",
+        }
     scenes = [
         {
             "scene_id": item["scene_id"],
