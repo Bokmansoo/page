@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,6 +27,8 @@ from src.agents.langgraph_runtime import (
     build_lg3_compiled_graph,
     build_lg1_compiled_graph,
     build_lg1_graph_input,
+    build_lg12i_intake_compiled_graph,
+    build_lg12i_intake_graph_input,
     build_lg11_edit_graph_input,
     langgraph_runtime_enabled,
     open_postgres_checkpointer,
@@ -35,7 +38,7 @@ from src.agents.langgraph_runtime import (
 # their stage-specific graph.  Keep that contract while LG-6 remains the
 # production graph selected below.
 _UNPATCHED_LG5_GRAPH_BUILDER = build_lg5_compiled_graph
-from src.db.models import AgentRun, AgentRunStep
+from src.db.models import AgentRun, AgentRunStep, Asset, ProductProject
 
 
 logger = logging.getLogger(__name__)
@@ -232,6 +235,18 @@ class AgentRunGraphProjector:
                 "langgraph_commerce": {
                     **((projected_run.outputs_json or {}).get("langgraph_commerce") or {}),
                     **commerce_delta,
+                },
+            }
+        intake_delta = update.get("intake")
+        if isinstance(intake_delta, dict):
+            # LG-12I projects the same compact, validated envelope identity
+            # that is held in the checkpoint.  It never projects source bodies
+            # or mode-specific adapter output before those adapters exist.
+            projected_run.outputs_json = {
+                **projected_run.outputs_json,
+                "langgraph_intake": {
+                    **((projected_run.outputs_json or {}).get("langgraph_intake") or {}),
+                    **intake_delta,
                 },
             }
         generation_delta = update.get("generation")
@@ -448,6 +463,8 @@ class LangGraphRunService:
     @staticmethod
     def _compiled_graph(checkpointer: Any, *, run: AgentRun | None = None) -> Any:
         """Use the migrated graph for the explicit LangGraph rollout."""
+        if run is not None and run.mode == "lg12i_intake":
+            return build_lg12i_intake_compiled_graph(checkpointer=checkpointer)
         if run is not None and run.mode == "lg11_edit":
             return build_lg11_compiled_graph(checkpointer=checkpointer)
         if not langgraph_runtime_enabled():
@@ -527,6 +544,7 @@ class LangGraphRunService:
                         "events": [events[-1]],
                         "discovery": dict((snapshot.values or {}).get("discovery") or {}),
                         "commerce": dict((snapshot.values or {}).get("commerce") or {}),
+                        "intake": dict((snapshot.values or {}).get("intake") or {}),
                         "generation": dict((snapshot.values or {}).get("generation") or {}),
                         "page_assembly": dict((snapshot.values or {}).get("page_assembly") or {}),
                         "rendering": dict((snapshot.values or {}).get("rendering") or {}),
@@ -588,6 +606,37 @@ class LangGraphRunService:
             db.commit()
             db.refresh(run)
             return run
+
+    @classmethod
+    def _recover_running_lg12i_projection(cls, run: AgentRun, db: Session) -> AgentRun:
+        """Repair an LG-12I router projection after checkpoint-only progress."""
+
+        if run.mode != "lg12i_intake" or run.status != "running" or not run.graph_thread_id:
+            return run
+        config = cls._config(cls._thread_id(run))
+        with open_postgres_checkpointer() as checkpointer:
+            graph = cls._compiled_graph(checkpointer, run=run)
+            snapshot = graph.get_state(config)
+            checkpoint_intake = dict((snapshot.values or {}).get("intake") or {})
+            projected_intake = dict((run.outputs_json or {}).get("langgraph_intake") or {})
+            if not checkpoint_intake or projected_intake == checkpoint_intake:
+                return run
+            run = cls._rebuild_projection_from_history(run, db, graph, config)
+            run.graph_checkpoint_id = (
+                (snapshot.config.get("configurable") or {}).get("checkpoint_id")
+            )
+            db.add(run)
+            db.commit()
+            db.refresh(run)
+            return run
+
+    @classmethod
+    def _recover_running_projection(cls, run: AgentRun, db: Session) -> AgentRun:
+        if run.mode == "lg11_edit":
+            return cls._recover_running_lg11_projection(run, db)
+        if run.mode == "lg12i_intake":
+            return cls._recover_running_lg12i_projection(run, db)
+        return run
 
     @classmethod
     def _execute(
@@ -691,7 +740,7 @@ class LangGraphRunService:
             # checkpoint may nevertheless be newer than its SQL projection if
             # the process stopped after the checkpoint commit; repair only
             # that stale projection before returning the same run.
-            return cls._recover_running_lg11_projection(run, db)
+            return cls._recover_running_projection(run, db)
         if run.status == "failed":
             raise GraphRunResumeRequired("This graph run failed; resume the same thread instead of starting again.")
 
@@ -737,6 +786,13 @@ class LangGraphRunService:
                 project_id=run.project_id,
                 edit=dict((run.input_snapshot or {}).get("lg11_edit") or {}),
             )
+        elif run.mode == "lg12i_intake":
+            initial_state = build_lg12i_intake_graph_input(
+                run_id=run.id,
+                workspace_id=run.workspace_id,
+                project_id=run.project_id,
+                intake_envelope=dict((run.input_snapshot or {}).get("unified_product_intake") or {}),
+            )
         else:
             initial_state = build_lg1_graph_input(
                 run_id=run.id,
@@ -752,6 +808,125 @@ class LangGraphRunService:
             initial_state=initial_state,
             rebuild_projection=False,
         )
+
+    @classmethod
+    def start_unified_product_intake(
+        cls,
+        *,
+        project_id: str,
+        workspace_id: str,
+        actor_id: str,
+        request: dict[str, Any],
+        db: Session,
+    ) -> AgentRun:
+        """Create or reuse one LG-12I intake thread, then use normal start.
+
+        This is deliberately only a run-envelope boundary.  It neither fetches
+        sources nor creates a ProductSourceSnapshotVersion; later adapter
+        tasks receive the persisted command from the compiled graph state.
+        """
+
+        from src.services.product_intake_version_service import (
+            UNIFIED_PRODUCT_INTAKE_SCHEMA_VERSION,
+            canonical_unified_intake_input_hash,
+            validate_unified_product_intake_envelope,
+        )
+
+        project = (
+            db.query(ProductProject)
+            .filter(ProductProject.id == project_id, ProductProject.workspace_id == workspace_id)
+            .with_for_update()
+            .one_or_none()
+        )
+        if project is None:
+            raise GraphRunNotFound("Product project was not found in this workspace.")
+        base_envelope = {
+            "schema_version": UNIFIED_PRODUCT_INTAKE_SCHEMA_VERSION,
+            "project_id": project_id,
+            "input_mode": request.get("input_mode"),
+            "source_payload_refs": list(request.get("source_payload_refs") or []),
+            "requested_generation_mode": request.get("requested_generation_mode"),
+            "target_channels": list(request.get("target_channels") or []),
+            "actor_workspace_identity": {
+                "actor_id": actor_id,
+                "workspace_id": workspace_id,
+            },
+            # These values are deliberately excluded from the input hash.
+            "run_identity": {"run_id": "pending", "thread_id": "pending"},
+            "created_at": "pending",
+        }
+        base_envelope["input_hash"] = canonical_unified_intake_input_hash(base_envelope)
+        # Validate the caller's source references before allocating an AgentRun.
+        base_envelope = validate_unified_product_intake_envelope(base_envelope)
+        if base_envelope["input_mode"] == "photo_only":
+            # Reuse the existing project-scoped asset-picker boundary instead
+            # of trusting a caller-supplied asset ID or rights label.
+            safe_refs = [
+                item for item in base_envelope["source_payload_refs"]
+                if "asset" in str(item.get("kind") or "").lower()
+                and item.get("rights_status") in {"seller_owned", "rights_confirmed"}
+            ]
+            assets = {
+                asset.id: asset
+                for asset in db.query(Asset).filter(
+                    Asset.project_id == project_id,
+                    Asset.id.in_([str(item["id"]) for item in safe_refs]),
+                ).all()
+            }
+            for reference in safe_refs:
+                asset = assets.get(str(reference["id"]))
+                usage = str(asset.usage_status or "").lower() if asset else ""
+                source = str(asset.source_type or "").lower() if asset else ""
+                if (
+                    asset is None
+                    or usage not in {"seller_owned", "rights_confirmed"}
+                    or source.startswith("supplier")
+                    or str(reference.get("rights_status") or "").lower() != usage
+                ):
+                    raise ValueError("photo_only asset reference is not eligible in this project.")
+
+        # Reuse the existing AgentRun start/idempotency behavior. JSON lookup
+        # stays portable across the supported SQL dialects; this candidate set
+        # is scoped by project/workspace/mode and contains only compact runs.
+        existing_runs = (
+            db.query(AgentRun)
+            .filter(
+                AgentRun.project_id == project_id,
+                AgentRun.workspace_id == workspace_id,
+                AgentRun.mode == "lg12i_intake",
+            )
+            .order_by(AgentRun.created_at.desc())
+            .all()
+        )
+        for existing in existing_runs:
+            stored = dict((existing.input_snapshot or {}).get("unified_product_intake") or {})
+            if stored.get("input_hash") == base_envelope["input_hash"]:
+                if existing.status == "created":
+                    return cls.start(existing.id, workspace_id, db)
+                return existing
+
+        run_id = str(uuid.uuid4())
+        envelope = {
+            **base_envelope,
+            "run_identity": {"run_id": run_id, "thread_id": run_id},
+            "created_at": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        }
+        envelope = validate_unified_product_intake_envelope(envelope)
+        run = AgentRun(
+            id=run_id,
+            workspace_id=workspace_id,
+            project_id=project_id,
+            mode="lg12i_intake",
+            status="created",
+            current_stage="unified_intake_router",
+            input_snapshot={"unified_product_intake": envelope},
+            outputs_json={},
+            cost_approval_status="not_required",
+            created_by=actor_id,
+        )
+        db.add(run)
+        db.commit()
+        return cls.start(run.id, workspace_id, db)
 
     @classmethod
     def get_state(cls, run_id: str, workspace_id: str, db: Session) -> GraphRunStateView:
@@ -831,7 +1006,7 @@ class LangGraphRunService:
         if run.status == "completed":
             return run
         if run.status == "running":
-            run = cls._recover_running_lg11_projection(run, db)
+            run = cls._recover_running_projection(run, db)
             if run.status == "running":
                 return run
         if not run.graph_thread_id:

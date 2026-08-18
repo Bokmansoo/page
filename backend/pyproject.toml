@@ -48,4 +48,5 @@ markers = [
     "lg10_real_provider_smoke: opt-in smoke that carries one real-provider image through the LG-10 final snapshot",
     "lg11_fake_e2e: zero-cost production LangGraph LG-11 edit, Canvas, restore, and export quality gate",
     "lg11_real_provider_smoke: opt-in smoke for an LG-11 scene edit through the configured real provider",
+    "lg12i_fake_e2e: zero-cost production LangGraph LG-12I unified intake routing coverage",
 ]

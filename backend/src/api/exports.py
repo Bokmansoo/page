@@ -28,6 +28,7 @@ from src.services.export_service import (
     build_lg10_standalone_export_bundle,
 )
 from src.services.page_visual_contract import LG11CanvasSafetyError, ensure_lg11_canvas_safe
+from src.services.channel_export_service import supported_channel_keys
 
 router = APIRouter(tags=["Exports"])
 logger = logging.getLogger(__name__)
@@ -131,7 +132,7 @@ def _asset_id_from_download_url(url: str) -> Optional[str]:
     return url.rstrip("/").split(marker, 1)[1].split("?", 1)[0]
 
 
-_LG11_EXPORT_CHANNELS = frozenset({"smartstore", "coupang"})
+_LG11_EXPORT_CHANNELS = supported_channel_keys()
 _LG11_CHANNEL_ARTIFACT_TYPES = frozenset({"channel_long", "channel_package"})
 _LG11_EXPORT_FORMATS = frozenset({"png", "jpg", "jpeg", "html", "zip"})
 

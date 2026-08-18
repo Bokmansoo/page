@@ -52,6 +52,9 @@ CHECKPOINT_SAFE_INPUT_FIELDS = frozenset(
         "prompt_intelligence_snapshot",
         "interaction_mode",
         "creative_brief_snapshot",
+        # LG-12I only persists the validated reference envelope. URL bodies,
+        # image bytes and OCR/source text are intentionally not graph state.
+        "unified_product_intake",
     }
 )
 
@@ -126,6 +129,10 @@ class SellformGraphState(TypedDict, total=False):
     # LG-7 keeps only the immutable compiler artifact identity in checkpoints.
     # Review corpora and reference bodies remain in their versioned SQL tables.
     creative_brief: Annotated[dict[str, Any], _merge_discovery]
+    # LG-12I keeps the versioned intake identity plus compact source refs so a
+    # later adapter can recover from the same checkpoint without re-reading a
+    # mutable request body.
+    intake: Annotated[dict[str, Any], _merge_discovery]
 
 
 class LG11EditGraphState(TypedDict, total=False):
@@ -221,6 +228,36 @@ def build_lg1_graph_input(
         "mode": mode,
         "input_snapshot": checkpoint_safe_input_snapshot(input_snapshot),
         "current_stage": "intake",
+        "status": "created",
+        "events": [],
+        "errors": [],
+    }
+
+
+def build_lg12i_intake_graph_input(
+    *,
+    run_id: str,
+    workspace_id: str,
+    project_id: str,
+    intake_envelope: dict[str, Any],
+) -> SellformGraphState:
+    """Build the narrow production state for one LG-12I intake thread.
+
+    The envelope was validated before the run was created and is validated
+    again by the router node.  That second check makes a manually altered SQL
+    snapshot fail closed rather than becoming an adapter input later.
+    """
+
+    return {
+        "run_id": run_id,
+        "thread_id": run_id,
+        "workspace_id": workspace_id,
+        "project_id": project_id,
+        "mode": "lg12i_intake",
+        "input_snapshot": checkpoint_safe_input_snapshot(
+            {"unified_product_intake": intake_envelope}
+        ),
+        "current_stage": "unified_intake_router",
         "status": "created",
         "events": [],
         "errors": [],
@@ -1347,6 +1384,62 @@ def build_lg10_compiled_graph(*, checkpointer: BaseCheckpointSaver[Any]):
     graph.add_conditional_edges("image_review", _lg10_image_review_route, {
         "generation_pending": "generation_pending", "page_assembly": "page_assembly", "finalize_run": "finalize_run", "image_review": "image_review"})
     graph.add_edge("page_assembly", "canonical_renderer"); graph.add_edge("canonical_renderer", "finalize_run"); graph.add_edge("finalize_run", END)
+    return graph.compile(checkpointer=checkpointer)
+
+
+def _lg12i_unified_intake_router(state: SellformGraphState) -> dict[str, Any]:
+    """Route every first-class input mode through one durable intake node.
+
+    Adapters are deliberately not invoked here.  The only output is the
+    compact, versioned command that TASK-12I.3 through TASK-12I.5 will consume.
+    """
+
+    from src.services.product_intake_version_service import (
+        UNIFIED_PRODUCT_INTAKE_MODES,
+        validate_unified_product_intake_envelope,
+    )
+
+    envelope = validate_unified_product_intake_envelope(
+        dict((state.get("input_snapshot") or {}).get("unified_product_intake") or {})
+    )
+    if envelope["project_id"] != state.get("project_id"):
+        raise ValueError("Unified intake envelope project_id does not match the graph run.")
+    if envelope["run_identity"]["run_id"] != state.get("run_id"):
+        raise ValueError("Unified intake envelope run_identity does not match the graph run.")
+    mode = str(envelope["input_mode"])
+    if mode not in UNIFIED_PRODUCT_INTAKE_MODES:
+        raise ValueError("Unknown unified intake input_mode.")
+    return {
+        "current_stage": "intake_adapter_pending",
+        "status": "completed",
+        "intake": {
+            "schema_version": envelope["schema_version"],
+            "input_hash": envelope["input_hash"],
+            "input_mode": mode,
+            "requested_generation_mode": envelope["requested_generation_mode"],
+            "target_channels": list(envelope["target_channels"]),
+            "run_identity": dict(envelope["run_identity"]),
+            "actor_workspace_identity": dict(envelope["actor_workspace_identity"]),
+            "source_payload_refs": list(envelope["source_payload_refs"]),
+            # This is a contract-only handoff, not a mode-specific adapter.
+            "next_action": "task_12i_adapter_not_implemented",
+            "product_source_snapshot_command": {
+                "input_mode": mode,
+                "input_hash": envelope["input_hash"],
+                "source_payload_refs": list(envelope["source_payload_refs"]),
+            },
+        },
+        "events": [_graph_node_event("intake_adapter_pending", "completed")],
+    }
+
+
+def build_lg12i_intake_compiled_graph(*, checkpointer: BaseCheckpointSaver[Any]):
+    """Compile the LG-12I subgraph inside the existing production runtime."""
+
+    graph = StateGraph(SellformGraphState)
+    graph.add_node("unified_intake_router", _lg12i_unified_intake_router)
+    graph.add_edge(START, "unified_intake_router")
+    graph.add_edge("unified_intake_router", END)
     return graph.compile(checkpointer=checkpointer)
 
 

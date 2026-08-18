@@ -44,6 +44,17 @@ _DEFAULT_PRESETS = {
     ),
 }
 
+# The production renderer, safety gate, and LG-11/LG-12I entry contracts all
+# use these fixed marketplace identities. Environment overrides may tune a
+# preset's values, but must never introduce a new channel identity.
+SUPPORTED_CHANNEL_KEYS = frozenset(_DEFAULT_PRESETS)
+
+
+def supported_channel_keys() -> frozenset[str]:
+    """Return the fixed production channel allowlist."""
+
+    return SUPPORTED_CHANNEL_KEYS
+
 
 def channel_presets() -> dict[str, ChannelPreset]:
     """Load replaceable preset values without changing rendering code.

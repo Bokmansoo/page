@@ -23,12 +23,16 @@ from src.db.models import (
     SellerConfirmationVersion,
 )
 from src.services.prompt_intelligence_service import canonical_hash
+from src.services.channel_export_service import supported_channel_keys
 
 
 PRODUCT_SOURCE_SNAPSHOT_SCHEMA_VERSION = "lg12i-product-source-snapshot-v1"
 PRODUCT_TRUTH_SCHEMA_VERSION = "lg12i-product-truth-v1"
 SELLER_CONFIRMATION_SCHEMA_VERSION = "lg12i-seller-confirmation-v1"
 COMMERCE_CREATIVE_MASTER_SCHEMA_VERSION = "lg12i-commerce-creative-master-v1"
+UNIFIED_PRODUCT_INTAKE_SCHEMA_VERSION = "lg12i-unified-product-intake-v1"
+UNIFIED_PRODUCT_INTAKE_MODES = frozenset({"owned_product_url", "photo_only", "manual"})
+UNIFIED_PRODUCT_INTAKE_GENERATION_MODES = frozenset({"quick", "expert"})
 _SHA256_CHARS = set("0123456789abcdef")
 _MASTER_REFERENCE_KEYS = {"id", "version", "hash", "schema_version", "artifact_key"}
 _DOWNSTREAM_KINDS = {"DetailPageVersion", "SocialKitVersion", "VideoProjectVersion"}
@@ -36,12 +40,16 @@ _UNORDERED_REFERENCE_COLLECTION_FIELDS = frozenset({
     "source_refs", "fact_refs", "evidence_refs", "unknown_refs", "conflict_refs",
     "prohibited_inference_refs", "confirmed_fact_refs", "rejected_fact_refs",
     "unknown_fact_refs", "evidence_artifacts", "asset_refs", "artifact_refs",
-    "rights_confirmations", "target_channels", "downstream_outputs",
+    "rights_confirmations", "target_channels", "downstream_outputs", "source_payload_refs",
 })
 
 
 class IntakeVersionContractError(ValueError):
     """An immutable LG-12I version or its lineage is invalid."""
+
+
+class UnifiedProductIntakeContractError(ValueError):
+    """A LG-12I intake envelope is unsafe or incomplete for routing."""
 
 
 VersionRow = TypeVar(
@@ -59,6 +67,137 @@ def canonical_version_hash(payload: Mapping[str, Any]) -> str:
     if not isinstance(payload, Mapping):
         raise IntakeVersionContractError("Version canonical payload must be an object.")
     return canonical_hash(_canonicalize_version_value({key: value for key, value in payload.items() if key != "canonical_hash"}))
+
+
+def canonical_unified_intake_input_hash(payload: Mapping[str, Any]) -> str:
+    """Return the idempotency identity for a routed intake request.
+
+    A run/thread and creation time identify one durable execution, not the
+    seller's requested intake content.  Excluding them keeps a retry of the
+    same project input idempotent while the persisted envelope still pins its
+    actual run/thread identity after creation.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise UnifiedProductIntakeContractError("Unified intake envelope must be an object.")
+    identity_payload = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"input_hash", "created_at", "run_identity"}
+    }
+    return canonical_hash(_canonicalize_version_value(identity_payload))
+
+
+def _require_intake_reference(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise UnifiedProductIntakeContractError(f"{label} must be a reference object.")
+    item = deepcopy(dict(value))
+    prohibited = {
+        "raw_image_bytes", "image_bytes", "bytes", "raw_html", "html", "ocr_text",
+        "raw_body", "body", "data_uri", "external_url", "script", "raw_html_body",
+    }
+    if prohibited.intersection(item):
+        raise UnifiedProductIntakeContractError(f"{label} must contain only a safe artifact reference.")
+    allowed = {"id", "kind", "version", "hash", "rights_status", "schema_version"}
+    if set(item) - allowed:
+        raise UnifiedProductIntakeContractError(f"{label} must not embed source content outside its stable reference identity.")
+    if not isinstance(item.get("id"), str) or not item["id"]:
+        raise UnifiedProductIntakeContractError(f"{label}.id is required.")
+    if not isinstance(item.get("kind"), str) or not item["kind"]:
+        raise UnifiedProductIntakeContractError(f"{label}.kind is required.")
+    if not isinstance(item.get("version"), int) or item["version"] < 1:
+        raise UnifiedProductIntakeContractError(f"{label}.version must be a positive integer.")
+    _require_hash(item.get("hash"), f"{label}.hash")
+    if any(isinstance(value, str) and len(value) > 4096 for value in item.values()):
+        raise UnifiedProductIntakeContractError(f"{label} must not embed a large raw payload.")
+    return item
+
+
+def validate_unified_product_intake_envelope(
+    payload: Mapping[str, Any], *, require_run_identity: bool = True
+) -> dict[str, Any]:
+    """Validate the reference-only LG-12I routing envelope.
+
+    This is intentionally a contract boundary: it does not fetch a URL,
+    inspect an image, normalize manual facts, or create any immutable source
+    row.  Later adapter tasks consume the compact references it returns.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise UnifiedProductIntakeContractError("Unified intake envelope must be an object.")
+    envelope = deepcopy(dict(payload))
+    required = {
+        "schema_version", "project_id", "input_mode", "source_payload_refs",
+        "requested_generation_mode", "target_channels", "actor_workspace_identity",
+        "input_hash", "created_at",
+    }
+    allowed = {*required, "run_identity"}
+    unexpected = sorted(key for key in envelope if key not in allowed)
+    if unexpected:
+        raise UnifiedProductIntakeContractError(
+            f"Unified intake envelope contains unsupported fields: {', '.join(unexpected)}."
+        )
+    missing = sorted(key for key in required if key not in envelope)
+    if missing:
+        raise UnifiedProductIntakeContractError(f"Unified intake envelope is missing: {', '.join(missing)}.")
+    if envelope.get("schema_version") != UNIFIED_PRODUCT_INTAKE_SCHEMA_VERSION:
+        raise UnifiedProductIntakeContractError("Unsupported unified intake schema_version.")
+    if not isinstance(envelope.get("project_id"), str) or not envelope["project_id"]:
+        raise UnifiedProductIntakeContractError("Unified intake project_id is required.")
+    mode = envelope.get("input_mode")
+    if mode not in UNIFIED_PRODUCT_INTAKE_MODES:
+        raise UnifiedProductIntakeContractError("Unknown unified intake input_mode.")
+    if envelope.get("requested_generation_mode") not in UNIFIED_PRODUCT_INTAKE_GENERATION_MODES:
+        raise UnifiedProductIntakeContractError("requested_generation_mode must be quick or expert.")
+    identity = envelope.get("actor_workspace_identity")
+    if not isinstance(identity, Mapping) or not all(isinstance(identity.get(key), str) and identity[key] for key in ("actor_id", "workspace_id")):
+        raise UnifiedProductIntakeContractError("actor_workspace_identity must pin actor_id and workspace_id.")
+    if require_run_identity:
+        run_identity = envelope.get("run_identity")
+        if not isinstance(run_identity, Mapping) or not all(isinstance(run_identity.get(key), str) and run_identity[key] for key in ("run_id", "thread_id")):
+            raise UnifiedProductIntakeContractError("run_identity must pin run_id and thread_id.")
+        if run_identity["run_id"] != run_identity["thread_id"]:
+            raise UnifiedProductIntakeContractError("Unified intake run_id and thread_id must match.")
+    refs = envelope.get("source_payload_refs")
+    if not isinstance(refs, list) or not refs:
+        raise UnifiedProductIntakeContractError("source_payload_refs must contain at least one reference.")
+    refs = [_require_intake_reference(item, f"source_payload_refs[{index}]") for index, item in enumerate(refs)]
+    kinds = {str(item["kind"]).lower() for item in refs}
+    if mode == "owned_product_url":
+        if not kinds or any("url" not in kind and "capture" not in kind for kind in kinds):
+            raise UnifiedProductIntakeContractError("owned_product_url accepts only URL/source capture request references.")
+    if mode == "photo_only":
+        eligible = [
+            item for item in refs
+            if "asset" in str(item["kind"]).lower()
+            and item.get("rights_status") in {"seller_owned", "rights_confirmed"}
+        ]
+        if not eligible:
+            raise UnifiedProductIntakeContractError("photo_only requires a seller-owned or rights-confirmed asset reference.")
+        if any("asset" not in kind for kind in kinds):
+            raise UnifiedProductIntakeContractError("photo_only accepts only rights-confirmed asset references.")
+    if mode == "manual":
+        if not kinds or any("manual" not in kind and "artifact" not in kind for kind in kinds):
+            raise UnifiedProductIntakeContractError("manual accepts only manual payload artifact references.")
+    channels = envelope.get("target_channels")
+    if not isinstance(channels, list) or not channels or any(not isinstance(channel, str) or not channel for channel in channels):
+        raise UnifiedProductIntakeContractError("target_channels must contain channel identities.")
+    if len(set(channels)) != len(channels):
+        raise UnifiedProductIntakeContractError("target_channels must not contain duplicates.")
+    if any(channel not in supported_channel_keys() for channel in channels):
+        raise UnifiedProductIntakeContractError("target_channels must use supported production channel identities.")
+    # Channels are a set-like production target contract. Persist the
+    # canonical order too, so a restart/projection does not preserve an
+    # arbitrary request order for the same envelope identity.
+    channels = sorted(channels)
+    envelope["target_channels"] = channels
+    if not isinstance(envelope.get("created_at"), str) or not envelope["created_at"]:
+        raise UnifiedProductIntakeContractError("Unified intake created_at is required.")
+    expected_hash = canonical_unified_intake_input_hash(envelope)
+    if envelope.get("input_hash") != expected_hash:
+        raise UnifiedProductIntakeContractError("Unified intake input_hash does not match canonical content.")
+    envelope["source_payload_refs"] = refs
+    return envelope
 
 
 def _canonical_collection_sort_key(value: Any) -> tuple[str, int, str, str]:
