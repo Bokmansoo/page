@@ -1,7 +1,8 @@
 # Sellform V2.1 AI Commerce Studio Sprint 로드맵
 
 작성일: 2026-08-07  
-상태: **현재 구현 로드맵**  
+개정일: 2026-08-18
+상태: **현재 구현 로드맵 — LG-12I 삽입 개정**
 상위 기획: [Sellform V2.1 AI Commerce Studio 최종 기획](../specs/2026-08-07-sellform-v2-ai-commerce-studio-v2.1-final-design.md)  
 이전 로드맵: [2026-08-06 LangGraph 전환 로드맵](./2026-08-06-sellform-v2-langgraph-migration-roadmap.md)
 
@@ -9,7 +10,7 @@
 
 기존 LG-0~LG-4는 LangGraph 기반층으로 보존한다. LG-5는 구현 자산은 있으나 최종 기획의 이미지 내구성·멱등·장면별 승인 완료 조건을 모두 증명하지 못했으므로 `LG-5R`에서 먼저 닫는다.
 
-기존 로드맵의 LG-6~LG-8은 아직 구현 기준으로 사용하지 않고 이 로드맵의 LG-6~LG-14로 대체한다. 번호를 새로 처음부터 시작하지 않는 이유는 기존 코드·테스트·리뷰 문서의 이력을 보존하기 위해서다.
+기존 로드맵의 LG-6~LG-8은 이 로드맵의 LG-6~LG-14로 대체했으며, 2026-08-18 제품 방향 개정으로 LG-11과 LG-12 사이에 `LG-12I`를 삽입하고 LG-15~LG-17을 후속 파생 콘텐츠 Sprint로 추가한다. 기존 번호와 requirement ID를 유지하는 이유는 코드·테스트·리뷰 이력을 보존하기 위해서다.
 
 2026-08-07 제품 인터뷰에서 다음 일곱 기능을 필수 범위로 확정했다.
 
@@ -21,18 +22,38 @@
 6. 서로 분리된 리뷰·레퍼런스 전용 입력
 7. 치명 오류 0건, 총점 85점, 영역별 70점을 요구하는 Visual Quality Bar
 
+2026-08-18 개정에서 다음 제품 기준을 추가 확정했다.
+
+1. 제품 포지셔닝은 “상품 입력 한 번으로 판매 콘텐츠의 모든 것을 만드는 AI Commerce Content Studio”다.
+2. `owned_product_url`, `photo_only`, `manual`은 동등한 first-class input mode다.
+3. 세 모드는 `ProductSourceSnapshotVersion → ProductTruthVersion → SellerConfirmationVersion → ProductCreativeBriefVersion → CommerceCreativeMasterVersion`으로 수렴한다.
+4. 상세페이지·소셜·영상은 동일 Commerce Creative Master에서 파생하며 서로의 렌더 결과를 상품 source로 재분석하지 않는다.
+5. LG-14 Detail Page Beta를 닫고 Social·Video·Campaign은 LG-15~LG-17에서 구현한다.
+
 ## 2. 현재 기준선
+
+### 2.1 생성 시간·Progressive generation 공통 계약
+
+- product understanding p90 <= 60초
+- planning/copy draft p90 <= 3분
+- first usable detail-page draft p90 <= 5분
+- high-quality final p90 <= 10~15분
+- 정상 실행의 90% <= 20분
+
+`first usable detail-page draft`는 사용자가 실제로 보고 수정 가능한 상세페이지 초안이다. `high-quality final`은 생성 이미지, QA, 최종 승격까지 완료된 결과다. 따라서 3~5분은 모든 생성 이미지와 최종 QA까지 포함한 final 보장이 아니다.
+
+Progressive generation은 seller-owned asset, 정보형 section, 이미 완료된 approved scene만으로 first usable frozen draft를 만든다. 아직 생성 중인 고품질 scene 때문에 first draft 전체를 기다리지 않으며, first usable draft는 immutable `DetailPageVersion`으로 freeze한다. 이후 고품질 scene이 완료되고 QA를 통과하면 기존 source frozen version을 수정하지 않고 LG-10/LG-11 lineage contract로 새 immutable child `DetailPageVersion`을 생성한다. 이 child version은 완료된 scene만 선택적으로 교체·reassembly하며 사용자는 이전 version으로 restore할 수 있다.
+
+Quick mode는 확실한 source-backed fact와 안전한 deterministic image QA PASS scene을 자동 채택·반영할 수 있고 모든 중간 장면 승인을 강제하지 않는다. fact ambiguity, rights, identity, safety, cost, critical quality 문제는 HITL interrupt로 전환한다. Expert mode는 기존 product understanding, planning, storyboard, scene review 등 단계별 검토를 제공하며 기존 LG-7/LG-9 검수 기능을 유지한다.
 
 | Sprint | 판정 | V2.1에서의 역할 |
 | --- | --- | --- |
-| LG-0 | 완료 기준선 | LangGraph 의존성, feature flag, legacy characterization |
-| LG-1 | 완료 기준선 | StateGraph, PostgreSQL checkpoint, run projection |
-| LG-2 | 완료 기준선 | Discovery와 승인 사실 snapshot |
-| LG-3 | 완료 기준선 | 기본 판매 전략·페이지·카피·비주얼 planning |
-| LG-4 | 완료 기준선 | input/evidence/planning/generation interrupt·resume |
-| LG-5 | 부분 구현 | 이미지 job·review 흐름의 기반, LG-5R 보완 필요 |
+| LG-0~LG-5 | 완료 기준선 | LangGraph 기반, discovery/planning/interrupt와 이미지 job 기반 |
+| LG-5R~LG-11 | 완료 | 이미지 production, Prompt/Brief, Assembly/HTML, Canvas·대화형 편집·복원 |
+| TASK-12.1 | 완료·PASS | Contract Golden Dataset v1. trusted 15-case hash/identity 계약을 그대로 보존 |
+| TASK-12.2 | 미착수 | LG-12I와 TASK-12.1R 완료 전 시작하지 않음 |
 
-LG-3의 기존 결과는 폐기하지 않고 V2.1 Prompt Intelligence artifact로 확장한다. LG-5의 job·화면·테스트도 폐기하지 않고 내구성·멱등·장면별 승인 계약을 바로잡는다.
+LG-3~LG-11의 기존 결과와 production LangGraph 경로는 폐기하지 않는다. TASK-12.1 Contract Golden Dataset v1도 새 입력 모드를 소급 적용하지 않고 기존 LG-10/LG-11 frozen contract regression 기준으로 보존한다.
 
 ## 3. 전체 Sprint
 
@@ -45,29 +66,35 @@ LG-3의 기존 결과는 폐기하지 않고 V2.1 Prompt Intelligence artifact�
 | LG-9 | Image Production V2 | 필요한 장면만 생성·재생성·검수 | 이미지 선택 |
 | LG-10 | Hybrid Page Assembly·HTML | 정확한 한글 상세페이지와 사용자용 HTML | 없음 |
 | LG-11 | Hybrid Canvas·대화형 편집 | 직접 또는 자연어로 일부만 수정하고 버전 복원 | 텍스트/이미지 선택 |
+| LG-12I | Unified Product Intake·Commerce Creative Master | URL·사진·수동 입력이 하나의 검증된 상품 기준으로 수렴 | VLM/OCR 선택 |
 | LG-12 | Visual Quality Bar·Golden Dataset | 치명 오류 없이 품질 기준을 통과한 결과 | 텍스트 선택 |
-| LG-13 | 운영 내구성·SLO·비용 | 재시작 복구와 정확한 진행 시간·비용 상태 | 없음 |
-| LG-14 | 전환·전체 출력·베타 E2E | 빠른 생성부터 HTML·이미지 출력까지 단일 흐름 | 제한적 |
+| LG-13 | 운영 내구성·SLO·비용 | 입력 모드부터 출력까지 재시작 복구와 진행 시간·비용 상태 | 없음 |
+| LG-14 | Detail Page Beta | 세 입력 모드부터 HTML·이미지 출력까지 단일 판매 가능 흐름 | 제한적 |
+| LG-15 | Social Creative Kit | 동일 Master에서 채널별 소셜 판매 소재 파생 | 선택적 |
+| LG-16 | Short-form Video Studio | 동일 Master에서 장면·자막이 검증된 숏폼 영상 파생 | 영상 선택 |
+| LG-17 | Campaign Content Pack | 상세페이지·소셜·영상을 하나의 versioned 캠페인 팩으로 묶음 | 없음/선택적 |
 
 ## 4. 공통 Sprint Gate
 
 모든 Sprint는 아래 산출물과 증거를 남긴다.
 
-1. 요구사항 ID가 명시된 구현 계획
-2. schema·migration·API·UI 변경 목록
-3. 단위·통합·그래프·필요 E2E 테스트
-4. 실행한 명령과 실제 결과
-5. 요구사항별 코드 위치와 테스트를 연결한 코드리뷰 문서
-6. 자동 검증과 사용자가 확인할 수동 검증 절차
+1. 대상 requirement ID 목록
+2. 실제 변경 파일 목록과 schema·migration·API·UI 영향
+3. 단위·통합·그래프·필요 E2E 테스트와 실행 명령·로그
+4. 현재 git diff 기준 요구사항 누락·논리 버그·회귀·architecture 검토
+5. 발견 사항의 BLOCKER/MAJOR/MINOR와 최종 verdict
+6. 필요한 자동·수동 검증과 기존 production regression 결과
 7. 미구현·부분 구현·테스트 우회 항목 0건 확인
-8. 회귀 실패와 다음 Sprint 진입 가능 여부
+8. 다음 Sprint 진입 가능 여부와 실제 다음 착수 항목
+
+별도 코드리뷰 Markdown 문서는 Sprint 기획이나 사용자의 명시적 요청이 있을 때만 만든다. 위 증거가 현재 작업 결과와 실행 로그에서 추적 가능하면 문서 파일 생성 자체를 Gate로 강제하지 않는다.
 
 다음은 완료 증거로 인정하지 않는다.
 
 - provider worker를 동기 함수로 바꿔 실제 대기·재개를 우회한 테스트
 - UI 버튼이 보이는지만 확인하고 요청·상태 전이를 검증하지 않은 테스트
 - API 성공 여부만 보고 품질·버전·권리 검사를 생략한 결과
-- 코드리뷰 문서의 주장만 있고 실행 로그가 없는 항목
+- 문서의 주장만 있고 코드·diff·실행 로그가 없는 항목
 
 ## 5. LG-5R — 이미지 생성 기반 보완
 
@@ -301,7 +328,42 @@ section 구조와 내부 자유 배치를 결합한 Hybrid Canvas와 자연어 �
 - Canvas 직접 편집과 선택 요소 채팅 수정이 동일 version history에 저장
 - 채널 안전 영역 위반이 export 전에 경고·차단되고 preview와 출력 parity 유지
 
-## 12. LG-12 — Visual Quality Bar와 Golden Dataset 품질 게이트
+## 12. LG-12I — Unified Product Intake와 Commerce Creative Master
+
+상세 Task: [LG-12I Unified Product Intake Task 분해](./2026-08-18-sellform-v2-lg-12i-unified-product-intake-task-breakdown.md)
+
+### 목표
+
+`owned_product_url`, `photo_only`, `manual` 세 입력을 production LangGraph에서 동일한 검증 가능한 상품 기준으로 정규화하고, 상세페이지·소셜·영상이 함께 참조할 immutable Commerce Creative Master를 만든다.
+
+### 대상 요구사항
+
+`ARC-09`, `ARC-10`, `INTAKE-01`~`INTAKE-10`, `SOURCE-01`~`SOURCE-08`, `MASTER-01`~`MASTER-08`, 기존 `FACT-01`~`FACT-05`, `PRM-06`~`PRM-09`, `HITL-01`~`HITL-06`
+
+### 주요 작업
+
+1. `ProductSourceSnapshotVersion`, `ProductTruthVersion`, `SellerConfirmationVersion`, `ProductCreativeBriefVersion`, `CommerceCreativeMasterVersion` schema·hash·lineage를 고정한다.
+2. owned URL의 소유·사용 권리, capture hash와 수집 결과를 source snapshot으로 저장한다.
+3. photo-only 입력에 기존 OCR/VLM/product understanding을 연결하고 관찰 사실·unknown·prohibited inference를 분리한다.
+4. manual 입력을 fact candidate와 creative direction으로 정규화한다.
+5. 세 모드를 동일 normalized product contract와 Creative Brief compiler 입력으로 수렴시킨다.
+6. source fidelity, evidence conflict, unknown fact와 unsupported inference를 구조화한다.
+7. 우선순위가 높은 판매자 확인 질문을 최대 3개로 제한하고 confirmation version에 고정한다.
+8. rights/provenance와 seller confirmation을 통과한 참조만 immutable Creative Master index에 연결한다.
+9. restart/resume/history rebuild와 duplicate request에서 version/confirmation/master를 중복 생성하지 않게 한다.
+10. production E2E에서 세 입력 모드가 기존 LG-7~LG-11 상세페이지 흐름으로 연결되는 것을 검증한다.
+
+### 완료 조건
+
+- 세 입력 모드가 동일 source/truth/confirmation/master contract로 수렴
+- unsupported inference와 미확인 사실·권리가 downstream 승인 입력으로 승격되지 않음
+- clarification은 한 cycle 최대 3개이며 답변·미답변·거절 상태가 durable하게 복구됨
+- master가 대용량 데이터를 복사하지 않고 artifact ID/version/hash만 참조
+- 기존 Creative Brief, approved fact/asset, Brand Kit과 source/master lineage가 일치
+- fake-provider production E2E에서 외부 비용 없이 세 모드 모두 재현
+- LG-12I 완료와 TASK-12.1R Product Intake Golden Dataset v2 완료 전 TASK-12.2 미착수
+
+## 13. LG-12 — Visual Quality Bar와 Golden Dataset 품질 게이트
 
 ### 목표
 
@@ -309,20 +371,23 @@ section 구조와 내부 자유 배치를 결합한 Hybrid Canvas와 자연어 �
 
 ### 대상 요구사항
 
-`ARC-08`, `QA-01`~`QA-06`, `FACT-01`~`FACT-05`, `VQB-01`~`VQB-08`
+`ARC-08`, `QA-01`~`QA-06`, `FACT-01`~`FACT-05`, `VQB-01`~`VQB-10`, `INTAKE-09`, `SOURCE-08`
 
 ### 주요 작업
 
-1. 5개 카테고리×최소 3개 제품 Golden Dataset을 고정한다.
-2. fact, identity, copy, visual, layout, rights, channel, parity evaluator를 만든다.
-3. QA routing code와 대상 노드 재실행을 연결한다.
-4. 노드별 최대 2회와 seller review escalation을 구현한다.
-5. 자동 점수와 사람 rubric을 같은 report로 저장한다.
-6. prompt pack·model·renderer 변경 전후 비교 도구를 만든다.
-7. 정체성·사실·레이아웃·한국어·Brand Kit·장면 흐름·채널 품질의 가중 점수를 만든다.
-8. 치명 오류 0건, 총점 85점, 영역별 70점 gate를 적용한다.
-9. section·scene·copy별 품질 근거와 선택적 재작업 대상을 report에 기록한다.
-10. 빠른 생성 모드가 QA를 우회하지 못하는 그래프 테스트를 만든다.
+1. 완료된 TASK-12.1 Contract Golden Dataset v1의 trusted 15-case identity를 변경 없이 보존한다.
+2. TASK-12.1R에서 5개 카테고리×3개 입력 모드의 Product Intake Golden Dataset v2를 별도 version으로 고정한다.
+3. fact, identity, copy, visual, layout, rights, channel, parity evaluator를 만든다.
+4. QA routing code와 대상 노드 재실행을 연결한다.
+5. 노드별 최대 2회와 seller review escalation을 구현한다.
+6. 자동 점수와 사람 rubric을 같은 report로 저장한다.
+7. prompt pack·model·renderer 변경 전후 비교 도구를 만든다.
+8. 정체성·사실·레이아웃·한국어·Brand Kit·장면 흐름·채널 품질의 가중 점수를 만든다.
+9. 치명 오류 0건, 총점 85점, 영역별 70점 gate를 적용한다.
+10. report metadata에 input mode, source/truth/confirmation/master version, source fidelity, prohibited inference, unknown fact와 clarification count를 고정한다.
+11. unsupported claim, prohibited inference, missing seller confirmation, unconfirmed rights와 product identity drift를 critical failure로 적용한다.
+12. section·scene·element·asset·copy·fact/evidence별 품질 근거와 선택적 재작업 대상을 report에 기록한다.
+13. 빠른 생성 모드가 QA를 우회하지 못하는 그래프 테스트를 만든다.
 
 ### 완료 조건
 
@@ -333,8 +398,10 @@ section 구조와 내부 자유 배치를 결합한 Hybrid Canvas와 자연어 �
 - 품질 기준 미달 결과가 final version으로 승격되지 않음
 - 치명 오류 1건 또는 총점·영역별 threshold 미달 시 export 승격 차단
 - 최대 2회 선택적 재작업 후 비교 후보와 문제 설명을 판매자에게 제공
+- input mode/source lineage metadata가 없는 report는 incomplete로 차단
+- unsupported claim·prohibited inference·missing confirmation·unconfirmed rights·identity drift는 점수와 무관하게 차단
 
-## 13. LG-13 — 운영 내구성·생성 시간 SLO·관측·비용
+## 14. LG-13 — 운영 내구성·생성 시간 SLO·관측·비용
 
 ### 목표
 
@@ -342,7 +409,7 @@ section 구조와 내부 자유 배치를 결합한 Hybrid Canvas와 자연어 �
 
 ### 대상 요구사항
 
-`OPS-01`~`OPS-10`, `HITL-01`~`HITL-06`, `SLO-01`~`SLO-08`, `FAST-08`
+`OPS-01`~`OPS-12`, `HITL-01`~`HITL-06`, `SLO-01`~`SLO-09`, `FAST-08`, `INTAKE-03`, `INTAKE-07`, `INTAKE-09`
 
 ### 주요 작업
 
@@ -354,9 +421,12 @@ section 구조와 내부 자유 배치를 결합한 Hybrid Canvas와 자연어 �
 6. 로그·checkpoint·event의 secret·민감 자료 마스킹을 검증한다.
 7. workspace 권한과 자산 signed URL 만료를 점검한다.
 8. 사용자용 복구 메시지와 운영자용 원인 정보를 분리한다.
-9. 분석 1분, planning 3분, 일반 이미지 페이지 10~15분과 정상 실행 90% 20분 목표를 계측한다.
+9. product understanding p90 <= 60초, planning/copy draft p90 <= 3분, first usable detail-page draft p90 <= 5분, high-quality final p90 <= 10~15분, 정상 실행의 90% <= 20분을 서로 다른 단계 목표로 계측한다. first usable draft는 사용자가 실제로 보고 수정 가능한 상세페이지 초안이며, high-quality final은 생성 이미지·QA·최종 승격까지 완료된 결과다. 3~5분을 final 보장으로 해석하지 않는다.
 10. 노드·장면별 ETA와 지연 원인을 event projection으로 제공한다.
-11. 완료 section의 부분 preview와 실패 장면 2회 재시도·폴백 선택을 연결한다.
+11. seller-owned asset, 정보형 section, 완료된 approved scene만으로 first usable frozen `DetailPageVersion`을 먼저 제공하고, QA를 통과한 고품질 scene은 LG-10/LG-11 lineage contract의 immutable child version에서 완료된 scene만 선택적으로 교체·reassembly한다. source version 불변과 이전 version restore를 유지하며 실패 장면 2회 재시도·폴백 선택을 연결한다.
+12. intake mode와 source/truth/confirmation/master version lifecycle event를 기록한다.
+13. mode별 intake 성공률, clarification count, source fidelity, unknown/prohibited inference count, rights·confirmation 차단률과 단계별 latency를 계측한다.
+14. intake SLO·운영 지표는 Visual Quality Bar 점수와 분리해 dashboard와 alert에 사용한다.
 
 ### 완료 조건
 
@@ -367,27 +437,29 @@ section 구조와 내부 자유 배치를 결합한 Hybrid Canvas와 자연어 �
 - secret과 고객 원문이 일반 로그·checkpoint에 없음
 - SLO dashboard에서 단계별 p50/p90·provider 지연과 20분 초과 원인을 확인 가능
 - 사용자가 완료된 section, 현재 단계, ETA와 재시도·폴백 행동을 확인 가능
+- input mode별 source 품질·확인 요청·실패 원인·완료 시간 비교 가능
 
-## 14. LG-14 — 전체 전환·채널 출력·베타 E2E
+## 15. LG-14 Detail Page Beta
 
 ### 목표
 
-모든 신규 생성 진입점을 V2.1 LangGraph로 통일하고 실제 사용 가능한 출력과 운영 가이드를 완성한다.
+세 first-class 입력 모드의 신규 상세페이지 생성 진입점을 V2.1 production LangGraph로 통일하고 실제 판매에 사용할 수 있는 출력과 운영 가이드를 완성한다. Social·Video production은 이 Sprint의 범위가 아니다.
 
 ### 대상 요구사항
 
-최종 기획의 모든 요구사항과 완료 정의 1~18
+LG-14 Detail Page Beta에 필요한 최종 기획 요구사항과 완료 정의, 특히 `INTAKE-*`, `SOURCE-*`, `MASTER-*`, 기존 LG-5R~LG-13 계약
 
 ### 주요 작업
 
 1. quick/expert 시작, planning, result, Canvas, history를 단일 graph/page version 흐름으로 연결한다.
 2. 신규 쓰기 경로의 legacy 직접 orchestration을 제거한다.
 3. 기존 프로젝트 읽기·다운로드 호환과 rollback 절차를 보존한다.
-4. 쿠팡·스마트스토어 JPG·PNG·분할 ZIP과 사용자용 HTML·ZIP 규격을 검증한다.
-5. 리뷰·레퍼런스·Brand Kit 입력→빠른 생성→이미지 검수→조립→Canvas 수정→HTML·이미지 출력 E2E를 실행한다.
-6. 중복 클릭, 브라우저 새로고침, 서버 재시작, provider 실패 E2E를 실행한다.
-7. Golden Dataset, 보안, 비용, 데이터 격리, 접근성 최종 gate를 실행한다.
-8. 사용자 가이드·운영 runbook·최종 코드리뷰를 작성한다.
+4. mandatory release matrix를 `owned_product_url`, `photo_only`, `manual` 3개 input mode × SmartStore, Coupang 2개 channel의 총 6개 production Golden Path 조합으로 고정한다.
+5. 6개 각 조합에서 product intake → seller confirmation → Commerce Creative Master → planning → detail page → Quality Bar → JPG/PNG/ZIP을 검증한다.
+6. HTML contract는 6개 조합의 사용자용 output parity 기준으로 별도 공통 검증한다.
+7. 중복 클릭, 브라우저 새로고침, 서버 재시작, provider 실패 E2E를 실행한다.
+8. Golden Dataset, 보안, 비용, 데이터 격리, 접근성 최종 gate를 실행한다.
+9. 사용자 가이드·운영 runbook과 최종 diff·테스트·회귀 검토 증거를 정리한다.
 
 ### 완료 조건
 
@@ -399,8 +471,66 @@ section 구조와 내부 자유 배치를 결합한 Hybrid Canvas와 자연어 �
 - preview·Canvas·HTML·JPG·PNG·ZIP 동일 version parity
 - 정상 provider mock 시간과 품질 threshold의 release gate 통과
 - 사용자가 주소와 버튼만으로 전체 흐름을 재현하는 검증 가이드 존재
+- 3개 input mode × 2개 channel의 6개 production Golden Path가 동일 normalized/master contract와 판매 가능한 상세페이지 출력으로 완료
+- HTML은 사용자용 output parity 공통 contract를 통과
+- SocialKit/VideoProject production 기능은 포함하지 않음
 
-## 15. 의존 관계
+## 16. LG-15 — Social Creative Kit
+
+### 목표
+
+검증된 `CommerceCreativeMasterVersion`에서 채널별 소셜 판매 소재를 파생한다. 상세페이지 PNG·JPG를 상품 source로 재분석하지 않는다.
+
+### 대상 요구사항
+
+`SOCIAL-01`~`SOCIAL-06`, `MASTER-04`, `MASTER-06`, 기존 fact/rights/Brand Kit 계약
+
+### 범위
+
+- `SocialKitVersion`과 채널·format별 frozen output
+- 승인 fact·asset·Brand Kit reference 재사용
+- 소셜 카피 provenance, safe-area와 export parity
+- fake-provider 기본 gate와 opt-in real-provider smoke 분리
+
+상세 Task 분해는 LG-15 착수 시 별도 수행한다.
+
+## 17. LG-16 — Short-form Video Studio
+
+### 목표
+
+같은 Commerce Creative Master에서 장면·자막·오디오·thumbnail identity가 고정된 숏폼 영상 프로젝트를 파생한다.
+
+### 대상 요구사항
+
+`VIDEO-01`~`VIDEO-06`, `MASTER-04`, `MASTER-06`, 기존 비용 승인·outbox·rights 계약
+
+### 범위
+
+- `VideoProjectVersion`, storyboard와 shot/scene contract
+- 장면별 비용 승인·generation/review와 정확한 한국어 자막 layer
+- frozen preview/export parity와 실패 장면 선택적 복구
+
+상세 Task 분해는 LG-16 착수 시 별도 수행한다.
+
+## 18. LG-17 — Campaign Content Pack
+
+### 목표
+
+같은 master에서 승인된 상세페이지·소셜·영상 version을 캠페인 목적별 불변 manifest로 묶어 재사용·배포할 수 있게 한다.
+
+### 대상 요구사항
+
+`CAMPAIGN-01`~`CAMPAIGN-05`, `MASTER-04`~`MASTER-07`
+
+### 범위
+
+- `CampaignContentPackVersion`과 포함 artifact version/hash parity
+- 일부 실패 격리, 다운로드 history와 채널별 manifest
+- 원본 master와 과거 파생 version 불변성
+
+상세 Task 분해는 LG-17 착수 시 별도 수행한다.
+
+## 19. 의존 관계
 
 ```text
 완료 기반: LG-0 → LG-1 → LG-2 → LG-3 → LG-4
@@ -415,14 +545,19 @@ LG-6 Prompt Intelligence
           → LG-9 Image Production V2
               → LG-10 Hybrid Assembly
                   → LG-11 Conversational Editing
-                      → LG-12 QA & Golden Dataset
-                          → LG-13 Operations
-                              → LG-14 Final Migration & Beta E2E
+                      → LG-12I Unified Product Intake & Commerce Creative Master
+                          → TASK-12.1R Product Intake Golden Dataset v2
+                              → LG-12 QA & Golden Dataset (TASK-12.2~12.12)
+                                  → LG-13 Operations
+                                      → LG-14 Detail Page Beta
+                                          → LG-15 Social Creative Kit
+                                              → LG-16 Short-form Video Studio
+                                                  → LG-17 Campaign Content Pack
 ```
 
-LG-6과 LG-5R의 일부 schema 작업은 병렬 설계할 수 있지만, 다음 Sprint 진입은 앞 Sprint의 공통 Gate를 통과한 뒤에만 허용한다.
+현재 실제 착수 순서는 `LG-12I → TASK-12.1R → TASK-12.2`다. TASK-12.1 Contract Golden Dataset v1은 완료·PASS 상태로 보존하며 v2 요구사항을 소급 적용하지 않는다. 다음 Sprint 진입은 앞 Sprint의 공통 Gate를 통과한 뒤에만 허용한다.
 
-## 16. 요구사항 추적표
+## 20. 요구사항 추적표
 
 | 요구사항 | 구현 Sprint |
 | --- | --- |
@@ -430,20 +565,22 @@ LG-6과 LG-5R의 일부 schema 작업은 병렬 설계할 수 있지만, 다음 
 | ARC-03 | LG-7 |
 | ARC-04 | LG-8, LG-10 |
 | ARC-05 | LG-11 |
-| ARC-06 | LG-6~LG-14 공통 |
+| ARC-06 | LG-6~LG-17 공통 |
 | ARC-07 | LG-5R, LG-9 |
 | ARC-08 | LG-12 |
+| ARC-09, ARC-10 | LG-12I, LG-14~LG-17 최종 확인 |
 | PRM-01, PRM-02, PRM-03, PRM-04, PRM-05 | LG-6 |
-| PRM-06, PRM-07, PRM-08, PRM-09 | LG-7 |
+| PRM-06, PRM-07, PRM-08, PRM-09 | LG-7, LG-12I |
 | PRM-10, PRM-11, PRM-12, PRM-13 | LG-8 |
 | FACT-01, FACT-02, FACT-03, FACT-04, FACT-05 | LG-7, LG-12 |
 | IMG-01, IMG-02, IMG-03, IMG-04, IMG-05, IMG-06, IMG-07, IMG-08, IMG-09, IMG-10 | LG-5R, LG-9 |
 | ASM-01, ASM-02, ASM-03, ASM-04, ASM-05, ASM-06, ASM-07 | LG-10 |
 | EDT-01, EDT-02, EDT-03, EDT-04, EDT-05, EDT-06, EDT-07 | LG-11 |
 | QA-01, QA-02, QA-03, QA-04, QA-05, QA-06 | LG-12 |
-| HITL-01, HITL-02, HITL-03, HITL-04, HITL-05, HITL-06 | 기존 LG-4, LG-5R, LG-13 |
-| OPS-01, OPS-02, OPS-03, OPS-04 | LG-6~LG-12 공통 |
+| HITL-01, HITL-02, HITL-03, HITL-04, HITL-05, HITL-06 | 기존 LG-4, LG-5R, LG-12I, LG-13 |
+| OPS-01, OPS-02, OPS-03, OPS-04 | LG-6~LG-17 공통 |
 | OPS-05, OPS-06, OPS-07, OPS-08, OPS-09, OPS-10 | LG-13 |
+| OPS-11, OPS-12 | LG-12I, LG-13, LG-14 |
 | FAST-01, FAST-02, FAST-03, FAST-04, FAST-05, FAST-06, FAST-07 | LG-7, LG-14 |
 | FAST-08 | LG-13, LG-14 |
 | BRAND-01, BRAND-02, BRAND-03, BRAND-04, BRAND-06, BRAND-08 | LG-6 |
@@ -452,9 +589,16 @@ LG-6과 LG-5R의 일부 schema 작업은 병렬 설계할 수 있지만, 다음 
 | REV-01, REV-02, REV-03, REV-04, REV-05, REV-06, REV-07, REV-08, REV-09 | LG-7 |
 | CANVAS-01, CANVAS-02, CANVAS-03, CANVAS-04, CANVAS-05, CANVAS-06, CANVAS-07, CANVAS-08, CANVAS-09 | LG-11 |
 | HTML-01, HTML-02, HTML-03, HTML-04, HTML-05, HTML-06, HTML-07, HTML-08 | LG-10, LG-14 |
-| SLO-01, SLO-02, SLO-03, SLO-04, SLO-05, SLO-06, SLO-07, SLO-08 | LG-13, LG-14 |
+| SLO-01, SLO-02, SLO-03, SLO-04, SLO-05, SLO-06, SLO-07, SLO-08, SLO-09 | LG-13, LG-14 |
 | VQB-01, VQB-02, VQB-03, VQB-04, VQB-05, VQB-06, VQB-07, VQB-08 | LG-12, LG-14 |
+| VQB-09, VQB-10 | LG-12, LG-14 |
+| INTAKE-01~INTAKE-10 | LG-12I, LG-13, LG-14 |
+| SOURCE-01~SOURCE-08 | LG-12I, LG-12, LG-14 |
+| MASTER-01~MASTER-08 | LG-12I, LG-14~LG-17 |
+| SOCIAL-01~SOCIAL-06 | LG-15 |
+| VIDEO-01~VIDEO-06 | LG-16 |
+| CAMPAIGN-01~CAMPAIGN-05 | LG-17 |
 
-## 17. 다음 착수 항목
+## 21. 다음 착수 항목
 
-다음 구현은 LG-6이 아니라 **LG-5R**이다. LG-5R 코드리뷰에서 이미지 job 멱등 키, durable worker, cost approval, 장면별 승인, 실패 장면만 재시도, 직접 업로드 UI와 실제 대기·재개 E2E를 모두 닫은 뒤 LG-6 Prompt Intelligence·Brand Kit 기반으로 이동한다. 인터뷰에서 확정한 일곱 기능은 LG-6~LG-14에 분산 구현하며 LG-14 전체 E2E가 통과하기 전에는 경쟁 서비스 수준의 제품 경험이 완료됐다고 판정하지 않는다.
+다음 실제 구현은 **LG-12I Unified Product Intake & Commerce Creative Master**다. LG-12I를 완료한 뒤 `TASK-12.1R Product Intake Golden Dataset v2`를 구현하고, 그 두 Gate가 모두 통과한 후에만 미착수 상태인 `TASK-12.2 Versioned QA report·threshold profile`로 이동한다. TASK-12.1 Contract Golden Dataset v1의 trusted hash와 15개 case는 변경하지 않는다. LG-14 Detail Page Beta에서는 세 입력 모드만 닫고, Social·Video·Campaign production은 LG-15~LG-17의 별도 Gate를 따른다.

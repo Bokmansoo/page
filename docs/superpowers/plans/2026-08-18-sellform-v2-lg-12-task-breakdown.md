@@ -4,6 +4,8 @@
 
 LG-12의 목표는 API와 renderer가 성공했다는 사실만으로 상세페이지를 완료하지 않고, LG-11까지 만들어진 immutable `DetailPageVersion`과 동일 frozen output을 대상으로 사실성·제품 정체성·한국어·레이아웃·브랜드·채널·출력 일치 품질을 검증해 판매 가능한 결과만 최종 승격하는 것이다.
 
+현재 기준선은 `TASK-12.1` Contract Golden Dataset v1 완료·PASS, `TASK-12.2` 미착수다. TASK-12.1의 trusted hash와 기존 5 category×3 product case는 LG-10/LG-11 frozen contract 회귀 기준으로 변경하지 않는다. LG-12I와 `TASK-12.1R` Product Intake Golden Dataset v2가 완료되기 전에는 TASK-12.2 이후 evaluator·threshold·quality gate 구현을 시작하지 않는다.
+
 - 원본 요구사항은 `ARC-08`, `QA-01`~`QA-06`, `FACT-01`~`FACT-05`, `VQB-01`~`VQB-08`이다.
 - production LangGraph와 LG-9 approved asset manifest, LG-10 canonical assembly/renderer/frozen version/export, LG-11 Canvas/channel safety/version restore 계약을 그대로 사용한다.
 - visual quality 판정은 제품 사실의 진위를 만들어내지 않는다. 사실·권리·정책 판정은 승인된 fact/evidence/provenance로, 이미지·레이아웃 판정은 frozen asset과 renderer geometry로 각각 수행한다.
@@ -11,8 +13,10 @@ LG-12의 목표는 API와 renderer가 성공했다는 사실만으로 상세페�
 - 점수는 하나의 불투명 값으로 만들지 않는다. 제품 정체성 20, 사실·정책 안전성 20, 레이아웃·시각적 완성도 20, 한국어 카피·가독성 15, Brand Kit 일치 10, 장면 다양성·섹션 흐름 10, 채널 출력 품질 5의 영역과 하위 지표를 보존한다.
 - 치명 오류는 점수와 별도로 기록하며 1건이라도 있으면 완료·최종 승격·export를 차단한다. 자동 PASS는 총점 85 이상이고 모든 영역 점수가 70 이상일 때만 가능하다.
 - 모든 report는 frozen source/version ID, snapshot hash, asset manifest hash, dataset/evaluator/threshold version과 section/scene/element/asset/copy/fact/evidence identity를 구조화해 기록한다.
+- 모든 report는 input mode, source/truth/confirmation/master version ID, source fidelity, prohibited inference count, unknown fact count와 clarification count를 frozen metadata로 추가 기록한다.
+- unsupported claim, prohibited inference, missing seller confirmation, unconfirmed rights와 product identity drift는 점수로 상쇄할 수 없는 critical failure다.
 - 기존 channel safety의 경고·차단은 LG-12가 재사용하는 입력이다. LG-12가 별도의 경쟁하는 safe-area validator를 만들지 않는다.
-- LG-13의 SLO, telemetry, 운영 dashboard, recovery sweep과 LG-14의 전체 beta 전환·채널 최종화는 포함하지 않는다.
+- LG-13의 SLO, telemetry, 운영 dashboard, recovery sweep과 LG-14 Detail Page Beta·채널 최종화는 포함하지 않는다.
 - legacy/mock execution path에 새 기능을 추가하지 않는다. fake provider는 production LangGraph 경로에 주입되는 결정론적 provider일 뿐 별도 실행 경로가 아니다.
 
 ---
@@ -71,6 +75,62 @@ LG-12의 목표는 API와 renderer가 성공했다는 사실만으로 상세페�
 
 ---
 
+## TASK-12.1R — Product Intake Golden Dataset v2 계약
+
+### 목표
+
+완료된 Contract Golden Dataset v1을 수정하지 않고, LG-12I의 세 first-class 입력 모드와 immutable source/truth/confirmation/master 계약을 검증하는 별도 Product Intake Golden Dataset v2를 정의한다.
+
+### 요구사항
+
+- 생활용품·뷰티·식품·패션·전자제품 5개 category와 `owned_product_url`·`photo_only`·`manual` 3개 input mode 조합의 정확히 15개 stable case를 둔다.
+- 각 case는 input mode, raw input fixture identity, `ProductSourceSnapshotVersion`, `ProductTruthVersion`, `SellerConfirmationVersion`, `ProductCreativeBriefVersion`, `CommerceCreativeMasterVersion`의 ID/hash와 기대 lineage를 포함한다.
+- source fidelity, 허용 evidence, unknown fact, conflict, prohibited inference, rights/provenance, seller confirmation과 최대 3개 clarification 기대값을 구조화한다.
+- expected downstream identity는 기존 Product Creative Brief, approved fact/asset, DetailPage canonical input과 source master reference를 연결하되 대용량 내용을 복사하지 않는다.
+- v2는 별도 schema/dataset version/trusted registry hash를 사용하며 v1 case와 trusted hash를 덮어쓰거나 재해석하지 않는다.
+- fixture는 외부 URL의 mutable 현재 응답이나 real provider에 의존하지 않고 deterministic capture/photo/manual 자료를 사용한다.
+
+### Acceptance Criteria
+
+- 정확히 5 category×3 input mode의 15개 case와 고유 stable ID가 존재한다.
+- 세 mode가 동일 normalized product와 master contract를 만들며 mode별 source provenance 차이는 보존된다.
+- unsupported inference, 미확인 rights, 누락 seller confirmation, 3개 초과 clarification 기대값은 invalid case로 거부된다.
+- source/truth/confirmation/master 중 하나의 hash·lineage를 변조하면 trusted validation이 실패한다.
+- 같은 v2 fixture를 반복 load하면 동일 canonical dataset/case/master identity를 만든다.
+- v1 load/validate 결과와 trusted hash는 v2 추가 전후에 동일하다.
+
+### 예상 변경 파일
+
+- LG-12I에서 확정한 source/truth/confirmation/master schema와 canonical hash helper
+- `backend/tests/fixtures/lg12_golden_dataset/v2/`
+- `backend/tests/test_lg12_product_intake_golden_dataset.py`
+- 기존 trusted Golden Dataset registry
+
+### 관련 테스트
+
+- 5 category×3 input mode collection/count/stable ID
+- deterministic source/truth/confirmation/master lineage와 canonical hash
+- prohibited inference/unknown/rights/confirmation/clarification validation
+- v1 immutability·trusted hash regression
+- provider/outbox/cost approval 0회
+
+### 다른 Task와의 의존성
+
+- 선행: LG-12I 전체 production contract, 완료된 TASK-12.1 v1
+- 후행: TASK-12.2~12.12가 v1 contract regression과 v2 intake lineage를 함께 사용한다.
+
+### fake-provider 검증 범위
+
+- capture/photo/manual 고정 fixture로 세 mode의 production intake normalization과 lineage를 외부 비용 없이 반복 검증한다.
+- VLM/OCR은 production provider interface에 연결된 deterministic fake 결과를 사용한다.
+
+### opt-in real-provider 검증 범위
+
+- dataset 작성·기본 검증에서는 real provider를 호출하지 않는다.
+- TASK-12.12 opt-in smoke가 v2 대표 case를 사용할 수 있지만 exact OCR/VLM bytes나 생성 이미지 hash를 baseline으로 요구하지 않는다.
+
+---
+
 ## TASK-12.2 — Versioned QA report·threshold profile 계약
 
 ### 목표
@@ -80,12 +140,14 @@ LG-12의 목표는 API와 renderer가 성공했다는 사실만으로 상세페�
 ### 요구사항
 
 - report는 frozen `DetailPageVersion` ID/snapshot hash, approved manifest hash, channel, dataset version/case, evaluator versions, threshold profile version을 고정한다.
+- report metadata는 input mode, source/truth/confirmation/master version ID, source fidelity, prohibited inference count, unknown fact count와 clarification count를 고정한다.
 - 각 dimension은 0~100 점수, weight, 하위 metric, evidence, status를 별도로 보존한다.
 - finding은 severity, reason code, message, section/scene/element/asset/copy/fact/evidence ID와 재작업 대상 identity를 구조화한다.
 - critical finding, total score, per-dimension score, gate result, routing code를 분리한다.
 - routing code는 `COPY_REWORK`, `PLAN_REWORK`, `VISUAL_REWORK`, `IMAGE_REWORK`, `SELLER_REVIEW`, `BLOCKED_POLICY`, `PASS`만 허용한다.
 - threshold profile v1은 critical 0, total 85 이상, 모든 영역 70 이상을 고정하며 canonical report hash를 만든다.
 - report 저장과 AgentRun durable projection은 같은 serialization/projection helper를 사용하고 mutable page state를 다시 읽지 않는다.
+- unsupported claim, prohibited inference, missing seller confirmation, unconfirmed rights와 product identity drift reason code를 critical finding으로 허용하고 일반 점수와 분리한다.
 
 ### Acceptance Criteria
 
@@ -93,6 +155,7 @@ LG-12의 목표는 API와 renderer가 성공했다는 사실만으로 상세페�
 - 단일 총점만 있는 report, target identity가 없는 failure, 허용되지 않은 routing code는 거부된다.
 - report에서 자동 metric과 human rubric 결과를 구분하면서 같은 case/version에 함께 연결할 수 있다.
 - checkpoint/history rebuild 이후 동일 report identity와 gate 결과가 복원 가능한 저장 계약을 가진다.
+- 필수 intake/source/master metadata가 없거나 source lineage가 일치하지 않는 report는 incomplete로 거부된다.
 
 ### 예상 변경 파일
 
@@ -111,7 +174,7 @@ LG-12의 목표는 API와 renderer가 성공했다는 사실만으로 상세페�
 
 ### 다른 Task와의 의존성
 
-- 선행: TASK-12.1
+- 선행: LG-12I, TASK-12.1, TASK-12.1R
 - 후행: TASK-12.3~12.10 evaluator·graph·UI가 이 report를 사용한다.
 
 ### fake-provider 검증 범위
@@ -140,6 +203,7 @@ frozen copy와 asset이 승인 사실·evidence·rights/provenance 범위를 벗
 - 최종 asset의 rights/provenance/content hash를 LG-9/LG-10 frozen manifest와 대조한다.
 - 이미지나 LLM의 시각 추정으로 business fact를 새로 승인하지 않는다.
 - 사실/권리 치명 오류는 점수와 무관하게 `BLOCKED_POLICY` 또는 evidence/seller review 대상으로 판정한다.
+- Product Truth와 Seller Confirmation 범위를 벗어난 unsupported claim, prohibited inference, missing seller confirmation과 unconfirmed rights를 source/truth/confirmation identity에 연결된 critical finding으로 기록한다.
 
 ### Acceptance Criteria
 
@@ -147,6 +211,7 @@ frozen copy와 asset이 승인 사실·evidence·rights/provenance 범위를 벗
 - narrative copy는 사실 claim으로 잘못 승격되지 않고 fact claim은 단순 visual warning으로 약화되지 않는다.
 - finding이 copy/fact/evidence/asset ID와 frozen source hash를 직접 포함한다.
 - valid frozen provenance/rights case는 결정론적으로 통과한다.
+- source/truth/confirmation lineage가 없거나 불일치한 claim은 점수와 관계없이 통과하지 않는다.
 - evaluator 실행은 provider, outbox, cost approval, page mutation을 발생시키지 않는다.
 
 ### 예상 변경 파일
@@ -194,6 +259,7 @@ LG-9가 보존한 scene별 identity/OCR/crop/resolution/safety/rights 증거와 
 - identity evidence가 부족하거나 판정 불가한 상태를 `passed`로 간주하지 않는다.
 - seller가 LG-9에서 명시적으로 승인한 review 결과는 approval identity와 함께 기록하되 fact/rights critical error를 override하지 못한다.
 - 중복 scene 이미지, 비정상 저해상도, 잘림은 scene/asset identity를 가진 failure로 반환한다.
+- source snapshot·master identity와 최종 제품의 형태·구성·브랜드 identity가 달라진 product identity drift를 critical finding으로 반환한다.
 - 새 CV pipeline을 만들지 않고 `product_identity_validator`와 LG-9 structured report를 확장·재사용한다.
 
 ### Acceptance Criteria
@@ -202,6 +268,7 @@ LG-9가 보존한 scene별 identity/OCR/crop/resolution/safety/rights 증거와 
 - shape/color/button/port/component/logo 불일치와 OCR/crop/resolution failure가 해당 scene/asset에 연결된다.
 - evidence 부족은 `needs_review`이며 자동 PASS가 아니다.
 - frozen hash와 실제 bytes 불일치는 critical failure다.
+- source/master identity와 결과 asset 사이의 product identity drift는 seller review 가능한 단순 경고로 약화되지 않는다.
 - image quality evaluator만 실행해 provider 재생성이나 비용이 발생하지 않는다.
 
 ### 예상 변경 파일
@@ -563,14 +630,14 @@ QA를 통과한 frozen candidate만 final version으로 승격하고, 실패 결
 
 ### 목표
 
-Prompt Pack·model adapter·renderer·evaluator 변경 전후의 versioned report를 비교하고, 15개 이상 Golden case를 production LangGraph로 반복 실행하는 기본 LG-12 release gate를 만든다.
+Prompt Pack·model adapter·renderer·evaluator 변경 전후의 versioned report를 비교하고, Contract v1과 Product Intake v2의 각 15개 Golden case를 production LangGraph로 반복 실행하는 기본 LG-12 release gate를 만든다.
 
 ### 요구사항
 
 - baseline과 candidate의 dataset version, frozen version, prompt/pack/model/renderer/evaluator/profile version을 명시한다.
 - critical finding 증가, total/per-dimension threshold 미달, score 하락, expected identity/parity 변경을 구조화된 regression으로 비교한다.
 - baseline update는 명시적 command/review 없이 자동으로 덮어쓰지 않는다.
-- `lg12_fake_quality_gate` marker/suite는 5 category×3 case, 3 design direction coverage, smartstore/coupang coverage와 pass/fail route fixture를 포함한다.
+- `lg12_fake_quality_gate` marker/suite는 Contract Golden Dataset v1의 15 case와 Product Intake Golden Dataset v2의 5 category×3 input mode, 3 design direction, smartstore/coupang, pass/fail route fixture를 포함한다.
 - suite는 production LangGraph → frozen candidate → evaluator → rework/escalation → promotion/export gate를 직접 사용한다.
 - actual provider cost/call이 0임을 호출 spy와 outbox/provider mode로 검증한다.
 
@@ -592,7 +659,7 @@ Prompt Pack·model adapter·renderer·evaluator 변경 전후의 versioned repor
 
 ### 관련 테스트
 
-- 15-case collection/count와 repeatability
+- v1 15-case contract와 v2 15-case input-mode collection/count/repeatability
 - baseline/candidate comparison dimensions
 - critical/threshold/identity/parity regression
 - fake cost/provider call 0
@@ -600,7 +667,7 @@ Prompt Pack·model adapter·renderer·evaluator 변경 전후의 versioned repor
 
 ### 다른 Task와의 의존성
 
-- 선행: TASK-12.1~12.10
+- 선행: LG-12I, TASK-12.1, TASK-12.1R, TASK-12.2~12.10
 - 후행: TASK-12.12와 LG-12 최종 quality gate
 
 ### fake-provider 검증 범위
@@ -628,14 +695,14 @@ Prompt Pack·model adapter·renderer·evaluator 변경 전후의 versioned repor
 - real-generated bytes는 exact hash가 아니라 frozen identity/provenance, critical 0, dimension threshold, human rubric 대상으로 평가한다.
 - 최종 matrix는 dataset schema, 모든 evaluator, threshold, routing/max-two, seller escalation, promotion/export gate, restart/rebuild, fake repeatability를 요구사항 ID별로 연결한다.
 - 실제 provider timeout/safety/unknown outcome에서 LG-9 dead-letter/retry·중복 과금 방지 정책을 유지한다.
-- LG-13 telemetry/SLO와 LG-14 전체 beta/channel migration은 추가하지 않는다.
+- LG-13 telemetry/SLO와 LG-14 Detail Page Beta/channel finalization은 추가하지 않는다.
 
 ### Acceptance Criteria
 
 - opt-in이 없으면 real smoke는 명확한 skip이고 provider 호출은 0회다.
 - opt-in 시 제한된 case/scene만 비용 승인 후 호출되며 동일 request가 중복 dispatch되지 않는다.
 - real 결과가 fake와 동일 report/profile/promotion contract를 사용한다.
-- final fake matrix가 5×3 Golden cases와 LG-12 critical/85/70/rework/export 조건을 모두 직접 검증한다.
+- final fake matrix가 v1 5×3 Contract cases, v2 5 category×3 input mode와 LG-12 critical/85/70/rework/export 조건을 모두 직접 검증한다.
 - LG-9~LG-11 핵심 regression과 production path 연결이 최종 gate에서 유지된다.
 
 ### 예상 변경 파일
@@ -655,7 +722,7 @@ Prompt Pack·model adapter·renderer·evaluator 변경 전후의 versioned repor
 
 ### 다른 Task와의 의존성
 
-- 선행: TASK-12.1~12.11
+- 선행: LG-12I, TASK-12.1, TASK-12.1R, TASK-12.2~12.11
 - 후행: 없음. 이 Task가 LG-12 완료 gate다.
 
 ### fake-provider 검증 범위
@@ -673,8 +740,10 @@ Prompt Pack·model adapter·renderer·evaluator 변경 전후의 versioned repor
 ## 권장 구현 순서
 
 ```text
-TASK-12.1 Golden Dataset
-  → TASK-12.2 QA report/profile
+TASK-12.1 Contract Golden Dataset v1 (완료·PASS)
+  → LG-12I Unified Product Intake & Commerce Creative Master
+      → TASK-12.1R Product Intake Golden Dataset v2
+          → TASK-12.2 QA report/profile
       → TASK-12.3 Fact/Rights
       → TASK-12.4 Image/Identity
       → TASK-12.5 Korean Copy
@@ -687,11 +756,12 @@ TASK-12.1 Golden Dataset
                           → TASK-12.12 real smoke/final matrix
 ```
 
-TASK-12.3~TASK-12.7은 TASK-12.2가 확정된 뒤 서로 독립적으로 구현·테스트할 수 있다.
+TASK-12.1 Contract Golden Dataset v1은 완료·PASS 상태로 보존한다. LG-12I와 TASK-12.1R이 모두 완료된 뒤 TASK-12.2를 시작하며, TASK-12.3~TASK-12.7은 TASK-12.2가 확정된 뒤 서로 독립적으로 구현·테스트할 수 있다.
 
 ## 범위 밖
 
 - LG-13 event telemetry, SLO/ETA dashboard, 운영 recovery command, 비용 집계 UI
-- LG-14 legacy 전환 제거, 전체 beta E2E와 채널 규격 최종화
+- LG-14 Detail Page Beta의 legacy 전환 제거, 세 입력 모드 E2E와 채널 규격 최종화
+- LG-15 Social Creative Kit, LG-16 Short-form Video Studio, LG-17 Campaign Content Pack
 - 새로운 이미지 생성/CV pipeline 또는 기존 provider/router를 우회하는 evaluator 호출
 - Golden 결과를 맞추기 위한 legacy 전용/fixture 전용 production 분기
