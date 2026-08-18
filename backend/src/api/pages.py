@@ -4,6 +4,7 @@
 # pyright: reportArgumentType=false, reportAssignmentType=false, reportReturnType=false, reportGeneralTypeIssues=false, reportCallIssue=false, reportOptionalMemberAccess=false, reportAttributeAccessIssue=false
 
 import logging
+import uuid
 from datetime import datetime, timezone
 import anthropic
 from typing import Optional, List, Dict, Any, Literal
@@ -14,7 +15,7 @@ from sqlalchemy.orm import Session
 from src.api.auth import get_current_user_and_workspace
 from src.config import settings
 from src.db.database import get_db
-from src.db.models import ProductProject, ProductPage, PageSection, PageVersion, DetailPageVersion, ProductFact, Asset, User, AgentRun, ImageGenerationJobRecord, CommerceStoryBaselineRecord
+from src.db.models import ProductProject, ProductPage, PageSection, PageVersion, DetailPageVersion, ProductFact, Asset, User, AgentRun, ImageGenerationJobRecord, CommerceStoryBaselineRecord, BrandKitVersion
 from src.schemas.planning_draft import PlanningDraftSchema
 from src.schemas.api_ready_generation import (
     ApiReadyGenerationPlanSchema,
@@ -43,11 +44,13 @@ from src.services.commerce_story_baseline import (
     serialize_baseline_product,
 )
 from src.services.page_finalization_service import (
+    EditIntentValidationError,
     FinalPageNotFoundError,
     PageDraftNotFoundError,
     finalize_page,
     get_final_page_version,
     get_page_version_for_export,
+    preview_lg11_edit_intent,
 )
 from src.services.page_asset_policy import (
     clear_unconfirmed_low_quality_hero_assignments,
@@ -214,6 +217,7 @@ class PageVersionResponseSchema(BaseModel):
     style_key: str
     is_final: bool
     created_at: Any
+    lg11_frozen: bool = False
 
     class Config:
         from_attributes = True
@@ -246,6 +250,40 @@ class StyleCandidatesResponse(BaseModel):
 
 class RegenerateStyleRequest(BaseModel):
     feedback_option: str
+
+
+class EditIntentPreviewRequest(BaseModel):
+    """Read-only LG-11 request normalized against a frozen LG-10 version."""
+
+    scope: Literal["page", "section", "scene", "copy", "style", "fact"]
+    target_ids: List[str] = Field(min_length=1)
+    operation: str = Field(min_length=1)
+    instruction: str = Field(min_length=1)
+    preserve_constraints: Dict[str, Any] = Field(default_factory=dict)
+    # Direct-editor text changes are deliberately part of the immutable
+    # EditIntent.  A later natural-language editor can normalize into this
+    # same field map without creating a second version-fork contract.
+    copy_changes: Dict[str, Dict[str, str]] = Field(default_factory=dict)
+    replacement_asset_id: str | None = None
+    seller_attested: bool = False
+    # Style edits select only an existing immutable LG-10 direction and an
+    # optional, workspace-owned Brand Kit version.  Raw color/font values do
+    # not enter the edit contract.
+    design_direction: str | None = None
+    brand_kit_version_id: str | None = None
+    # The Canvas selection is advisory only until it is pinned into the
+    # immutable EditIntent preserve constraints below.  It is never resolved
+    # from a mutable editor draft during execution.
+    selected_section_id: str | None = Field(default=None, max_length=100)
+    selected_element_id: str | None = Field(default=None, max_length=160)
+
+
+class EditRunStartResponse(BaseModel):
+    run_id: str
+    source_detail_page_version_id: str
+    parent_detail_page_version_id: str
+    intent_id: str
+    state: Dict[str, Any]
 
 
 # =====================================================================
@@ -1328,6 +1366,7 @@ def finalize_page_endpoint(
 def get_final_page_endpoint(
     project_id: str,
     version_id: Optional[str] = None,
+    channel: Optional[str] = None,
     db: Session = Depends(get_db),
     auth_ctx: dict = Depends(get_current_user_and_workspace)
 ):
@@ -1335,12 +1374,31 @@ def get_final_page_endpoint(
     get_project_or_404(db, project_id, workspace.id)
 
     try:
-        if version_id:
-            return get_page_version_for_export(db, project_id, version_id)
-        return get_final_page_version(db, project_id)
+        version = get_page_version_for_export(db, project_id, version_id) if version_id else get_final_page_version(db, project_id)
+        snapshot = version.sections_json if isinstance(version.sections_json, dict) else {}
+        if snapshot.get("schema_version") == "lg10-detail-page-version-v1" and isinstance(snapshot.get("lg11"), dict):
+            from src.services.page_visual_contract import LG11CanvasSafetyError, ensure_lg11_canvas_safe
+            if channel not in {"smartstore", "coupang"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "LG-11 preview requires an explicit channel identity.",
+                        "canvas_safety": {
+                            "schema_version": "lg11-canvas-safety-v1",
+                            "channel": channel,
+                            "safe": False,
+                            "checked": True,
+                            "issues": [{"code": "channel_identity_required", "reason": "A channel must be selected for LG-11 preview."}],
+                        },
+                    },
+                )
+            try:
+                ensure_lg11_canvas_safe(version_snapshot=snapshot, channel=channel)
+            except LG11CanvasSafetyError as exc:
+                raise HTTPException(status_code=409, detail={"message": str(exc), "canvas_safety": exc.result}) from exc
+        return version
     except FinalPageNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-
 
 
 @router.patch("/projects/{project_id}/page", response_model=PageResponseSchema)
@@ -1584,7 +1642,19 @@ def list_page_versions_endpoint(
     from src.services.page_version_service import list_page_versions as get_versions
     versions = get_versions(project_id, db=db)
     versions = sorted(versions, key=lambda v: v.created_at, reverse=True)
-    return versions
+    return [
+        {
+            "id": version.id,
+            "project_id": version.project_id,
+            "name": version.name,
+            "style_key": version.style_key,
+            "is_final": version.is_final,
+            "created_at": version.created_at,
+            "lg11_frozen": isinstance(getattr(version, "sections_json", None), dict)
+            and isinstance(version.sections_json.get("lg11"), dict),
+        }
+        for version in versions
+    ]
 
 
 @router.get("/projects/{project_id}/page/versions/{version_id}", response_model=PageVersionSnapshotSchema)
@@ -1604,6 +1674,162 @@ def get_page_version_snapshot_endpoint(
     if not version:
         raise HTTPException(status_code=404, detail="Page version not found")
     return version
+
+
+def _lg11_edit_request_payload(
+    *,
+    request: EditIntentPreviewRequest,
+    db: Session,
+    workspace_id: str,
+) -> dict[str, Any]:
+    """Pin a requested Brand Kit version before an LG-11 edit is previewed."""
+
+    payload = request.model_dump()
+    requested_brand_version_id = str(payload.pop("brand_kit_version_id", "") or "")
+    selected_section_id = str(payload.pop("selected_section_id", "") or "").strip() or None
+    selected_element_id = str(payload.pop("selected_element_id", "") or "").strip() or None
+    if selected_element_id and not selected_section_id:
+        raise EditIntentValidationError("An LG-11 selected element requires its selected section identity.")
+    if any(value and any(marker in value.lower() for marker in ("<", ">", "javascript:", "http://", "https://", "data:")) for value in (selected_section_id, selected_element_id)):
+        raise EditIntentValidationError("LG-11 selected Canvas identities must be stable local IDs.")
+    if selected_section_id or selected_element_id:
+        constraints = dict(payload.get("preserve_constraints") or {})
+        if "selected_context" in constraints:
+            raise EditIntentValidationError("LG-11 selected Canvas context is supplied only by the request identity fields.")
+        constraints["selected_context"] = {
+            "section_id": selected_section_id,
+            "element_id": selected_element_id,
+        }
+        payload["preserve_constraints"] = constraints
+    if requested_brand_version_id:
+        version = db.query(BrandKitVersion).filter(
+            BrandKitVersion.id == requested_brand_version_id,
+            BrandKitVersion.workspace_id == workspace_id,
+        ).one_or_none()
+        if version is None:
+            raise EditIntentValidationError("LG-11 style edit Brand Kit version is not in this workspace.")
+        payload["brand_kit_ref"] = {
+            "brand_kit_version_id": version.id,
+            "brand_kit_hash": str(version.content_hash or ""),
+        }
+    else:
+        payload["brand_kit_ref"] = None
+    return payload
+
+
+@router.post("/projects/{project_id}/page/versions/{version_id}/edit-intents/preview")
+def preview_edit_intent_endpoint(
+    project_id: str,
+    version_id: str,
+    req: EditIntentPreviewRequest,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Show the frozen-version impact of an LG-11 edit without starting an edit run."""
+
+    workspace = auth_ctx["workspace"]
+    get_project_or_404(db, project_id, workspace.id)
+    try:
+        version = get_page_version_for_export(db, project_id, version_id)
+        return preview_lg11_edit_intent(
+            version=version,
+            **_lg11_edit_request_payload(
+                request=req,
+                db=db,
+                workspace_id=workspace.id,
+            ),
+        )
+    except (FinalPageNotFoundError, EditIntentValidationError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post(
+    "/projects/{project_id}/page/versions/{version_id}/edit-runs",
+    response_model=EditRunStartResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def start_lg11_edit_run_endpoint(
+    project_id: str,
+    version_id: str,
+    req: EditIntentPreviewRequest,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Start a dedicated LG-11 confirmation run from one final frozen version."""
+
+    workspace = auth_ctx["workspace"]
+    get_project_or_404(db, project_id, workspace.id)
+    try:
+        version = get_page_version_for_export(db, project_id, version_id)
+        if not version.is_final and not (req.scope == "page" and req.operation == "restore"):
+            raise EditIntentValidationError("LG-11 edit runs require a final frozen DetailPageVersion.")
+        preview = preview_lg11_edit_intent(
+            version=version,
+            **_lg11_edit_request_payload(
+                request=req,
+                db=db,
+                workspace_id=workspace.id,
+            ),
+        )
+    except (FinalPageNotFoundError, EditIntentValidationError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    intent = dict(preview["edit_intent"])
+    snapshot_hash = str(intent["base_snapshot_hash"])
+    run_id = str(uuid.uuid4())
+    edit_state = {
+        "schema_version": "lg11-edit-run-v1",
+        "lineage": {
+            "edit_run_id": run_id,
+            "source_detail_page_version_id": version.id,
+            "parent_detail_page_version_id": version.id,
+        },
+        "base_version": {"id": version.id, "snapshot_hash": snapshot_hash},
+        "intent_id": str(intent["intent_hash"]),
+        "intent_hash": str(intent["intent_hash"]),
+        "impact_preview": dict(preview["impact_preview"]),
+        "confirmation": {"status": "pending"},
+    }
+    run = AgentRun(
+        id=run_id,
+        workspace_id=workspace.id,
+        project_id=project_id,
+        created_by=auth_ctx["user"].id,
+        mode="lg11_edit",
+        status="created",
+        current_stage="edit_intent",
+        input_snapshot={
+            "lg11_edit": edit_state,
+            # Keep the complete immutable request only in the SQL run input.
+            # The LangGraph checkpoint contains the stable intent identity and
+            # preview, never mutable page state.
+            "lg11_edit_intent": intent,
+        },
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+
+    from src.services.langgraph_run_service import LangGraphRunService
+
+    try:
+        started = LangGraphRunService.start(run.id, workspace.id, db)
+        state = LangGraphRunService.get_state(started.id, workspace.id, db)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return EditRunStartResponse(
+        run_id=started.id,
+        source_detail_page_version_id=version.id,
+        parent_detail_page_version_id=version.id,
+        intent_id=str(intent["intent_hash"]),
+        state={
+            "status": state.status,
+            "current_stage": state.current_stage,
+            "checkpoint_id": state.checkpoint_id,
+            "values": state.values,
+            "next_nodes": state.next_nodes,
+        },
+    )
 
 
 @router.post(

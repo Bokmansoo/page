@@ -14,16 +14,18 @@ from pydantic import BaseModel, Field, field_validator
 
 LG4_REVIEW_SCHEMA_VERSION = "lg4-v1"
 LG5_REVIEW_SCHEMA_VERSION = "lg5-v1"
+LG11_REVIEW_SCHEMA_VERSION = "lg11-v1"
 ReviewStage = Literal[
     "input_review", "evidence_review", "planning_review", "generation_pending", "provider_wait", "image_review",
+    "edit_confirmation", "canvas_edit",
 ]
-ReviewDecision = Literal["approve", "reject", "defer", "refresh", "regenerate", "upload"]
+ReviewDecision = Literal["approve", "reject", "defer", "refresh", "regenerate", "upload", "apply", "undo", "redo", "commit"]
 
 
 class GraphReviewResumePayload(BaseModel):
     """The only value that may resume an LG-4 interrupt."""
 
-    schema_version: Literal["lg4-v1", "lg5-v1"] = LG4_REVIEW_SCHEMA_VERSION
+    schema_version: Literal["lg4-v1", "lg5-v1", "lg11-v1"] = LG4_REVIEW_SCHEMA_VERSION
     review_stage: ReviewStage
     decision: ReviewDecision
     comment: str = Field(default="", max_length=1000)
@@ -31,6 +33,7 @@ class GraphReviewResumePayload(BaseModel):
     asset_id: str = Field(default="", max_length=100)
     seller_attested: bool = False
     cost_plan_hash: str = Field(default="", max_length=64)
+    canvas_operation: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("comment")
     @classmethod
@@ -110,6 +113,8 @@ def validate_resume_payload(value: Any, expected_stage: str) -> GraphReviewResum
         "generation_pending": {"approve", "defer"},
         "provider_wait": {"refresh"},
         "image_review": {"approve", "reject", "regenerate", "upload"},
+        "edit_confirmation": {"approve", "reject"},
+        "canvas_edit": {"apply", "undo", "redo", "commit"},
     }.get(expected_stage, {"approve", "reject"})
     if payload.decision not in allowed:
         raise ValueError(f"{expected_stage} does not accept the '{payload.decision}' decision.")

@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from src.db.models import (
     AgentRun,
     Asset,
+    DetailPageVersion,
     ImageGenerationCostApprovalRecord,
     ImageGenerationJobRecord,
     ImageGenerationOutboxRecord,
@@ -585,6 +586,107 @@ def _next_attempts(rows: list[ImageGenerationJobRecord], scene_ids: list[str]) -
         attempts = [int(row.generation_attempt or 1) for row in rows if str(row.scene_id or row.section_id) == scene_id]
         result[scene_id] = max(attempts or [0]) + 1
     return result
+
+
+def _lg11_source_scene_job(*, source_version: DetailPageVersion, scene_id: str, db: Session) -> ImageGenerationJobRecord:
+    """Resolve a scene's immutable LG-9 job from the frozen version manifest."""
+
+    snapshot = dict(source_version.sections_json or {})
+    canonical = dict(dict(snapshot.get("lg10") or {}).get("canonical_page_assembly_input") or {})
+    manifest = dict(canonical.get("approved_asset_manifest") or {})
+    entry = next((dict(item) for item in manifest.get("assets") or [] if str(item.get("scene_id") or "") == scene_id), None)
+    if entry is None:
+        raise ImageGenerationGateError("FROZEN_SCENE_NOT_FOUND", "The selected approved scene is not in the frozen version.")
+    job = db.query(ImageGenerationJobRecord).filter(
+        ImageGenerationJobRecord.project_id == source_version.project_id,
+        ImageGenerationJobRecord.job_id == str(entry.get("job_id") or ""),
+    ).first()
+    if job is None or job.status != "approved" or str(job.output_asset_id or "") != str(entry.get("asset_id") or ""):
+        raise ImageGenerationGateError("FROZEN_SCENE_SOURCE_INVALID", "The frozen scene no longer has its immutable approved generation input.")
+    asset = db.query(Asset).filter(Asset.id == job.output_asset_id, Asset.project_id == source_version.project_id).first()
+    if asset is None or str(asset.content_hash or "") != str(entry.get("asset_content_hash") or ""):
+        raise ImageGenerationGateError("FROZEN_SCENE_ASSET_MISMATCH", "The frozen scene asset identity does not match its bytes.")
+    return job
+
+
+def ensure_lg11_scene_regeneration_cost_plan(*, run: AgentRun, source_version: DetailPageVersion, scene_id: str, db: Session) -> dict[str, Any]:
+    """Create one immutable, source-version-scoped cost plan for an LG-11 scene."""
+
+    source = _lg11_source_scene_job(source_version=source_version, scene_id=scene_id, db=db)
+    scene = {
+        "scene_id": scene_id, "section_id": source.section_id, "source_job_id": source.job_id,
+        "prompt_hash": source.prompt_hash, "reference_hash": source.reference_hash, "input_hash": source.input_hash,
+        "estimated_cost": float(source.estimated_cost or 0), "model": source.model, "output_size": source.output_size,
+    }
+    planning_hash = _hash({"source_version_id": source_version.id, "snapshot_hash": dict(source_version.sections_json or {}).get("snapshot_hash"), "scene": scene})
+    plan_hash = _hash({"run_id": run.id, "planning_hash": planning_hash, "scenes": [scene]})
+    record = db.query(ImageGenerationCostApprovalRecord).filter_by(run_id=run.id, cost_plan_hash=plan_hash).first()
+    if record is None:
+        record = ImageGenerationCostApprovalRecord(
+            workspace_id=run.workspace_id, project_id=run.project_id, run_id=run.id, thread_id=run.graph_thread_id or run.id,
+            planning_hash=planning_hash, cost_plan_hash=plan_hash, provider=str(source.provider or ""), model=str(source.model or ""),
+            scene_count=1, scene_costs=[scene], total_estimated_cost=float(source.estimated_cost or 0), currency="credit", status="pending",
+        )
+        db.add(record); db.commit()
+    # Keep the AgentRun operational projection aligned with the same durable
+    # LG-9 approval record used by ordinary image generation.
+    run.estimated_cost = float(record.total_estimated_cost or 0)
+    run.cost_approval_status = record.status
+    db.add(run)
+    db.commit()
+    return _cost_plan_payload(record)
+
+
+def prepare_lg11_scene_regeneration(*, run: AgentRun, source_version: DetailPageVersion, scene_id: str, cost_plan_hash: str, db: Session) -> dict[str, Any]:
+    approval = db.query(ImageGenerationCostApprovalRecord).filter_by(run_id=run.id, cost_plan_hash=cost_plan_hash, status="approved").first()
+    if approval is None:
+        raise ImageGenerationGateError("COST_APPROVAL_REQUIRED", "Approve the frozen scene cost before provider dispatch.")
+    source = _lg11_source_scene_job(source_version=source_version, scene_id=scene_id, db=db)
+    key = _hash({"lg11_run_id": run.id, "source_version_id": source_version.id, "source_job_id": source.job_id, "cost_plan_hash": cost_plan_hash})
+    existing = db.query(ImageGenerationJobRecord).filter_by(idempotency_key=key).first()
+    if existing is None:
+        existing = ImageGenerationJobRecord(
+            project_id=run.project_id, job_id=f"lg11-{key[:24]}", section_id=source.section_id, scene_id=scene_id, role=source.role,
+            source_asset_ids=deepcopy(source.source_asset_ids or []), prompt=source.prompt, negative_prompt=source.negative_prompt,
+            preserve_product_identity=True, output_size=source.output_size, cost_tier=source.cost_tier, status="awaiting_approval",
+            provider=source.provider, model=source.model, warnings=["LG-11 scene regeneration approved; durable dispatch pending."],
+            input_snapshot=deepcopy(source.input_snapshot or {}), validation_result={"status": "pending"}, estimated_cost=source.estimated_cost,
+            usage_metadata={"langgraph_run_id": run.id, "langgraph_thread_id": run.graph_thread_id or run.id, "langgraph_mode": run.mode,
+                            "cost_approval_id": approval.id, "cost_plan_hash": cost_plan_hash, "lg11_source_version_id": source_version.id, "lg11_source_job_id": source.job_id},
+            prompt_version=source.prompt_version, prompt_hash=source.prompt_hash, reference_hash=source.reference_hash, planning_hash=approval.planning_hash,
+            input_hash=source.input_hash, generation_attempt=int(source.generation_attempt or 1) + 1, idempotency_key=key,
+            required_for_completion=True, supersedes_job_id=source.job_id, scene_prompt_version_id=source.scene_prompt_version_id,
+        )
+        db.add(existing); db.commit()
+    return _summary(_owned_jobs(run.project_id, run.id, db))
+
+
+def prepare_lg11_seller_asset_replacement(*, run: AgentRun, source_version: DetailPageVersion, scene_id: str, asset_id: str, seller_attested: bool, db: Session) -> dict[str, Any]:
+    source = _lg11_source_scene_job(source_version=source_version, scene_id=scene_id, db=db)
+    key = _hash({"lg11_run_id": run.id, "source_version_id": source_version.id, "source_job_id": source.job_id, "asset_id": asset_id})
+    job = db.query(ImageGenerationJobRecord).filter_by(idempotency_key=key).first()
+    if job is None:
+        job = ImageGenerationJobRecord(project_id=run.project_id, job_id=f"lg11-{key[:24]}", section_id=source.section_id, scene_id=scene_id, role=source.role,
+            source_asset_ids=deepcopy(source.source_asset_ids or []), prompt=source.prompt, negative_prompt=source.negative_prompt, preserve_product_identity=True,
+            output_size=source.output_size, cost_tier=source.cost_tier, status="awaiting_approval", provider="manual_upload", model="seller_final_asset",
+            input_snapshot=deepcopy(source.input_snapshot or {}), validation_result={"status": "pending"}, estimated_cost=0.0,
+            usage_metadata={"langgraph_run_id": run.id, "lg11_source_version_id": source_version.id, "lg11_source_job_id": source.job_id},
+            prompt_version=source.prompt_version, prompt_hash=source.prompt_hash, reference_hash=source.reference_hash, planning_hash=source.planning_hash,
+            input_hash=source.input_hash, generation_attempt=int(source.generation_attempt or 1) + 1, idempotency_key=key, required_for_completion=True,
+            supersedes_job_id=source.job_id, scene_prompt_version_id=source.scene_prompt_version_id)
+        db.add(job); db.commit()
+    try:
+        attach_manual_storyboard_output(_project(run.project_id, db), job.job_id, asset_id, seller_attested, db)
+    except StoryboardImageGenerationError as error:
+        # A replacement-rights rejection is a terminal result for this target
+        # edit, not an orchestration failure.  Keep every source/sibling asset
+        # intact and require a fresh explicit edit run for another candidate.
+        job.status = "blocked"
+        job.error_code = "SELLER_REPLACEMENT_INELIGIBLE"
+        job.warnings = [str(error)]
+        job.validation_result = {"status": "blocked", "reason": "seller_replacement_ineligible"}
+        db.commit()
+    return _summary(_owned_jobs(run.project_id, run.id, db))
 
 
 def apply_image_review(

@@ -46,4 +46,6 @@ markers = [
     "lg9_real_provider_smoke: opt-in smoke test that sends an image request to the configured real provider",
     "lg10_fake_e2e: zero-cost production LangGraph LG-10 assembly, render, and export quality gate",
     "lg10_real_provider_smoke: opt-in smoke that carries one real-provider image through the LG-10 final snapshot",
+    "lg11_fake_e2e: zero-cost production LangGraph LG-11 edit, Canvas, restore, and export quality gate",
+    "lg11_real_provider_smoke: opt-in smoke for an LG-11 scene edit through the configured real provider",
 ]

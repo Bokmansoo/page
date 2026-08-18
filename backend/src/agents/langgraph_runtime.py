@@ -128,6 +128,32 @@ class SellformGraphState(TypedDict, total=False):
     creative_brief: Annotated[dict[str, Any], _merge_discovery]
 
 
+class LG11EditGraphState(TypedDict, total=False):
+    """Durable LG-11 edit-run state, isolated from the LG-1 through LG-10 graph.
+
+    The source page remains the immutable DetailPageVersion reference.  This
+    state deliberately retains no mutable ProductPage or image-job payload.
+    """
+
+    run_id: str
+    thread_id: str
+    workspace_id: str
+    project_id: str
+    mode: str
+    current_stage: str
+    status: str
+    events: Annotated[list[dict[str, Any]], add]
+    edit: Annotated[dict[str, Any], _merge_discovery]
+    # LG-11 scene edits reuse the LG-9 durable job/outbox protocol.  Keep the
+    # same small generation summary in the checkpoint so the existing worker
+    # callback can resume the provider wait without reconstructing a second
+    # regeneration workflow.
+    generation: Annotated[dict[str, Any], _merge_discovery]
+    # TASK-11.7 stores an immutable-source canvas draft in the same durable
+    # LG-11 checkpoint; it never writes the source DetailPageVersion.
+    canvas: Annotated[dict[str, Any], _merge_discovery]
+
+
 def configured_graph_runtime() -> GraphRuntime:
     """Return the validated runtime selection without activating migration code."""
 
@@ -198,6 +224,28 @@ def build_lg1_graph_input(
         "status": "created",
         "events": [],
         "errors": [],
+    }
+
+
+def build_lg11_edit_graph_input(
+    *,
+    run_id: str,
+    workspace_id: str,
+    project_id: str,
+    edit: dict[str, Any],
+) -> LG11EditGraphState:
+    """Build the narrow LG-11 state from a frozen-version edit-run envelope."""
+
+    return {
+        "run_id": run_id,
+        "thread_id": run_id,
+        "workspace_id": workspace_id,
+        "project_id": project_id,
+        "mode": "lg11_edit",
+        "current_stage": "edit_intent",
+        "status": "created",
+        "events": [],
+        "edit": copy.deepcopy(edit),
     }
 
 
@@ -1299,6 +1347,653 @@ def build_lg10_compiled_graph(*, checkpointer: BaseCheckpointSaver[Any]):
     graph.add_conditional_edges("image_review", _lg10_image_review_route, {
         "generation_pending": "generation_pending", "page_assembly": "page_assembly", "finalize_run": "finalize_run", "image_review": "image_review"})
     graph.add_edge("page_assembly", "canonical_renderer"); graph.add_edge("canonical_renderer", "finalize_run"); graph.add_edge("finalize_run", END)
+    return graph.compile(checkpointer=checkpointer)
+
+
+def _lg11_edit_event(stage: str, *, status: str = "running") -> dict[str, Any]:
+    return {
+        "stage": stage,
+        "status": status,
+        "node_status": "completed",
+        "event_type": "node_completed",
+    }
+
+
+def _lg11_prepare_edit_run(state: LG11EditGraphState) -> dict[str, Any]:
+    """Persist only the immutable source/version lineage before confirmation."""
+
+    edit = dict(state.get("edit") or {})
+    lineage = dict(edit.get("lineage") or {})
+    base_version = dict(edit.get("base_version") or {})
+    if (
+        not lineage.get("edit_run_id")
+        or lineage.get("edit_run_id") != state.get("run_id")
+        or not lineage.get("source_detail_page_version_id")
+        or not lineage.get("parent_detail_page_version_id")
+        or not base_version.get("id")
+        or not base_version.get("snapshot_hash")
+        or not edit.get("intent_id")
+        or not isinstance(edit.get("impact_preview"), dict)
+    ):
+        raise ValueError("LG-11 edit run requires a frozen base-version lineage and impact preview.")
+    return {
+        "current_stage": "edit_confirmation",
+        "status": "running",
+        "edit": {
+            **edit,
+            "confirmation": {"status": "pending"},
+        },
+        "events": [_lg11_edit_event("edit_intent")],
+    }
+
+
+def _lg11_edit_confirmation_interrupt(state: LG11EditGraphState) -> dict[str, Any]:
+    edit = dict(state.get("edit") or {})
+    lineage = dict(edit.get("lineage") or {})
+    return {
+        "schema_version": "lg11-v1",
+        "review_stage": "edit_confirmation",
+        "title": "변경 영향 확인",
+        "description": "고정된 상세페이지 버전과 변경 영향 범위를 확인한 뒤 다음 편집 단계로 진행합니다.",
+        "allowed_decisions": ["approve", "reject"],
+        "run_id": str(state.get("run_id") or ""),
+        "thread_id": str(state.get("thread_id") or state.get("run_id") or ""),
+        "project_id": str(state.get("project_id") or ""),
+        "context": {
+            "edit_run_id": str(lineage.get("edit_run_id") or ""),
+            "source_detail_page_version_id": str(lineage.get("source_detail_page_version_id") or ""),
+            "parent_detail_page_version_id": str(lineage.get("parent_detail_page_version_id") or ""),
+            "base_snapshot_hash": str(dict(edit.get("base_version") or {}).get("snapshot_hash") or ""),
+            "intent_id": str(edit.get("intent_id") or ""),
+            "impact_preview": dict(edit.get("impact_preview") or {}),
+        },
+        "rejection_reason": "",
+    }
+
+
+def _lg11_edit_confirmation(state: LG11EditGraphState) -> dict[str, Any]:
+    """Pause before any edit execution; later LG-11 tasks own downstream work."""
+
+    from src.services.langgraph_review_service import validate_resume_payload
+
+    raw_response = interrupt(_lg11_edit_confirmation_interrupt(state))
+    response = validate_resume_payload(raw_response, "edit_confirmation")
+    edit = dict(state.get("edit") or {})
+    return {
+        "current_stage": "edit_confirmation",
+        "status": "running",
+        "edit": {
+            **edit,
+            "confirmation": {
+                "status": "confirmed" if response.decision == "approve" else "rejected",
+                "decision": response.decision,
+            },
+        },
+        "events": [_lg11_edit_event("edit_confirmation")],
+    }
+
+
+def _lg11_finalize_edit_run(state: LG11EditGraphState) -> dict[str, Any]:
+    """Start the approved LG-11 action without widening its task boundary."""
+
+    edit = dict(state.get("edit") or {})
+    from src.db.models import AgentRun, DetailPageVersion
+    from src.services.langgraph_discovery_service import current_langgraph_session
+    from src.services.page_finalization_service import (
+        EditIntentValidationError,
+        build_lg11_canvas_draft,
+        build_lg11_copy_version_fork,
+        build_lg11_style_version_fork,
+    )
+
+    db = current_langgraph_session()
+    if db is None:
+        raise RuntimeError("LG-11 copy fork requires the graph database session.")
+    run = db.query(AgentRun).filter(
+        AgentRun.id == str(state.get("run_id") or ""),
+        AgentRun.workspace_id == str(state.get("workspace_id") or ""),
+        AgentRun.project_id == str(state.get("project_id") or ""),
+        AgentRun.mode == "lg11_edit",
+    ).one_or_none()
+    if run is None:
+        raise EditIntentValidationError("LG-11 copy fork run is not available in this workspace.")
+    intent = dict((run.input_snapshot or {}).get("lg11_edit_intent") or {})
+    if (
+        str(intent.get("intent_hash") or "") != str(edit.get("intent_id") or "")
+        or str(intent.get("intent_hash") or "") != str(edit.get("intent_hash") or "")
+    ):
+        raise EditIntentValidationError("LG-11 copy fork intent identity does not match the edit run.")
+
+    scope = str(intent.get("scope") or "")
+    operation = str(intent.get("operation") or "")
+    if scope == "page" and operation == "restore":
+        source_version = db.query(DetailPageVersion).filter(
+            DetailPageVersion.id == str(dict(edit.get("base_version") or {}).get("id") or ""),
+            DetailPageVersion.project_id == run.project_id,
+        ).one_or_none()
+        if source_version is None or not isinstance(source_version.sections_json, dict):
+            raise EditIntentValidationError("LG-11 restore source is not an immutable frozen DetailPageVersion.")
+        if not isinstance(source_version.sections_json.get("lg11"), dict):
+            raise EditIntentValidationError("LG-11 restore only accepts an LG-11 frozen DetailPageVersion.")
+        # Reactivate the immutable snapshot itself.  No draft is hydrated and
+        # no child version, provider work, cost approval, or mutable page read
+        # is involved.  The single transaction also makes retry/resume safe.
+        db.query(DetailPageVersion).filter(
+            DetailPageVersion.project_id == run.project_id,
+            DetailPageVersion.is_final == True,  # noqa: E712
+        ).update({DetailPageVersion.is_final: False}, synchronize_session=False)
+        source_version.is_final = True
+        db.commit()
+        restore_state = {
+            "status": "restored",
+            "detail_page_version_id": source_version.id,
+            "source_detail_page_version_id": source_version.id,
+            "parent_detail_page_version_id": str(dict(source_version.sections_json.get("lg11") or {}).get("parent_detail_page_version_id") or source_version.id),
+            "snapshot_hash": str(dict(source_version.sections_json or {}).get("snapshot_hash") or ""),
+        }
+        return {
+            "current_stage": "version_restored", "status": "completed",
+            "edit": {**edit, "next_action": "none", "version_restore": restore_state},
+            "events": [_lg11_edit_event("version_restored", status="completed")],
+        }
+    if scope == "page" and operation == "canvas_draft":
+        source_version = db.query(DetailPageVersion).filter(
+            DetailPageVersion.id == str(dict(edit.get("base_version") or {}).get("id") or ""),
+            DetailPageVersion.project_id == run.project_id,
+        ).one_or_none()
+        if source_version is None:
+            raise EditIntentValidationError("LG-11 canvas source version is not in this project.")
+        draft = build_lg11_canvas_draft(source_version=source_version, edit_run_id=run.id, intent=intent)
+        return {
+            "current_stage": "canvas_draft_ready", "status": "running", "canvas": draft,
+            "edit": {**edit, "next_action": "canvas_edit"},
+            "events": [_lg11_edit_event("canvas_draft_ready")],
+        }
+    # Fact-sensitive requests, including a selected copy request that changes
+    # a frozen fact, share TASK-11.5's existing evidence-review interrupt.
+    # They must never fall through to a direct copy fork.
+    if bool(dict(edit.get("impact_preview") or {}).get("requires_evidence_review")):
+        return {
+            "current_stage": "fact_evidence_review",
+            "status": "running",
+            "edit": {**edit, "next_action": "fact_evidence_review"},
+            "events": [_lg11_edit_event("fact_evidence_review")],
+        }
+    if scope == "scene" and operation in {"regenerate", "replace"}:
+        source_version = db.query(DetailPageVersion).filter(
+            DetailPageVersion.id == str(dict(edit.get("base_version") or {}).get("id") or ""),
+            DetailPageVersion.project_id == run.project_id,
+        ).one_or_none()
+        if source_version is None:
+            raise EditIntentValidationError("LG-11 scene edit source version is not in this project.")
+        scene_id = str((intent.get("target_ids") or [""])[0] or "")
+        if not scene_id or len(intent.get("target_ids") or []) != 1:
+            raise EditIntentValidationError("LG-11 scene edits require exactly one frozen scene target.")
+        if operation == "regenerate":
+            from src.services.langgraph_image_generation_service import ensure_lg11_scene_regeneration_cost_plan
+
+            cost_plan = ensure_lg11_scene_regeneration_cost_plan(
+                run=run, source_version=source_version, scene_id=scene_id, db=db,
+            )
+            generation = {
+                "cost_plan": cost_plan,
+                "cost_plan_hash": cost_plan["cost_plan_hash"],
+                "scene_ids": [scene_id],
+                "next_action": "cost_approval",
+            }
+            return {
+                "current_stage": "scene_cost_approval",
+                "status": "running",
+                "generation": generation,
+                "edit": {**edit, "next_action": "scene_cost_approval"},
+                "events": [_lg11_edit_event("scene_cost_approval")],
+            }
+
+        from src.services.langgraph_image_generation_service import prepare_lg11_seller_asset_replacement
+
+        generation = prepare_lg11_seller_asset_replacement(
+            run=run,
+            source_version=source_version,
+            scene_id=scene_id,
+            asset_id=str(intent.get("replacement_asset_id") or ""),
+            seller_attested=bool(intent.get("seller_attested")),
+            db=db,
+        )
+        return {
+            "current_stage": "scene_image_review",
+            "status": "running",
+            "generation": generation,
+            "edit": {**edit, "next_action": "scene_image_review"},
+            "events": [_lg11_edit_event("scene_asset_replacement_ready")],
+        }
+
+    if scope == "style":
+        source_version = db.query(DetailPageVersion).filter(
+            DetailPageVersion.id == str(dict(edit.get("base_version") or {}).get("id") or ""),
+            DetailPageVersion.project_id == run.project_id,
+        ).one_or_none()
+        if source_version is None:
+            raise EditIntentValidationError("LG-11 style fork source version is not in this project.")
+        fork = build_lg11_style_version_fork(
+            run=run,
+            source_version=source_version,
+            edit_run_id=run.id,
+            intent=intent,
+            db=db,
+        )
+        return {
+            "current_stage": "style_version_reassembled",
+            "status": "completed",
+            "edit": {**edit, "next_action": "none", "style_version_fork": fork},
+            "events": [_lg11_edit_event("style_version_reassembled", status="completed")],
+        }
+
+    # Only direct copy content is in TASK-11.3's execution scope.  Natural
+    # language normalization and all non-copy work remain later LG-11 tasks.
+    if scope != "copy" or not dict(intent.get("copy_changes") or {}):
+        return {
+            "current_stage": "edit_run_ready",
+            "status": "completed",
+            "edit": {**edit, "next_action": "task_11_3_edit_execution"},
+            "events": [_lg11_edit_event("edit_run_ready", status="completed")],
+        }
+    source_version = db.query(DetailPageVersion).filter(
+        DetailPageVersion.id == str(dict(edit.get("base_version") or {}).get("id") or ""),
+        DetailPageVersion.project_id == run.project_id,
+    ).one_or_none()
+    if source_version is None:
+        raise EditIntentValidationError("LG-11 copy fork source version is not in this project.")
+    fork = build_lg11_copy_version_fork(
+        source_version=source_version,
+        edit_run_id=run.id,
+        intent=intent,
+    )
+
+    return {
+        "current_stage": "copy_version_forked",
+        "status": "completed",
+        "edit": {**edit, "next_action": "none", "copy_version_fork": fork},
+        "events": [_lg11_edit_event("copy_version_forked", status="completed")],
+    }
+
+
+def _lg11_reject_edit_run(state: LG11EditGraphState) -> dict[str, Any]:
+    """Close a rejected confirmation without exposing it to edit execution."""
+
+    return {
+        "current_stage": "edit_rejected",
+        "status": "completed",
+        "edit": {**dict(state.get("edit") or {}), "next_action": "none"},
+        "events": [_lg11_edit_event("edit_rejected", status="completed")],
+    }
+
+
+def _lg11_edit_confirmation_route(state: LG11EditGraphState) -> str:
+    return (
+        "finalize_edit_run"
+        if str(dict(state.get("edit") or {}).get("confirmation", {}).get("status") or "") == "confirmed"
+        else "reject_edit_run"
+    )
+
+
+def _lg11_finalize_edit_run_route(state: LG11EditGraphState) -> str:
+    next_action = str(dict(state.get("edit") or {}).get("next_action") or "")
+    if next_action == "fact_evidence_review":
+        return "fact_evidence_review"
+    if next_action == "scene_cost_approval":
+        return "scene_cost_approval"
+    if next_action == "scene_image_review":
+        return "scene_image_review"
+    if next_action == "canvas_edit":
+        return "canvas_edit"
+    return "end"
+
+
+def _lg11_canvas_edit_route(state: LG11EditGraphState) -> str:
+    return "canvas_edit" if str(state.get("status") or "") == "running" else "end"
+
+
+def _lg11_canvas_edit_interrupt(state: LG11EditGraphState) -> dict[str, Any]:
+    canvas = dict(state.get("canvas") or {})
+    return {
+        "schema_version": "lg11-v1", "review_stage": "canvas_edit",
+        "title": "Canvas section draft", "description": "Apply, undo, redo, or commit section-only changes.",
+        "allowed_decisions": ["apply", "undo", "redo", "commit"],
+        "run_id": str(state.get("run_id") or ""), "thread_id": str(state.get("thread_id") or state.get("run_id") or ""),
+        "project_id": str(state.get("project_id") or ""),
+        "context": {"canvas": canvas},
+    }
+
+
+def _lg11_canvas_edit(state: LG11EditGraphState) -> dict[str, Any]:
+    """Apply one deterministic section command or commit the frozen draft."""
+    from src.services.langgraph_review_service import validate_resume_payload
+    from src.services.langgraph_discovery_service import current_langgraph_session
+    from src.services.page_finalization_service import (
+        EditIntentValidationError, apply_lg11_canvas_command, build_lg11_canvas_version_fork,
+    )
+    response = validate_resume_payload(interrupt(_lg11_canvas_edit_interrupt(state)), "canvas_edit")
+    edit = dict(state.get("edit") or {})
+    canvas = dict(state.get("canvas") or {})
+    db = current_langgraph_session()
+    if db is None:
+        raise RuntimeError("LG-11 canvas edit requires the graph database session.")
+    from src.db.models import AgentRun, DetailPageVersion
+    run = db.query(AgentRun).filter(AgentRun.id == str(state.get("run_id") or ""), AgentRun.mode == "lg11_edit").one()
+    intent = dict((run.input_snapshot or {}).get("lg11_edit_intent") or {})
+    if response.decision == "commit":
+        source = db.query(DetailPageVersion).filter(DetailPageVersion.id == str(dict(edit.get("base_version") or {}).get("id") or ""), DetailPageVersion.project_id == run.project_id).one()
+        fork = build_lg11_canvas_version_fork(run=run, source_version=source, edit_run_id=run.id, intent=intent, canvas_draft=canvas)
+        return {"current_stage": "canvas_version_forked", "status": "completed", "canvas": canvas,
+                "edit": {**edit, "next_action": "none", "canvas_version_fork": fork},
+                "events": [_lg11_edit_event("canvas_version_forked", status="completed")]}
+    try:
+        selected_context = dict(dict(intent.get("preserve_constraints") or {}).get("selected_context") or {})
+        selected_section_id = str(selected_context.get("section_id") or "")
+        selected_element_id = str(selected_context.get("element_id") or "")
+        command = dict(response.canvas_operation or {})
+        command_kind = str(command.get("kind") or "")
+        # A conversational edit is anchored to the frozen selection captured
+        # in its EditIntent.  Undo/redo are draft-history operations; every
+        # mutating section/element command must stay inside that anchor.
+        if selected_section_id and command_kind not in {"undo", "redo"}:
+            if str(command.get("section_id") or "") != selected_section_id:
+                raise EditIntentValidationError("LG-11 Canvas command is outside the selected frozen section.")
+        if selected_element_id and command_kind not in {"undo", "redo"}:
+            if str(command.get("element_id") or "") != selected_element_id:
+                raise EditIntentValidationError("LG-11 Canvas command is outside the selected frozen element.")
+        updated = apply_lg11_canvas_command(
+            canvas_draft=canvas, decision=response.decision, command=command,
+            db=db, project_id=run.project_id,
+        )
+        return {"current_stage": "canvas_draft_updated", "status": "running", "canvas": updated,
+                "edit": {**edit, "next_action": "canvas_edit", "canvas_last_error": None},
+                "events": [_lg11_edit_event("canvas_draft_updated")]}
+    except EditIntentValidationError as error:
+        return {"current_stage": "canvas_operation_rejected", "status": "running", "canvas": canvas,
+                "edit": {**edit, "next_action": "canvas_edit", "canvas_last_error": str(error)},
+                "events": [_lg11_edit_event("canvas_operation_rejected")]}
+
+
+def _lg11_fact_evidence_review_interrupt(state: LG11EditGraphState) -> dict[str, Any]:
+    """Expose frozen fact/evidence identities before marking dependencies stale."""
+
+    edit = dict(state.get("edit") or {})
+    preview = dict(edit.get("impact_preview") or {})
+    affected = dict(preview.get("affected_artifacts") or {})
+    return {
+        "schema_version": "lg11-v1",
+        "review_stage": "evidence_review",
+        "title": "사실·근거 변경 검토",
+        "description": "변경된 사실에 연결된 카피와 장면만 stale 처리합니다. 새 이미지 생성이나 비용 승인은 시작하지 않습니다.",
+        "allowed_decisions": ["approve", "reject"],
+        "run_id": str(state.get("run_id") or ""),
+        "thread_id": str(state.get("thread_id") or state.get("run_id") or ""),
+        "project_id": str(state.get("project_id") or ""),
+        "context": {
+            "lineage": copy.deepcopy(dict(edit.get("lineage") or {})),
+            "base_version": copy.deepcopy(dict(edit.get("base_version") or {})),
+            "intent_id": str(edit.get("intent_id") or ""),
+            "fact_evidence": copy.deepcopy(list(affected.get("facts") or [])),
+            "affected_section_ids": copy.deepcopy(list(affected.get("section_ids") or [])),
+            "affected_scene_ids": copy.deepcopy(list(affected.get("scene_ids") or [])),
+            "affected_artifacts": affected,
+        },
+        "rejection_reason": "",
+    }
+
+
+def _lg11_fact_evidence_review(state: LG11EditGraphState) -> dict[str, Any]:
+    """Confirm one fact-change scope, then persist only its stale envelope."""
+
+    from src.db.models import AgentRun, DetailPageVersion
+    from src.services.langgraph_discovery_service import current_langgraph_session
+    from src.services.langgraph_review_service import validate_resume_payload
+    from src.services.page_finalization_service import build_lg11_fact_selective_stale_state
+
+    db = current_langgraph_session()
+    if db is None:
+        raise RuntimeError("LG-11 fact evidence review requires the graph database session.")
+    run = db.query(AgentRun).filter_by(id=str(state.get("run_id") or ""), mode="lg11_edit").one_or_none()
+    if run is None:
+        raise ValueError("LG-11 fact edit run is unavailable.")
+    edit = dict(state.get("edit") or {})
+    raw = interrupt(_lg11_fact_evidence_review_interrupt(state))
+    response = validate_resume_payload(raw, "evidence_review")
+    if response.decision == "reject":
+        return {
+            "current_stage": "fact_evidence_rejected",
+            "status": "completed",
+            "edit": {
+                **edit,
+                "next_action": "none",
+                "fact_evidence_review": {"status": "rejected"},
+                "selective_stale": {"status": "not_applied", "reason": "evidence_review_rejected"},
+            },
+            "events": [_lg11_edit_event("fact_evidence_rejected", status="completed")],
+        }
+    source = db.query(DetailPageVersion).filter_by(
+        id=str(dict(edit.get("base_version") or {}).get("id") or ""), project_id=run.project_id,
+    ).one_or_none()
+    if source is None:
+        raise ValueError("LG-11 fact edit source version is unavailable.")
+    stale = build_lg11_fact_selective_stale_state(
+        source_version=source,
+        edit_run_id=run.id,
+        intent=dict((run.input_snapshot or {}).get("lg11_edit_intent") or {}),
+    )
+    return {
+        "current_stage": "fact_selective_stale",
+        "status": "completed",
+        "edit": {
+            **edit,
+            "next_action": "none",
+            "fact_evidence_review": {"status": "approved"},
+            "selective_stale": stale,
+        },
+        "events": [_lg11_edit_event("fact_selective_stale", status="completed")],
+    }
+
+
+def _lg11_scene_cost_approval(state: LG11EditGraphState) -> dict[str, Any]:
+    """Require a fresh LG-9 cost approval before one scene is dispatched."""
+
+    from src.db.models import AgentRun, DetailPageVersion
+    from src.services.langgraph_discovery_service import current_langgraph_session
+    from src.services.langgraph_image_generation_service import (
+        ensure_lg11_scene_regeneration_cost_plan,
+        record_cost_decision,
+    )
+    from src.services.langgraph_review_service import review_interrupt_payload, validate_resume_payload
+
+    db = current_langgraph_session()
+    if db is None:
+        raise RuntimeError("LG-11 scene cost approval requires the graph database session.")
+    run = db.query(AgentRun).filter_by(id=str(state.get("run_id") or ""), mode="lg11_edit").one_or_none()
+    if run is None:
+        raise ValueError("LG-11 scene edit run is unavailable.")
+    edit = dict(state.get("edit") or {})
+    intent = dict((run.input_snapshot or {}).get("lg11_edit_intent") or {})
+    source = db.query(DetailPageVersion).filter_by(
+        id=str(dict(edit.get("base_version") or {}).get("id") or ""), project_id=run.project_id,
+    ).one_or_none()
+    if source is None:
+        raise ValueError("LG-11 scene edit source version is unavailable.")
+    scene_id = str((intent.get("target_ids") or [""])[0] or "")
+    cost_plan = ensure_lg11_scene_regeneration_cost_plan(run=run, source_version=source, scene_id=scene_id, db=db)
+    generation = {
+        **dict(state.get("generation") or {}),
+        "cost_plan": cost_plan,
+        "cost_plan_hash": cost_plan["cost_plan_hash"],
+        "scene_ids": [scene_id],
+        "next_action": "cost_approval",
+    }
+    raw = interrupt(review_interrupt_payload(
+        "generation_pending", {**state, "generation": generation}, schema_version="lg5-v1",
+    ))
+    response = validate_resume_payload(raw, "generation_pending")
+    cost_plan = record_cost_decision(
+        run_id=run.id, project_id=run.project_id, cost_plan_hash=cost_plan["cost_plan_hash"],
+        decision=response.decision, db=db,
+    )
+    generation.update({"cost_plan": cost_plan, "cost_approved": response.decision == "approve"})
+    if response.decision == "defer":
+        generation["next_action"] = "cost_approval"
+        return {
+            "current_stage": "scene_cost_approval", "status": "running", "generation": generation,
+            "edit": {**edit, "next_action": "scene_cost_approval"},
+            "events": [_lg11_edit_event("scene_cost_approval", status="deferred")],
+        }
+    generation["next_action"] = "prepare"
+    return {
+        "current_stage": "scene_cost_approval", "status": "running", "generation": generation,
+        "edit": {**edit, "next_action": "scene_prepare"},
+        "events": [_lg11_edit_event("scene_cost_approval")],
+    }
+
+
+def _lg11_scene_cost_approval_route(state: LG11EditGraphState) -> str:
+    return "scene_prepare" if (state.get("generation") or {}).get("cost_approved") else "scene_cost_approval"
+
+
+def _lg11_scene_prepare(state: LG11EditGraphState) -> dict[str, Any]:
+    from src.db.models import AgentRun, DetailPageVersion
+    from src.services.langgraph_discovery_service import current_langgraph_session
+    from src.services.langgraph_image_generation_service import prepare_lg11_scene_regeneration
+
+    db = current_langgraph_session()
+    if db is None:
+        raise RuntimeError("LG-11 scene preparation requires the graph database session.")
+    run = db.query(AgentRun).filter_by(id=str(state.get("run_id") or ""), mode="lg11_edit").one()
+    edit = dict(state.get("edit") or {})
+    intent = dict((run.input_snapshot or {}).get("lg11_edit_intent") or {})
+    source = db.query(DetailPageVersion).filter_by(
+        id=str(dict(edit.get("base_version") or {}).get("id") or ""), project_id=run.project_id,
+    ).one()
+    generation = prepare_lg11_scene_regeneration(
+        run=run, source_version=source, scene_id=str((intent.get("target_ids") or [""])[0] or ""),
+        cost_plan_hash=str((state.get("generation") or {}).get("cost_plan_hash") or ""), db=db,
+    )
+    return {"current_stage": "scene_prepare", "status": "running", "generation": generation,
+            "edit": {**edit, "next_action": "scene_dispatch"}, "events": [_lg11_edit_event("scene_prepare")]}
+
+
+def _lg11_scene_dispatch(state: LG11EditGraphState) -> dict[str, Any]:
+    from src.db.models import AgentRun
+    from src.services.langgraph_discovery_service import current_langgraph_session
+    from src.services.langgraph_image_generation_service import dispatch_graph_image_jobs
+
+    db = current_langgraph_session()
+    if db is None:
+        raise RuntimeError("LG-11 scene dispatch requires the graph database session.")
+    run = db.query(AgentRun).filter_by(id=str(state.get("run_id") or ""), mode="lg11_edit").one()
+    provider = str(dict((state.get("generation") or {}).get("cost_plan") or {}).get("provider") or "").lower()
+    # The immutable source scene, rather than the LG-11 orchestration mode,
+    # determines whether the pre-existing LG-9 mock adapter is allowed.
+    provider_mode = "mock" if provider in {"mock", "fake"} else "real"
+    generation = dispatch_graph_image_jobs(run_id=run.id, project_id=run.project_id, mode=provider_mode, db=db)
+    return {"current_stage": "scene_dispatch", "status": "running", "generation": generation,
+            "edit": {**dict(state.get("edit") or {}), "next_action": "scene_provider_wait"},
+            "events": [_lg11_edit_event("scene_dispatch")]}
+
+
+def _lg11_scene_provider_wait(state: LG11EditGraphState) -> dict[str, Any]:
+    from src.services.langgraph_discovery_service import current_langgraph_session
+    from src.services.langgraph_image_generation_service import collect_graph_image_results
+    from src.services.langgraph_review_service import review_interrupt_payload, validate_resume_payload
+
+    db = current_langgraph_session()
+    if db is None:
+        raise RuntimeError("LG-11 scene provider wait requires the graph database session.")
+    generation = collect_graph_image_results(run_id=str(state.get("run_id") or ""), project_id=str(state.get("project_id") or ""), db=db)
+    if generation.get("pending_count", 0):
+        raw = interrupt(review_interrupt_payload("provider_wait", {**state, "generation": generation}, schema_version="lg5-v1"))
+        validate_resume_payload(raw, "provider_wait")
+        generation = collect_graph_image_results(run_id=str(state.get("run_id") or ""), project_id=str(state.get("project_id") or ""), db=db)
+    generation["next_action"] = "wait" if generation.get("pending_count", 0) else "review"
+    return {"current_stage": "scene_provider_wait", "status": "running", "generation": generation,
+            "edit": {**dict(state.get("edit") or {}), "next_action": "scene_provider_wait" if generation.get("pending_count", 0) else "scene_image_review"},
+            "events": [_lg11_edit_event("scene_provider_wait")]}
+
+
+def _lg11_scene_provider_wait_route(state: LG11EditGraphState) -> str:
+    return "scene_provider_wait" if (state.get("generation") or {}).get("pending_count", 0) else "scene_image_review"
+
+
+def _lg11_scene_image_review(state: LG11EditGraphState) -> dict[str, Any]:
+    """Reuse LG-9 scene review and create the child only after approval."""
+
+    from src.db.models import AgentRun, DetailPageVersion, ImageGenerationJobRecord
+    from src.services.langgraph_discovery_service import current_langgraph_session
+    from src.services.langgraph_image_generation_service import apply_image_review, collect_graph_image_results
+    from src.services.langgraph_review_service import review_interrupt_payload, validate_resume_payload
+    from src.services.page_finalization_service import build_lg11_scene_version_fork
+
+    db = current_langgraph_session()
+    if db is None:
+        raise RuntimeError("LG-11 scene review requires the graph database session.")
+    run = db.query(AgentRun).filter_by(id=str(state.get("run_id") or ""), mode="lg11_edit").one()
+    edit = dict(state.get("edit") or {})
+    generation = collect_graph_image_results(run_id=run.id, project_id=run.project_id, db=db)
+    if generation.get("failed_job_ids"):
+        return {"current_stage": "scene_generation_failed", "status": "completed", "generation": generation,
+                "edit": {**edit, "next_action": "none", "scene_status": "failed"},
+                "events": [_lg11_edit_event("scene_generation_failed", status="completed")]}
+    raw = interrupt(review_interrupt_payload("image_review", {**state, "generation": generation}, schema_version="lg5-v1"))
+    response = validate_resume_payload(raw, "image_review")
+    if response.decision != "approve":
+        # Regeneration within the same edit run would bypass a fresh approval.
+        if response.decision not in {"reject"}:
+            raise ValueError("LG-11 scene edits require a new edit run for another regeneration or upload.")
+        generation = apply_image_review(run_id=run.id, project_id=run.project_id, decision="reject", job_id=response.job_id, db=db)
+        return {"current_stage": "scene_edit_rejected", "status": "completed", "generation": generation,
+                "edit": {**edit, "next_action": "none", "scene_status": "rejected"},
+                "events": [_lg11_edit_event("scene_edit_rejected", status="completed")]}
+    generation = apply_image_review(run_id=run.id, project_id=run.project_id, decision="approve", job_id=response.job_id, db=db)
+    job = db.query(ImageGenerationJobRecord).filter_by(project_id=run.project_id, job_id=response.job_id).one()
+    intent = dict((run.input_snapshot or {}).get("lg11_edit_intent") or {})
+    source = db.query(DetailPageVersion).filter_by(id=str(dict(edit.get("base_version") or {}).get("id") or ""), project_id=run.project_id).one()
+    fork = build_lg11_scene_version_fork(source_version=source, edit_run_id=run.id, intent=intent, job=job, db=db)
+    return {"current_stage": "scene_version_forked", "status": "completed", "generation": generation,
+            "edit": {**edit, "next_action": "none", "scene_status": "approved", "scene_version_fork": fork},
+            "events": [_lg11_edit_event("scene_version_forked", status="completed")]}
+
+
+def build_lg11_compiled_graph(*, checkpointer: BaseCheckpointSaver[Any]):
+    """Compile LG-11 separately so LG-5 through LG-10 routes remain unchanged."""
+
+    graph = StateGraph(LG11EditGraphState)
+    graph.add_node("prepare_edit_run", _lg11_prepare_edit_run)
+    graph.add_node("edit_confirmation", _lg11_edit_confirmation)
+    graph.add_node("finalize_edit_run", _lg11_finalize_edit_run)
+    graph.add_node("canvas_edit", _lg11_canvas_edit)
+    graph.add_node("fact_evidence_review", _lg11_fact_evidence_review)
+    graph.add_node("scene_cost_approval", _lg11_scene_cost_approval)
+    graph.add_node("scene_prepare", _lg11_scene_prepare)
+    graph.add_node("scene_dispatch", _lg11_scene_dispatch)
+    graph.add_node("scene_provider_wait", _lg11_scene_provider_wait)
+    graph.add_node("scene_image_review", _lg11_scene_image_review)
+    graph.add_node("reject_edit_run", _lg11_reject_edit_run)
+    graph.add_edge(START, "prepare_edit_run")
+    graph.add_edge("prepare_edit_run", "edit_confirmation")
+    graph.add_conditional_edges("edit_confirmation", _lg11_edit_confirmation_route, {
+        "finalize_edit_run": "finalize_edit_run", "reject_edit_run": "reject_edit_run",
+    })
+    graph.add_conditional_edges("finalize_edit_run", _lg11_finalize_edit_run_route, {
+        "fact_evidence_review": "fact_evidence_review", "scene_cost_approval": "scene_cost_approval", "scene_image_review": "scene_image_review", "canvas_edit": "canvas_edit", "end": END,
+    })
+    graph.add_edge("fact_evidence_review", END)
+    graph.add_conditional_edges("scene_cost_approval", _lg11_scene_cost_approval_route, {
+        "scene_cost_approval": "scene_cost_approval", "scene_prepare": "scene_prepare",
+    })
+    graph.add_edge("scene_prepare", "scene_dispatch")
+    graph.add_edge("scene_dispatch", "scene_provider_wait")
+    graph.add_conditional_edges("scene_provider_wait", _lg11_scene_provider_wait_route, {
+        "scene_provider_wait": "scene_provider_wait", "scene_image_review": "scene_image_review",
+    })
+    graph.add_edge("scene_image_review", END)
+    graph.add_conditional_edges("canvas_edit", _lg11_canvas_edit_route, {"canvas_edit": "canvas_edit", "end": END})
+    graph.add_edge("reject_edit_run", END)
     return graph.compile(checkpointer=checkpointer)
 
 

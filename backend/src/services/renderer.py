@@ -36,6 +36,63 @@ PRESETS = {
 
 
 LG10_CANONICAL_RENDER_SCHEMA_VERSION = "lg10-canonical-render-v1"
+LG11_RENDERER_PAGE_WIDTH = 760
+LG11_BRAND_LOGO_GEOMETRY = {"x": 24, "y": 18, "width": 180, "height": 56}
+LG11_BRAND_WATERMARK_SIZE = {"width": 132, "height": 64, "right": 18, "bottom": 18}
+
+
+def lg11_effective_brand_geometry(
+    *,
+    brand_tokens: dict[str, Any],
+    rendered_sections: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Return the exact deterministic Brand Kit placements used by the renderer."""
+    layer = dict(brand_tokens.get("asset_layer") or {})
+    logo = layer.get("logo") if isinstance(layer.get("logo"), dict) else None
+    watermark = layer.get("watermark") if isinstance(layer.get("watermark"), dict) else None
+    cursor = 92 if logo else 0  # 18px top/bottom padding plus 56px logo box.
+    section_offsets: dict[str, int] = {}
+    for section in rendered_sections:
+        canvas = dict(section.get("canvas") or {})
+        if canvas.get("is_visible", True) is False:
+            continue
+        section_offsets[str(section.get("section_id") or "")] = cursor
+        height = canvas.get("height_px")
+        if not isinstance(height, int):
+            element_bottoms = [
+                int(item.get("y") or 0) + int(item.get("height") or 0)
+                for item in section.get("canvas_elements") or []
+                if isinstance(item, dict) and not item.get("deleted")
+            ]
+            height = max([160, *element_bottoms])
+        cursor += height
+    placements: dict[str, dict[str, int | str]] = {}
+    if logo:
+        placements["logo"] = {**LG11_BRAND_LOGO_GEOMETRY, "element_id": "brand:logo"}
+    if watermark:
+        placements["watermark"] = {
+            "x": LG11_RENDERER_PAGE_WIDTH - LG11_BRAND_WATERMARK_SIZE["right"] - LG11_BRAND_WATERMARK_SIZE["width"],
+            "y": max(0, cursor - LG11_BRAND_WATERMARK_SIZE["bottom"] - LG11_BRAND_WATERMARK_SIZE["height"]),
+            "width": LG11_BRAND_WATERMARK_SIZE["width"],
+            "height": LG11_BRAND_WATERMARK_SIZE["height"],
+            "element_id": "brand:watermark",
+        }
+    return {"page_width": LG11_RENDERER_PAGE_WIDTH, "page_height": max(cursor, 1), "section_offsets": section_offsets, "placements": placements}
+
+
+def _lg11_canvas_element_style(element: dict[str, Any]) -> str:
+    """Render only validated, frozen Canvas geometry; never read a live draft."""
+    required = ("element_id", "kind", "x", "y", "width", "height", "z_index", "locked")
+    if not all(key in element for key in required) or not isinstance(element.get("element_id"), str):
+        raise ValueError("LG-10 canonical renderer received an invalid Canvas element.")
+    x, y, width, height, z_index = (element[key] for key in ("x", "y", "width", "height", "z_index"))
+    if (element.get("kind") not in {"background", "text", "asset", "mask", "icon", "decorative"} or not isinstance(element.get("locked"), bool)
+            or not all(isinstance(value, int) for value in (x, y, width, height, z_index))
+            or not -2400 <= x <= 2400 or not -2400 <= y <= 2400 or not 1 <= width <= 760
+            or not 1 <= height <= 2400 or not 0 <= z_index <= 100):
+        raise ValueError("LG-10 canonical renderer received invalid Canvas element bounds.")
+    position = "absolute" if element.get("kind") == "background" else "relative"
+    return f"position:{position};left:{x}px;top:{y}px;width:{width}px;min-height:{height}px;z-index:{z_index}"
 
 
 def render_lg10_canonical_page_html(
@@ -103,7 +160,7 @@ def render_lg10_canonical_page_html(
             if rendering_mode == "seller_owned_fallback"
             else []
         )
-        asset_layer = [
+        source_asset_layer = [
             {
                 "asset_id": str(asset.get("asset_id") or ""),
                 "asset_content_hash": str(asset.get("asset_content_hash") or ""),
@@ -112,17 +169,54 @@ def render_lg10_canonical_page_html(
             if isinstance(asset, dict) and asset.get("asset_id")
         ]
         if component_id == "information_only":
+            source_asset_layer = []
+        canvas = dict(canonical_section.get("canvas") or {})
+        is_visible = canvas.get("is_visible", True)
+        height_px = canvas.get("height_px")
+        if not isinstance(is_visible, bool) or height_px is not None and (
+            not isinstance(height_px, int) or height_px < 160 or height_px > 2400
+        ):
+            raise ValueError("LG-10 canonical renderer received invalid canvas section bounds.")
+
+        canvas_elements = [dict(item or {}) for item in (canonical_section.get("canvas_elements") or [])]
+        if len({str(item.get("element_id") or "") for item in canvas_elements}) != len(canvas_elements):
+            raise ValueError("LG-10 canonical renderer received duplicate Canvas element IDs.")
+        for element in canvas_elements:
+            _lg11_canvas_element_style(element)
+        visible_elements = [item for item in canvas_elements if not bool(item.get("deleted"))]
+        elements_by_kind = {
+            kind: sorted([item for item in visible_elements if item.get("kind") == kind], key=lambda item: (item["z_index"], item["element_id"]))
+            for kind in {"background", "text", "asset", "mask", "icon", "decorative"}
+        }
+        asset_elements = elements_by_kind["asset"]
+        text_elements = elements_by_kind["text"]
+        background_elements = elements_by_kind["background"]
+        asset_layer = (
+            [{"asset_id": str(item.get("asset_id") or ""), "asset_content_hash": str(item.get("asset_content_hash") or "")}
+             for item in asset_elements]
+            if canvas_elements else source_asset_layer
+        )
+        if component_id == "information_only":
             asset_layer = []
+
+        def canvas_attributes(element: dict[str, Any] | None) -> str:
+            if element is None:
+                return ""
+            return ' data-canvas-element-id="{element_id}" data-layer-z="{z}" style="{style}"'.format(
+                element_id=escape(str(element["element_id"]), quote=True), z=element["z_index"],
+                style=_lg11_canvas_element_style(element),
+            )
 
         asset_html = "".join(
             (
                 '<figure class="sf-asset-layer" data-asset-id="{asset_id}" '
-                'data-asset-content-hash="{asset_hash}"></figure>'
+                'data-asset-content-hash="{asset_hash}"{canvas_attributes}></figure>'
             ).format(
                 asset_id=escape(asset["asset_id"], quote=True),
                 asset_hash=escape(asset["asset_content_hash"], quote=True),
+                canvas_attributes=canvas_attributes(asset_elements[index]) if canvas_elements else "",
             )
-            for asset in asset_layer
+            for index, asset in enumerate(asset_layer)
         )
         if layout_token == "spec_table":
             text_html = "<table class=\"sf-text-layer sf-spec-table\"><tbody>{}</tbody></table>".format(
@@ -148,24 +242,51 @@ def render_lg10_canonical_page_html(
                     for item in body_items
                 ),
             )
-        section_html.append(
+        if canvas_elements:
+            text_html = "".join(
+                '<div class="sf-canvas-text-element"{attributes}>{text}</div>'.format(
+                    attributes=canvas_attributes(text_element), text=text_html,
+                ) for text_element in text_elements
+            )
+        background_html = "".join(
+            '<div class="sf-canvas-background" aria-hidden="true"{attributes}></div>'.format(
+                attributes=canvas_attributes(element),
+            ) for element in background_elements
+        )
+        ornament_html = "".join(
+            '<div class="sf-canvas-{kind}" aria-hidden="true" data-canvas-token="{token}"{attributes}></div>'.format(
+                kind=escape(str(element["kind"]), quote=True), token=escape(str(element.get("token") or ""), quote=True),
+                attributes=canvas_attributes(element),
+            ) for kind in ("mask", "icon", "decorative") for element in elements_by_kind[kind]
+        )
+        if is_visible:
+            height_attr = f' style="min-height:{height_px}px"' if height_px is not None else ""
+            section_html.append(
             '<section class="sf-section sf-component-{component}" data-section-id="{section_id}" '
-            'data-layout-token="{layout}">{asset_html}{text_html}</section>'.format(
+            'data-layout-token="{layout}"{height_attr}>{background_html}{ornament_html}{asset_html}{text_html}</section>'.format(
                 component=escape(component_id, quote=True),
                 section_id=escape(section_id, quote=True),
                 layout=escape(layout_token, quote=True),
+                height_attr=height_attr,
+                background_html=background_html,
+                ornament_html=ornament_html,
                 asset_html=asset_html,
                 text_html=text_html,
             )
-        )
-        rendered_sections.append({
+            )
+        rendered_section = {
             "section_id": section_id,
             "sort_order": expected_order,
             "component_id": component_id,
             "layout_token": layout_token,
             "asset_layer": asset_layer,
             "text_layer": text_layer,
-        })
+        }
+        if canvas:
+            rendered_section["canvas"] = {"is_visible": is_visible, "height_px": height_px}
+        if canvas_elements:
+            rendered_section["canvas_elements"] = canvas_elements
+        rendered_sections.append(rendered_section)
 
     color_tokens = dict(brand_tokens.get("color_tokens") or {})
     typography_tokens = dict(brand_tokens.get("typography") or {})
@@ -180,7 +301,7 @@ def render_lg10_canonical_page_html(
     if logo:
         brand_html += (
             '<header class="sf-brand-logo" data-asset-id="{asset_id}" '
-            'data-asset-content-hash="{asset_hash}" data-brand-placement="header"></header>'
+            'data-asset-content-hash="{asset_hash}" data-brand-placement="header" data-canvas-element-id="brand:logo"></header>'
         ).format(
             asset_id=escape(str(logo["asset_id"]), quote=True),
             asset_hash=escape(str(logo["asset_content_hash"]), quote=True),
@@ -188,7 +309,7 @@ def render_lg10_canonical_page_html(
     if watermark:
         brand_html += (
             '<aside class="sf-brand-watermark" data-asset-id="{asset_id}" '
-            'data-asset-content-hash="{asset_hash}" data-brand-placement="watermark"></aside>'
+            'data-asset-content-hash="{asset_hash}" data-brand-placement="watermark" data-canvas-element-id="brand:watermark"></aside>'
         ).format(
             asset_id=escape(str(watermark["asset_id"]), quote=True),
             asset_hash=escape(str(watermark["asset_content_hash"]), quote=True),
@@ -199,8 +320,11 @@ def render_lg10_canonical_page_html(
         ".sf-brand-logo img{{display:block;max-width:180px;max-height:56px;object-fit:contain;}}"
         ".sf-brand-watermark{{position:absolute;right:18px;bottom:18px;z-index:1;opacity:.16;pointer-events:none;}}"
         ".sf-brand-watermark img{{display:block;max-width:132px;max-height:64px;object-fit:contain;}}"
-        ".sf-section{{padding:{spacing}px 24px;border-bottom:1px solid #e5e7eb;background:{surface};}}"
+        ".sf-section{{position:relative;overflow:hidden;padding:{spacing}px 24px;border-bottom:1px solid #e5e7eb;background:{surface};}}"
+        ".sf-canvas-background{{pointer-events:none;background:{muted};}}"
+        ".sf-canvas-mask,.sf-canvas-icon,.sf-canvas-decorative{{pointer-events:none;opacity:.18;}}"
         ".sf-asset-layer{{min-height:{media_height}px;margin:0 0 20px;background:{muted};border-radius:12px;}}"
+        ".sf-canvas-text-element{{max-width:100%;}}"
         ".sf-text-layer{{line-height:1.65;white-space:pre-wrap;}}"
         ".sf-text-layer h2{{margin:0 0 12px;font-size:{title_size}px;color:{accent};}}"
         ".sf-text-layer p{{margin:0 0 10px;}}"
@@ -225,11 +349,13 @@ def render_lg10_canonical_page_html(
         brand_html=brand_html,
         sections="".join(section_html),
     )
+    brand_geometry = lg11_effective_brand_geometry(brand_tokens=brand_tokens, rendered_sections=rendered_sections)
     return {
         "schema_version": LG10_CANONICAL_RENDER_SCHEMA_VERSION,
         "design_direction": design_direction,
         "renderer_tokens": direction_tokens,
         "brand_tokens": brand_tokens,
+        "brand_geometry": brand_geometry,
         "sections": rendered_sections,
         "css": css,
         "html": html,

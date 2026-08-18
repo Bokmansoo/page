@@ -31,6 +31,7 @@ export interface DetailPageSection {
   visual_payload?: Record<string, unknown> | null;
   sort_order: number;
   is_visible?: boolean;
+  height_px?: number | null;
   image_candidates?: DetailPageImageCandidate[];
   associated_fact_ids?: string[];
   associated_fact_texts?: string[];
@@ -250,7 +251,7 @@ export default function DetailPageDocument({
       data-detail-page-document="true"
     >
       {logo ? (
-        <header className="flex items-center bg-white px-6 py-4" data-detail-page-brand-logo="true">
+        <header className="flex items-center bg-white px-6 py-[18px]" data-detail-page-brand-logo="true">
           <img
             src={detailAssetUrl({ id: logo.asset_id }, logo.asset_content_hash)}
             alt="브랜드 로고"
@@ -290,6 +291,11 @@ export default function DetailPageDocument({
         const isComposedProduct = visualKind === "composed_product";
         const visualIssues = validateSectionVisual(section as unknown as DetailPageSectionVisual);
         const payload = (section.visual_payload || {}) as Record<string, unknown>;
+        const canvasHeight = typeof section.height_px === "number"
+          ? section.height_px
+          : typeof payload.canvas_height_px === "number"
+            ? payload.canvas_height_px
+            : undefined;
         const layoutVariant = payload.layout_variant as string | undefined;
         const isStructuredHtmlGraphic =
           isHtmlGraphic &&
@@ -309,6 +315,7 @@ export default function DetailPageDocument({
             id={section.id ? `section-${section.id}` : undefined}
             className={theme.section}
             data-detail-page-section="true"
+            style={canvasHeight ? { minHeight: `${canvasHeight}px` } : undefined}
           >
             {!exportMode && onStartInlineEdit ? (
               <div className="mb-3 flex justify-end">
@@ -376,7 +383,7 @@ export default function DetailPageDocument({
       })}
       {watermark ? (
         <aside
-          className="pointer-events-none absolute bottom-4 right-4 z-10 opacity-20"
+          className="pointer-events-none absolute bottom-[18px] right-[18px] z-10 opacity-[.16]"
           data-detail-page-brand-watermark="true"
         >
           <img

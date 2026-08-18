@@ -868,21 +868,42 @@ def start_storyboard_job(
         db.commit()
         return _job_payload(job, card)
 
-    sources = _source_assets(project, card, db, preferred_ids=job.source_asset_ids)
-    job.source_asset_ids = [asset.id for asset in sources]
-    snapshot = dict(job.input_snapshot or {})
-    snapshot["reference_assets"] = [_asset_summary(asset) for asset in sources]
-    snapshot["confirmed_facts"] = [_fact_snapshot(fact) for fact in _confirmed_facts(project, card, db)]
-    job.input_snapshot = snapshot
+    frozen_lg11_source = bool((job.usage_metadata or {}).get("lg11_source_version_id"))
+    if frozen_lg11_source:
+        # An LG-11 child is derived from an immutable final version.  Preserve
+        # the original LG-9 prompt/reference/fact snapshot verbatim rather
+        # than re-reading mutable planning cards or facts during dispatch.
+        source_ids = [str(asset_id) for asset_id in (job.source_asset_ids or []) if str(asset_id)]
+        by_id = {
+            asset.id: asset for asset in db.query(Asset).filter(
+                Asset.project_id == project.id, Asset.id.in_(source_ids)
+            ).all()
+        }
+        sources = [by_id[asset_id] for asset_id in source_ids if asset_id in by_id]
+    else:
+        sources = _source_assets(project, card, db, preferred_ids=job.source_asset_ids)
+        job.source_asset_ids = [asset.id for asset in sources]
+        snapshot = dict(job.input_snapshot or {})
+        snapshot["reference_assets"] = [_asset_summary(asset) for asset in sources]
+        snapshot["confirmed_facts"] = [_fact_snapshot(fact) for fact in _confirmed_facts(project, card, db)]
+        job.input_snapshot = snapshot
+
+    if frozen_lg11_source and not sources:
+        job.status = "blocked"
+        job.error_code = "FROZEN_REFERENCE_UNAVAILABLE"
+        job.warnings = ["The frozen LG-11 source references are no longer available for regeneration."]
+        db.commit()
+        return _job_payload(job, card)
+
     confirmed_facts = _confirmed_facts(project, card, db)
-    if not _power_scene_is_grounded(card, confirmed_facts):
+    if not frozen_lg11_source and not _power_scene_is_grounded(card, confirmed_facts):
         job.status = "blocked"
         job.error_code = "POWER_FACT_REQUIRED"
         job.warnings = ["충전·전원 장면은 판매자가 확인한 충전, 전원 또는 배터리 사실이 있어야 생성할 수 있습니다."]
         db.commit()
         return _job_payload(job, card)
     identity_ready, identity_warnings = _reference_assessment(sources)
-    if not identity_ready:
+    if not frozen_lg11_source and not identity_ready:
         job.status = "blocked"
         job.error_code = "IDENTITY_REFERENCE_INSUFFICIENT"
         job.warnings = identity_warnings

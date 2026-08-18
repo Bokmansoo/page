@@ -1,5 +1,13 @@
 from typing import Any
 
+
+class LG11CanvasSafetyError(ValueError):
+    """Raised when a frozen LG-11 Canvas snapshot cannot be previewed/exported."""
+
+    def __init__(self, result: dict[str, Any]):
+        self.result = result
+        super().__init__("LG-11 Canvas safety validation blocked this frozen version.")
+
 VISUAL_KINDS = {"image", "html_graphic", "composed_product"}
 HTML_LAYOUTS = {
     "comparison_cards",
@@ -60,6 +68,190 @@ _SECTION_DEFAULT_LAYOUT = {
     "guarantee": "spec_table",
     "product_info": "spec_table",
 }
+
+
+def validate_lg11_canvas_safety(
+    *,
+    version_snapshot: dict[str, Any],
+    channel: str = "smartstore",
+) -> dict[str, Any]:
+    """Validate frozen Canvas geometry for a channel without reading live drafts.
+
+    Canvas coordinates are renderer-local (the renderer owns its padding), so
+    the safe rectangle is the full rendered section width.  Backgrounds may
+    intentionally bleed to that rectangle; every other visible element must
+    remain inside it.  The returned value is deliberately JSON-friendly so
+    preview and every export endpoint can use the exact same gate.
+    """
+    from src.services.channel_export_service import get_channel_preset
+
+    snapshot = dict(version_snapshot or {})
+    lg10 = dict(snapshot.get("lg10") or {})
+    rendering = dict(lg10.get("canonical_rendering") or {})
+    canonical = dict(lg10.get("canonical_page_assembly_input") or {})
+    # LG-10 versions without a Canvas child remain governed by their existing
+    # immutable export rules.  Do not retroactively invent Canvas geometry.
+    if not isinstance(snapshot.get("lg11"), dict):
+        return {"schema_version": "lg11-canvas-safety-v1", "channel": channel, "safe": True, "issues": [], "checked": False}
+    try:
+        preset = get_channel_preset(channel)
+    except ValueError:
+        return {
+            "schema_version": "lg11-canvas-safety-v1", "channel": channel, "safe": False, "checked": True,
+            "issues": [{"code": "unsupported_channel", "reason": "Unsupported channel safe-area contract."}],
+        }
+
+    from src.services.renderer import lg11_effective_brand_geometry
+
+    width = min(760, int(preset.width))
+    issues: list[dict[str, Any]] = []
+    sections = list(rendering.get("sections") or canonical.get("sections") or [])
+    initial_brand_layer = dict(dict(rendering.get("brand_tokens") or {}).get("asset_layer") or {})
+    # This is the same 18 + 56 + 18 header box used by the renderer helper.
+    page_height = 92 if isinstance(initial_brand_layer.get("logo"), dict) else 0
+    visible_boxes: list[dict[str, Any]] = []
+    for index, raw in enumerate(sections):
+        section = dict(raw or {})
+        section_id = str(section.get("section_id") or section.get("id") or "")
+        canvas = dict(section.get("canvas") or {})
+        visible = canvas.get("is_visible", True)
+        if not isinstance(visible, bool):
+            issues.append({"code": "invalid_section_visibility", "reason": "Section visibility is invalid.", "section_id": section_id})
+            continue
+        if not visible:
+            # A hidden section and its children are not in the frozen rendered
+            # output, therefore they cannot create a visible overflow.
+            continue
+        raw_height = canvas.get("height_px")
+        elements = [dict(item or {}) for item in list(section.get("canvas_elements") or []) if not bool(dict(item or {}).get("deleted"))]
+        content_height = max([160, *[int(item.get("y", 0)) + int(item.get("height", 0)) for item in elements]])
+        section_height = int(raw_height) if isinstance(raw_height, int) else content_height
+        if section_height < 160 or section_height > 2400:
+            issues.append({"code": "section_height_out_of_bounds", "reason": "Section height violates the channel contract.", "section_id": section_id})
+            continue
+        section_top = page_height
+        page_height += section_height
+        for element in elements:
+            element_id = str(element.get("element_id") or "")
+            try:
+                x, y = int(element["x"]), int(element["y"])
+                element_width, element_height = int(element["width"]), int(element["height"])
+            except (KeyError, TypeError, ValueError):
+                issues.append({"code": "invalid_element_geometry", "reason": "Element geometry is invalid.", "section_id": section_id, "element_id": element_id})
+                continue
+            if x < 0 or y < 0 or x + element_width > width or y + element_height > section_height:
+                issues.append({"code": "element_overflow", "reason": "Element exceeds the channel safe area.", "section_id": section_id, "element_id": element_id})
+            if element.get("kind") != "background":
+                visible_boxes.append({
+                    "section_id": section_id,
+                    "element_id": element_id,
+                    "kind": str(element.get("kind") or ""),
+                    "x": x,
+                    "y": section_top + y,
+                    "width": element_width,
+                    "height": element_height,
+                    "allowed_overlap_with": list(element.get("allowed_overlap_with") or []),
+                })
+    if page_height > 30000:
+        issues.append({"code": "page_height_out_of_bounds", "reason": "Page height exceeds the channel contract."})
+
+    # Final spec must be visible and last in the frozen rendering, matching
+    # the commit-time Canvas invariant rather than any mutable editor state.
+    section_ids = [str(dict(item or {}).get("section_id") or dict(item or {}).get("id") or "") for item in sections]
+    specs = [idx for idx, section_id in enumerate(section_ids) if section_id == "specs" or section_id.endswith("_specs")]
+    if specs:
+        spec_index = specs[-1]
+        spec_canvas = dict(dict(sections[spec_index] or {}).get("canvas") or {})
+        if len(specs) != 1 or spec_index != len(sections) - 1 or not spec_canvas.get("is_visible", True):
+            issues.append({"code": "final_spec_position", "reason": "Final specification section must remain visible and last.", "section_id": section_ids[spec_index]})
+
+    # The renderer freezes these placements.  Older snapshots derive them from
+    # the same renderer helper, never from mutable Brand Kit state.
+    brand_layer = dict(dict(rendering.get("brand_tokens") or {}).get("asset_layer") or {})
+    brand_geometry = dict(rendering.get("brand_geometry") or {})
+    if not brand_geometry:
+        brand_geometry = lg11_effective_brand_geometry(
+            brand_tokens=dict(rendering.get("brand_tokens") or {}),
+            rendered_sections=[dict(item or {}) for item in sections],
+        )
+    placements = dict(brand_geometry.get("placements") or {})
+    effective_page_height = max(page_height, int(brand_geometry.get("page_height") or 0), 1)
+    for role in ("logo", "watermark"):
+        identity = brand_layer.get(role)
+        if not isinstance(identity, dict):
+            continue
+        # A frozen renderer placement takes precedence; legacy snapshots use
+        # a stored canvas geometry only where the renderer had already frozen
+        # it, otherwise deterministic renderer placement is used.
+        geometry = placements.get(role) or identity.get("canvas_geometry")
+        if not isinstance(geometry, dict):
+            issues.append({"code": "invalid_brand_geometry", "reason": "Brand Kit renderer geometry is unavailable.", "brand_role": role})
+            continue
+        try:
+            x, y, item_width, item_height = (int(geometry[key]) for key in ("x", "y", "width", "height"))
+        except (KeyError, TypeError, ValueError):
+            issues.append({"code": "invalid_brand_geometry", "reason": "Brand Kit geometry is invalid.", "brand_role": role})
+            continue
+        element_id = str(geometry.get("element_id") or f"brand:{role}")
+        if x < 0 or y < 0 or x + item_width > width or y + item_height > effective_page_height:
+            issues.append({"code": "brand_overflow", "reason": "Brand Kit asset exceeds the channel safe area.", "brand_role": role, "asset_id": identity.get("asset_id")})
+        visible_boxes.append({"section_id": "__brand__", "element_id": element_id, "kind": role, "x": x, "y": y, "width": item_width, "height": item_height, "allowed_overlap_with": []})
+
+    def overlaps(left: dict[str, Any], right: dict[str, Any]) -> bool:
+        return (
+            left["x"] < right["x"] + right["width"]
+            and right["x"] < left["x"] + left["width"]
+            and left["y"] < right["y"] + right["height"]
+            and right["y"] < left["y"] + left["height"]
+        )
+
+    def intentionally_allowed(left: dict[str, Any], right: dict[str, Any]) -> bool:
+        if left["kind"] == "background" or right["kind"] == "background":
+            return True
+        # Only decoration/mask/icon relationships are allowed to layer over
+        # content; arbitrary text/asset overlap never becomes silently safe.
+        return (
+            left["kind"] in {"mask", "icon", "decorative"}
+            and right["element_id"] in left["allowed_overlap_with"]
+        ) or (
+            right["kind"] in {"mask", "icon", "decorative"}
+            and left["element_id"] in right["allowed_overlap_with"]
+        )
+
+    def renderer_flow_pair(left: dict[str, Any], right: dict[str, Any]) -> bool:
+        """Legacy default text/asset coordinates are relative-flow, not overlay boxes."""
+        kinds = {left["kind"], right["kind"]}
+        if kinds != {"text", "asset"}:
+            return False
+        text = left if left["kind"] == "text" else right
+        asset = right if left["kind"] == "text" else left
+        return (
+            text["element_id"] == f"{text['section_id']}:text"
+            and asset["element_id"].startswith(f"{asset['section_id']}:asset")
+            and text["y"] == asset["y"]
+        )
+
+    for index, left in enumerate(visible_boxes):
+        for right in visible_boxes[index + 1:]:
+            if overlaps(left, right) and not intentionally_allowed(left, right) and not renderer_flow_pair(left, right):
+                issues.append({
+                    "code": "element_overlap",
+                    "reason": "Visible elements overlap outside an allowed Canvas relationship.",
+                    "section_id": left["section_id"],
+                    "element_id": left["element_id"],
+                    "conflicting_element_id": right["element_id"],
+                })
+    return {
+        "schema_version": "lg11-canvas-safety-v1", "channel": channel, "safe": not issues, "checked": True,
+        "viewport": {"width": width, "max_segment_height": int(preset.max_segment_height)}, "issues": issues,
+    }
+
+
+def ensure_lg11_canvas_safe(*, version_snapshot: dict[str, Any], channel: str = "smartstore") -> dict[str, Any]:
+    result = validate_lg11_canvas_safety(version_snapshot=version_snapshot, channel=channel)
+    if not result["safe"]:
+        raise LG11CanvasSafetyError(result)
+    return result
 
 
 def _is_non_empty_string(value: Any) -> bool:

@@ -33,13 +33,22 @@ export default function DetailPageRenderClient() {
     const loadFinalPage = async () => {
       try {
         const versionId = searchParams.get("version_id");
+        const channel = searchParams.get("channel");
         const headers = SESSION_HEADERS;
-        const versionQuery = versionId ? `?version_id=${encodeURIComponent(versionId)}` : "";
+        const channelQuery = channel ? `&channel=${encodeURIComponent(channel)}` : "";
+        const versionQuery = versionId
+          ? `?version_id=${encodeURIComponent(versionId)}${channelQuery}`
+          : channelQuery.replace("&", "?");
         const [finalRes, assetsRes] = await Promise.all([
           fetch(apiUrl(`/api/v1/projects/${projectId}/page/final${versionQuery}`), { headers, credentials: "include" }),
           fetch(apiUrl(`/api/v1/projects/${projectId}/assets`), { headers, credentials: "include" }),
         ]);
         if (!finalRes.ok) {
+          const payload = await finalRes.json().catch(() => null);
+          const safety = payload?.detail?.canvas_safety;
+          if (safety?.issues?.length) {
+            throw new Error(safety.issues.map((issue: { section_id?: string; element_id?: string; reason?: string }) => [issue.section_id, issue.element_id, issue.reason].filter(Boolean).join(" · ")).join(" / "));
+          }
           throw new Error("Final detail page version is not ready.");
         }
         const finalPage = (await finalRes.json()) as FinalPageResponse;

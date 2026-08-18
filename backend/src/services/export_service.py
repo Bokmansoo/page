@@ -19,6 +19,7 @@ from src.db.models import Asset, ExportArtifact
 from src.services.commerce_policy import REFERENCE_SOURCE_TYPES, is_asset_final_output_eligible
 from src.services.page_asset_policy import get_page_eligible_assets
 from src.services.channel_export_service import image_sha256
+from src.services.page_visual_contract import LG11CanvasSafetyError, ensure_lg11_canvas_safe
 
 
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
@@ -245,6 +246,7 @@ def build_lg10_copyable_html(
     db: Session,
     project_id: str,
     version,
+    channel: str | None = "smartstore",
 ) -> dict[str, Any]:
     """Build paste-ready HTML from one frozen LG-10 version.
 
@@ -254,7 +256,7 @@ def build_lg10_copyable_html(
     creates a public asset URL.
     """
 
-    _, rendering, manifest = _frozen_lg10_export_inputs(version)
+    _, rendering, manifest = _frozen_lg10_export_inputs(version, channel=channel)
     entries = [dict(item) for item in manifest.get("assets") or [] if isinstance(item, dict)]
     brand_assets = _frozen_lg10_brand_assets(rendering)
     asset_ids = [str(item.get("asset_id") or "") for item in entries]
@@ -329,10 +331,23 @@ def _safe_asset_extension(asset) -> str:
     return extension
 
 
-def _frozen_lg10_export_inputs(version) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+def _frozen_lg10_export_inputs(
+    version,
+    *,
+    channel: str | None = "smartstore",
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     snapshot = version.sections_json if isinstance(version.sections_json, dict) else {}
     if snapshot.get("schema_version") != _LG10_DETAIL_PAGE_VERSION_SCHEMA:
         raise FrozenExportSnapshotError("Standalone exports require an LG-10 frozen DetailPageVersion.")
+    if isinstance(snapshot.get("lg11"), dict):
+        if channel not in {"smartstore", "coupang"}:
+            raise FrozenExportSnapshotError("LG-11 frozen exports require an explicit channel identity.")
+        try:
+            # Direct service callers receive the same frozen Canvas gate as the
+            # HTTP preview/export APIs; this never consults a mutable draft.
+            ensure_lg11_canvas_safe(version_snapshot=snapshot, channel=channel)
+        except LG11CanvasSafetyError as exc:
+            raise FrozenExportSnapshotError(str(exc)) from exc
     lg10 = snapshot.get("lg10") if isinstance(snapshot.get("lg10"), dict) else {}
     canonical_input = lg10.get("canonical_page_assembly_input")
     rendering = lg10.get("canonical_rendering")
@@ -390,6 +405,7 @@ def build_lg10_standalone_export_bundle(
     project_id: str,
     version,
     output_dir: str | None = None,
+    channel: str | None = "smartstore",
 ) -> dict[str, Any]:
     """Build a local-only HTML/CSS/image package from one frozen LG-10 version.
 
@@ -397,7 +413,7 @@ def build_lg10_standalone_export_bundle(
     preview URLs or mutable page state; Brand Kit images are included only when
     the frozen renderer actually placed them.
     """
-    _, rendering, manifest = _frozen_lg10_export_inputs(version)
+    _, rendering, manifest = _frozen_lg10_export_inputs(version, channel=channel)
     entries = [dict(item) for item in manifest.get("assets") or [] if isinstance(item, dict)]
     brand_assets = _frozen_lg10_brand_assets(rendering)
     asset_ids = [str(item.get("asset_id") or "") for item in entries]
@@ -577,6 +593,7 @@ def capture_next_render_export(
     *,
     project_id: str,
     version_id: str,
+    channel: str | None = None,
     output_format: Literal["png", "jpg", "jpeg"] = "png",
     output_dir: str | None = None,
     render_base_url: str | None = None,
@@ -603,6 +620,7 @@ def capture_next_render_export(
     query = urlencode(
         {
             "version_id": version_id,
+            **({"channel": channel} if channel else {}),
             "user_id": auth_headers.get("X-Mock-User-Id", ""),
             "workspace_id": auth_headers.get("X-Mock-Workspace-Id", ""),
         }

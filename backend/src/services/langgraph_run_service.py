@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from src.agents.langgraph_runtime import (
     build_lg8_compiled_graph,
     build_lg10_compiled_graph,
+    build_lg11_compiled_graph,
     build_lg7_compiled_graph,
     build_lg6_compiled_graph,
     build_lg5_compiled_graph,
@@ -25,6 +26,7 @@ from src.agents.langgraph_runtime import (
     build_lg3_compiled_graph,
     build_lg1_compiled_graph,
     build_lg1_graph_input,
+    build_lg11_edit_graph_input,
     langgraph_runtime_enabled,
     open_postgres_checkpointer,
 )
@@ -284,6 +286,44 @@ class AgentRunGraphProjector:
                     **rendering_delta,
                 },
             }
+        edit_delta = update.get("edit")
+        if isinstance(edit_delta, dict) and edit_delta:
+            copy_version_fork = edit_delta.get("copy_version_fork")
+            if isinstance(copy_version_fork, dict):
+                from src.services.page_finalization_service import persist_lg11_copy_version_fork
+
+                persist_lg11_copy_version_fork(
+                    run=projected_run,
+                    copy_version_fork=copy_version_fork,
+                    db=db,
+                )
+            scene_version_fork = edit_delta.get("scene_version_fork")
+            if isinstance(scene_version_fork, dict):
+                from src.services.page_finalization_service import persist_lg11_scene_version_fork
+                persist_lg11_scene_version_fork(run=projected_run, scene_version_fork=scene_version_fork, db=db)
+            style_version_fork = edit_delta.get("style_version_fork")
+            if isinstance(style_version_fork, dict):
+                from src.services.page_finalization_service import persist_lg11_style_version_fork
+
+                persist_lg11_style_version_fork(
+                    run=projected_run,
+                    style_version_fork=style_version_fork,
+                    db=db,
+                )
+            canvas_version_fork = edit_delta.get("canvas_version_fork")
+            if isinstance(canvas_version_fork, dict):
+                from src.services.page_finalization_service import persist_lg11_canvas_version_fork
+                persist_lg11_canvas_version_fork(run=projected_run, canvas_version_fork=canvas_version_fork, db=db)
+            projected_run.outputs_json = {
+                **projected_run.outputs_json,
+                "langgraph_edit": {
+                    **((projected_run.outputs_json or {}).get("langgraph_edit") or {}),
+                    **edit_delta,
+                },
+            }
+        canvas_delta = update.get("canvas")
+        if isinstance(canvas_delta, dict) and canvas_delta:
+            projected_run.outputs_json = {**projected_run.outputs_json, "langgraph_canvas": canvas_delta}
         prompt_delta = update.get("prompt_intelligence")
         if isinstance(prompt_delta, dict):
             projected_run.outputs_json = {
@@ -406,8 +446,10 @@ class LangGraphRunService:
         return {"configurable": {"thread_id": thread_id}}
 
     @staticmethod
-    def _compiled_graph(checkpointer: Any) -> Any:
+    def _compiled_graph(checkpointer: Any, *, run: AgentRun | None = None) -> Any:
         """Use the migrated graph for the explicit LangGraph rollout."""
+        if run is not None and run.mode == "lg11_edit":
+            return build_lg11_compiled_graph(checkpointer=checkpointer)
         if not langgraph_runtime_enabled():
             return build_lg1_compiled_graph(checkpointer=checkpointer)
         builder = build_lg10_compiled_graph
@@ -488,9 +530,64 @@ class LangGraphRunService:
                         "generation": dict((snapshot.values or {}).get("generation") or {}),
                         "page_assembly": dict((snapshot.values or {}).get("page_assembly") or {}),
                         "rendering": dict((snapshot.values or {}).get("rendering") or {}),
+                        "edit": dict((snapshot.values or {}).get("edit") or {}),
+                        "canvas": dict((snapshot.values or {}).get("canvas") or {}),
                     },
                 )
+        snapshot = graph.get_state(config)
+        interrupt_payload = cls._interrupt_payload(snapshot)
+        if interrupt_payload is not None:
+            run = AgentRunGraphProjector.apply_interrupt_wait(run, db, interrupt_payload)
         return run
+
+    @classmethod
+    def _recover_running_lg11_projection(cls, run: AgentRun, db: Session) -> AgentRun:
+        """Recover only an LG-11 SQL projection that lags its durable checkpoint.
+
+        A normal in-flight run still owns its execution lease.  We replay
+        history only when the checkpoint has edit/interrupt state that is
+        absent or different in the durable projection, so browser retries do
+        not repeatedly project a healthy run.
+        """
+
+        if run.mode != "lg11_edit" or run.status != "running" or not run.graph_thread_id:
+            return run
+        config = cls._config(cls._thread_id(run))
+        with open_postgres_checkpointer() as checkpointer:
+            graph = cls._compiled_graph(checkpointer, run=run)
+            snapshot = graph.get_state(config)
+            checkpoint_edit = dict((snapshot.values or {}).get("edit") or {})
+            checkpoint_pending = cls._interrupt_payload(snapshot)
+            projected_outputs = dict(run.outputs_json or {})
+            projected_edit = dict(projected_outputs.get("langgraph_edit") or {})
+            projected_pending = dict(
+                (dict(projected_outputs.get("langgraph_review") or {}).get("pending") or {})
+            )
+            checkpoint_canvas = dict((snapshot.values or {}).get("canvas") or {})
+            projected_canvas = dict(projected_outputs.get("langgraph_canvas") or {})
+            stale = (
+                bool(checkpoint_edit) and projected_edit != checkpoint_edit
+            ) or (
+                checkpoint_pending is not None and projected_pending != checkpoint_pending
+            ) or (
+                bool(checkpoint_canvas) and projected_canvas != checkpoint_canvas
+            )
+            if not stale:
+                return run
+            run = cls._rebuild_projection_from_history(run, db, graph, config)
+            # A checkpoint can be interrupted after its node update but before
+            # the interrupt projection. Rebuild both halves so public resume
+            # exposes the same durable canvas/edit review state after restart.
+            restored_pending = cls._interrupt_payload(snapshot)
+            if restored_pending is not None:
+                run = AgentRunGraphProjector.apply_interrupt_wait(run, db, restored_pending)
+            run.graph_checkpoint_id = (
+                (snapshot.config.get("configurable") or {}).get("checkpoint_id")
+            )
+            db.add(run)
+            db.commit()
+            db.refresh(run)
+            return run
 
     @classmethod
     def _execute(
@@ -506,7 +603,7 @@ class LangGraphRunService:
         config = cls._config(thread_id)
         try:
             with open_postgres_checkpointer() as checkpointer:
-                graph = cls._compiled_graph(checkpointer)
+                graph = cls._compiled_graph(checkpointer, run=run)
                 if rebuild_projection:
                     run = cls._rebuild_projection_from_history(run, db, graph, config)
                     restored = graph.get_state(config)
@@ -590,9 +687,11 @@ class LangGraphRunService:
             # set of projection rows.
             return run
         if run.status == "running":
-            # The first caller owns the execution lease. Returning the same
-            # projection makes duplicate browser/API requests idempotent.
-            return run
+            # The first caller usually owns the execution lease. An LG-11
+            # checkpoint may nevertheless be newer than its SQL projection if
+            # the process stopped after the checkpoint commit; repair only
+            # that stale projection before returning the same run.
+            return cls._recover_running_lg11_projection(run, db)
         if run.status == "failed":
             raise GraphRunResumeRequired("This graph run failed; resume the same thread instead of starting again.")
 
@@ -631,13 +730,21 @@ class LangGraphRunService:
             raise ValueError("Could not acquire the graph execution lease.")
         run = cls._find_run(run_id, workspace_id, db)
 
-        initial_state = build_lg1_graph_input(
-            run_id=run.id,
-            workspace_id=run.workspace_id,
-            project_id=run.project_id,
-            mode=run.mode,
-            input_snapshot=run.input_snapshot or {},
-        )
+        if run.mode == "lg11_edit":
+            initial_state = build_lg11_edit_graph_input(
+                run_id=run.id,
+                workspace_id=run.workspace_id,
+                project_id=run.project_id,
+                edit=dict((run.input_snapshot or {}).get("lg11_edit") or {}),
+            )
+        else:
+            initial_state = build_lg1_graph_input(
+                run_id=run.id,
+                workspace_id=run.workspace_id,
+                project_id=run.project_id,
+                mode=run.mode,
+                input_snapshot=run.input_snapshot or {},
+            )
 
         return cls._execute(
             run,
@@ -661,7 +768,7 @@ class LangGraphRunService:
                 next_nodes=[],
             )
         with open_postgres_checkpointer() as checkpointer:
-            graph = cls._compiled_graph(checkpointer)
+            graph = cls._compiled_graph(checkpointer, run=run)
             snapshot = graph.get_state(cls._config(thread_id))
         checkpoint_id = (snapshot.config.get("configurable") or {}).get("checkpoint_id")
         return GraphRunStateView(
@@ -680,7 +787,7 @@ class LangGraphRunService:
         if not run.graph_thread_id:
             return []
         with open_postgres_checkpointer() as checkpointer:
-            graph = cls._compiled_graph(checkpointer)
+            graph = cls._compiled_graph(checkpointer, run=run)
             snapshots = list(graph.get_state_history(cls._config(run.graph_thread_id)))
         return [
             GraphRunStateView(
@@ -724,7 +831,9 @@ class LangGraphRunService:
         if run.status == "completed":
             return run
         if run.status == "running":
-            return run
+            run = cls._recover_running_lg11_projection(run, db)
+            if run.status == "running":
+                return run
         if not run.graph_thread_id:
             raise GraphRunResumeUnavailable("This graph run has no checkpoint to resume.")
         is_review_resume = run.status == "awaiting_review"

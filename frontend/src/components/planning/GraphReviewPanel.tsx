@@ -59,6 +59,14 @@ export type GraphView = {
     rendering?: {
       detail_page_version?: { id?: string };
     };
+    edit?: {
+      version_restore?: { detail_page_version_id?: string };
+    };
+    canvas?: {
+      canonical_page_assembly_input?: { sections?: Array<{ section_id: string; canvas?: { is_visible?: boolean; height_px?: number | null }; canvas_elements?: Array<{ element_id: string; kind: string; x: number; y: number; width: number; height: number; z_index: number; locked: boolean; group_id?: string | null; deleted?: boolean; asset_id?: string; asset_content_hash?: string }> }> };
+      element_groups?: Array<{ group_id: string; section_id: string; child_element_ids: string[]; locked: boolean }>;
+      revision?: number;
+    };
     execution?: {
       recoverable?: boolean;
       last_error?: GraphExecutionError | null;
@@ -78,8 +86,8 @@ type GraphExecutionError = {
 };
 
 type ReviewRequest = {
-  schema_version: "lg4-v1" | "lg5-v1";
-  review_stage: "input_review" | "evidence_review" | "planning_review" | "generation_pending" | "provider_wait" | "image_review";
+  schema_version: "lg4-v1" | "lg5-v1" | "lg11-v1";
+  review_stage: "input_review" | "evidence_review" | "planning_review" | "generation_pending" | "provider_wait" | "image_review" | "edit_confirmation" | "canvas_edit";
   title: string;
   description: string;
   allowed_decisions: string[];
@@ -92,6 +100,7 @@ type UploadAsset = {
   source_type: string;
   usage_status: string;
   mime_type?: string;
+  content_hash?: string | null;
 };
 
 type StandaloneExport = {
@@ -99,6 +108,52 @@ type StandaloneExport = {
   html_download_url: string;
   zip_download_url: string;
 };
+
+type FrozenCanvasElement = {
+  element_id: string;
+  kind: string;
+};
+
+type FrozenCanvasSection = {
+  section_id: string;
+  canvas_elements?: FrozenCanvasElement[];
+  copy_ref?: { fields?: string[]; fact_ids?: string[] };
+  approved_assets?: Array<{ scene_id?: string; asset_id?: string; asset_content_hash?: string }>;
+};
+
+type FrozenVersionSnapshot = {
+  sections_json?: {
+    lg10?: {
+      canonical_page_assembly_input?: {
+        sections?: FrozenCanvasSection[];
+        approved_asset_manifest?: { assets?: Array<{ scene_id?: string; section_id?: string; asset_id?: string; asset_content_hash?: string }> };
+      };
+    };
+  };
+};
+
+type EditIntentPreview = {
+  edit_intent: Record<string, unknown>;
+  impact_preview: {
+    affected_artifacts?: {
+      section_ids?: string[];
+      scene_ids?: string[];
+      assets?: Array<{ asset_id?: string; asset_content_hash?: string }>;
+      copy_artifacts?: Array<{ artifact_key?: string; artifact_hash?: string }>;
+      brand_kit?: Record<string, unknown>;
+      facts?: Array<{ fact_id?: string; evidence_ids?: string[] }>;
+      style_layout_tokens?: Array<{ section_id?: string; layout_token?: string }>;
+    };
+    expected_provider_cost?: Record<string, unknown>;
+    requires_cost_approval?: boolean;
+    requires_evidence_review?: boolean;
+    requires_explicit_confirmation?: boolean;
+    execution_blocked?: boolean;
+  };
+};
+
+type FrozenVersionOption = { id: string; name: string; is_final: boolean; lg11_frozen?: boolean };
+type BrandKitVersionOption = { id: string; version?: number; status?: string };
 
 type Props = {
   projectId: string;
@@ -140,6 +195,26 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   const [uploadByJob, setUploadByJob] = useState<Record<string, string>>({});
   const [standaloneExport, setStandaloneExport] = useState<StandaloneExport | null>(null);
   const [standaloneExporting, setStandaloneExporting] = useState(false);
+  const [canvasHeights, setCanvasHeights] = useState<Record<string, string>>({});
+  const [selectedCanvasElements, setSelectedCanvasElements] = useState<string[]>([]);
+  const [canvasAssetReplacements, setCanvasAssetReplacements] = useState<Record<string, string>>({});
+  const [previewChannel, setPreviewChannel] = useState<"smartstore" | "coupang">("smartstore");
+  const [frozenCanvasSections, setFrozenCanvasSections] = useState<FrozenCanvasSection[]>([]);
+  const [selectedEditSectionId, setSelectedEditSectionId] = useState("");
+  const [selectedEditElementId, setSelectedEditElementId] = useState("");
+  const [selectedEditCopyField, setSelectedEditCopyField] = useState("");
+  const [conversationalInstruction, setConversationalInstruction] = useState("");
+  const [conversationalCopy, setConversationalCopy] = useState("");
+  const [conversationalMode, setConversationalMode] = useState<"canvas" | "copy" | "fact" | "style" | "scene_regenerate" | "asset_replace" | "restore">("canvas");
+  const [selectedEditSceneId, setSelectedEditSceneId] = useState("");
+  const [selectedReplacementAssetId, setSelectedReplacementAssetId] = useState("");
+  const [selectedDesignDirection, setSelectedDesignDirection] = useState("balanced_sale");
+  const [selectedBrandKitVersionId, setSelectedBrandKitVersionId] = useState("");
+  const [selectedRestoreVersionId, setSelectedRestoreVersionId] = useState("");
+  const [frozenVersionOptions, setFrozenVersionOptions] = useState<FrozenVersionOption[]>([]);
+  const [brandKitVersionOptions, setBrandKitVersionOptions] = useState<BrandKitVersionOption[]>([]);
+  const [conversationalPreview, setConversationalPreview] = useState<EditIntentPreview | null>(null);
+  const [confirmedEditPayload, setConfirmedEditPayload] = useState<Record<string, unknown> | null>(null);
   const inFlightRef = useRef(false);
   const copyableHtmlRef = useRef<HTMLTextAreaElement | null>(null);
   const resolvedRunIdRef = useRef<string | null>(runId ?? null);
@@ -199,7 +274,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
         const assets = await assetResponse.json() as UploadAsset[];
         setUploadAssets(assets.filter((asset) =>
           ["uploaded", "self_shot"].includes(asset.source_type)
-          && asset.usage_status === "seller_owned"
+          && ["seller_owned", "rights_confirmed"].includes(asset.usage_status)
           && (!asset.mime_type || asset.mime_type.startsWith("image/")),
         ));
       }
@@ -213,6 +288,60 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   useEffect(() => { void load(); }, [load]);
 
   useEffect(() => {
+    setConversationalPreview(null);
+    setConfirmedEditPayload(null);
+  }, [selectedEditSectionId, selectedEditElementId, selectedEditCopyField, conversationalInstruction, conversationalCopy, conversationalMode, selectedEditSceneId, selectedReplacementAssetId, selectedDesignDirection, selectedBrandKitVersionId, selectedRestoreVersionId]);
+
+  const completedDetailPageVersionId = view?.values.rendering?.detail_page_version?.id
+    || view?.values.edit?.version_restore?.detail_page_version_id;
+  useEffect(() => {
+    if (!completedDetailPageVersionId) {
+      setFrozenCanvasSections([]);
+      setSelectedEditSectionId("");
+      setSelectedEditElementId("");
+      setSelectedEditCopyField("");
+      return;
+    }
+    let active = true;
+    void fetch(
+      apiUrl(`/api/v1/projects/${projectId}/page/versions/${completedDetailPageVersionId}`),
+      { credentials: "include", cache: "no-store" },
+    ).then(async (response) => {
+      if (!response.ok) throw new Error("Frozen version을 불러오지 못했습니다.");
+      return response.json() as Promise<FrozenVersionSnapshot>;
+    }).then((snapshot) => {
+      if (!active) return;
+      const sections = snapshot.sections_json?.lg10?.canonical_page_assembly_input?.sections || [];
+      setFrozenCanvasSections(sections);
+      setSelectedEditSectionId((current) => current || sections[0]?.section_id || "");
+    }).catch((error) => {
+      if (active) setMessage(error instanceof Error ? error.message : "Frozen version을 불러오지 못했습니다.");
+    });
+    return () => { active = false; };
+  }, [completedDetailPageVersionId, projectId]);
+
+  useEffect(() => {
+    if (!completedDetailPageVersionId) return;
+    let active = true;
+    const options = { credentials: "include" as const, cache: "no-store" as const };
+    void Promise.all([
+      fetch(apiUrl(`/api/v1/projects/${projectId}/page/versions`), options),
+      fetch(apiUrl("/api/v1/brand-kits"), options),
+    ]).then(async ([versionsResponse, brandKitsResponse]) => {
+      if (!active) return;
+      if (versionsResponse.ok) setFrozenVersionOptions(await versionsResponse.json() as FrozenVersionOption[]);
+      if (brandKitsResponse.ok) {
+        const data = await brandKitsResponse.json() as { versions?: BrandKitVersionOption[] };
+        setBrandKitVersionOptions(data.versions || []);
+      }
+    }).catch(() => {
+      // These are optional selectors. The frozen version itself stays the
+      // only source of truth for every edit request.
+    });
+    return () => { active = false; };
+  }, [completedDetailPageVersionId, projectId]);
+
+  useEffect(() => {
     if (view?.current_stage !== "provider_wait") return;
     // Keep the current review card mounted during background polling.  A
     // provider wait may last several seconds; replacing the whole panel with
@@ -222,8 +351,8 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   }, [view?.current_stage, load]);
 
   const resume = async (
-    decision: "approve" | "reject" | "defer" | "refresh" | "regenerate" | "upload",
-    options: { jobId?: string; assetId?: string } = {},
+    decision: "approve" | "reject" | "defer" | "refresh" | "regenerate" | "upload" | "apply" | "undo" | "redo" | "commit",
+    options: { jobId?: string; assetId?: string; canvasOperation?: Record<string, unknown> } = {},
   ) => {
     if (!view || inFlightRef.current) return;
     const pending = view.values.review?.pending;
@@ -246,6 +375,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
               : {}),
             ...(options.jobId ? { job_id: options.jobId } : {}),
             ...(decision === "upload" ? { asset_id: options.assetId, seller_attested: true } : {}),
+            ...(options.canvasOperation ? { canvas_operation: options.canvasOperation } : {}),
           },
         }),
       });
@@ -315,7 +445,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
-        body: JSON.stringify({ final_version_id: detailPageVersionId }),
+          body: JSON.stringify({ final_version_id: detailPageVersionId, channel: previewChannel }),
       });
       const payload = await response.json().catch(() => null);
       if (!response.ok) {
@@ -348,6 +478,164 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     }
   };
 
+  const buildSelectedLg11EditPayload = (): Record<string, unknown> | null => {
+    if (!completedDetailPageVersionId || !conversationalInstruction.trim()) return null;
+    const selectedSection = frozenCanvasSections.find((section) => section.section_id === selectedEditSectionId);
+    const selectedContext = selectedEditSectionId
+      ? { selected_section_id: selectedEditSectionId, ...(selectedEditElementId ? { selected_element_id: selectedEditElementId } : {}) }
+      : {};
+    const copyField = selectedEditCopyField || selectedSection?.copy_ref?.fields?.[0] || "";
+    if (conversationalMode === "restore") {
+      if (!selectedRestoreVersionId) return null;
+      return { scope: "page", target_ids: [selectedRestoreVersionId], operation: "restore", instruction: conversationalInstruction.trim() };
+    }
+    if (conversationalMode === "style") {
+      return {
+        scope: "style", target_ids: [completedDetailPageVersionId], operation: "restyle",
+        instruction: conversationalInstruction.trim(), design_direction: selectedDesignDirection,
+        ...(selectedBrandKitVersionId ? { brand_kit_version_id: selectedBrandKitVersionId } : {}), ...selectedContext,
+      };
+    }
+    if (conversationalMode === "scene_regenerate" || conversationalMode === "asset_replace") {
+      if (!selectedEditSceneId) return null;
+      if (conversationalMode === "asset_replace" && !selectedReplacementAssetId) return null;
+      return {
+        scope: "scene", target_ids: [selectedEditSceneId], operation: conversationalMode === "scene_regenerate" ? "regenerate" : "replace",
+        instruction: conversationalInstruction.trim(), ...selectedContext,
+        ...(conversationalMode === "asset_replace" ? { replacement_asset_id: selectedReplacementAssetId, seller_attested: true } : {}),
+      };
+    }
+    if (!selectedEditSectionId) return null;
+    if (conversationalMode === "fact") {
+      const factId = selectedSection?.copy_ref?.fact_ids?.[0] || "";
+      if (!factId) return null;
+      return { scope: "fact", target_ids: [factId], operation: "rewrite", instruction: conversationalInstruction.trim(), ...selectedContext };
+    }
+    if (conversationalMode === "copy") {
+      if (!conversationalCopy.trim() || !copyField) return null;
+      return {
+        scope: "copy", target_ids: [selectedEditSectionId], operation: "rewrite", instruction: conversationalInstruction.trim(),
+        copy_changes: { [selectedEditSectionId]: { [copyField]: conversationalCopy.trim() } }, ...selectedContext,
+      };
+    }
+    return {
+      scope: "page", target_ids: [completedDetailPageVersionId], operation: "canvas_draft",
+      instruction: conversationalInstruction.trim(), ...selectedContext,
+    };
+  };
+
+  const previewSelectedLg11Edit = async () => {
+    const payload = buildSelectedLg11EditPayload();
+    if (!payload || !completedDetailPageVersionId) {
+      setMessage("선택한 대상과 편집에 필요한 값을 확인해 주세요.");
+      return;
+    }
+    const sourceVersionId = conversationalMode === "restore" ? selectedRestoreVersionId : completedDetailPageVersionId;
+    if (!sourceVersionId) return;
+    setWorking(true); setMessage(null); setConversationalPreview(null); setConfirmedEditPayload(null);
+    try {
+      const response = await fetch(
+        apiUrl(`/api/v1/projects/${projectId}/page/versions/${sourceVersionId}/edit-intents/preview`),
+        { method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include", body: JSON.stringify(payload) },
+      );
+      const result = await response.json().catch(() => null);
+      if (!response.ok || !result?.edit_intent) throw new Error(typeof result?.detail === "string" ? result.detail : "영향 미리보기를 만들지 못했습니다.");
+      setConversationalPreview(result as EditIntentPreview);
+      setConfirmedEditPayload(payload);
+    } catch (error) {
+      setMessage(error instanceof globalThis.Error ? error.message : "영향 미리보기를 만들지 못했습니다.");
+    } finally { setWorking(false); }
+  };
+
+  const startConfirmedLg11Edit = async () => {
+    if (!completedDetailPageVersionId || !confirmedEditPayload || !conversationalPreview) return;
+    const sourceVersionId = conversationalMode === "restore" ? selectedRestoreVersionId : completedDetailPageVersionId;
+    if (!sourceVersionId) return;
+    setWorking(true); setMessage(null);
+    try {
+      const response = await fetch(
+        apiUrl(`/api/v1/projects/${projectId}/page/versions/${sourceVersionId}/edit-runs`),
+        { method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include", body: JSON.stringify(confirmedEditPayload) },
+      );
+      const result = await response.json().catch(() => null);
+      if (!response.ok || !result?.run_id) throw new Error(typeof result?.detail === "string" ? result.detail : "LG-11 편집 실행을 시작하지 못했습니다.");
+      resolvedRunIdRef.current = result.run_id;
+      const url = new URL(window.location.href); url.searchParams.set("runId", result.run_id);
+      window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+      setConversationalPreview(null); setConfirmedEditPayload(null);
+      await load(false);
+    } catch (error) {
+      setMessage(error instanceof globalThis.Error ? error.message : "LG-11 편집 실행을 시작하지 못했습니다.");
+    } finally { setWorking(false); }
+  };
+
+  const startSelectedLg11Edit = async () => {
+    // Kept as the existing UI callback: it is now strictly read-only.  The
+    // graph run can only be created by the explicit confirmation control.
+    await previewSelectedLg11Edit();
+    return;
+    /*
+    if (!completedDetailPageVersionId || !selectedEditSectionId || !conversationalInstruction.trim()) {
+      setMessage("수정할 frozen 섹션과 요청 내용을 선택해 주세요.");
+      return;
+    }
+    const selectedSection = frozenCanvasSections.find((section) => section.section_id === selectedEditSectionId);
+    const copyField = selectedEditCopyField || selectedSection?.copy_ref?.fields?.[0] || "";
+    if (conversationalMode === "copy" && (!conversationalCopy.trim() || !copyField)) {
+      setMessage("카피 수정에는 새 문구가 필요합니다.");
+      return;
+    }
+    setWorking(true);
+    setMessage(null);
+    try {
+      const payload = conversationalMode === "copy"
+        ? {
+          scope: "copy",
+          target_ids: [selectedEditSectionId],
+          operation: "rewrite",
+          instruction: conversationalInstruction.trim(),
+          copy_changes: { [selectedEditSectionId]: { [copyField]: conversationalCopy.trim() } },
+          selected_section_id: selectedEditSectionId,
+          ...(selectedEditElementId ? { selected_element_id: selectedEditElementId } : {}),
+        }
+        : {
+          scope: "page",
+          target_ids: [completedDetailPageVersionId],
+          operation: "canvas_draft",
+          instruction: conversationalInstruction.trim(),
+          selected_section_id: selectedEditSectionId,
+          ...(selectedEditElementId ? { selected_element_id: selectedEditElementId } : {}),
+        };
+      const response = await fetch(
+        apiUrl(`/api/v1/projects/${projectId}/page/versions/${completedDetailPageVersionId}/edit-runs`),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify(payload),
+        },
+      );
+      const result = await response.json().catch(() => null);
+      if (!response.ok || !result?.run_id) {
+        throw new Error(typeof result?.detail === "string" ? result.detail : "LG-11 편집 실행을 시작하지 못했습니다.");
+      }
+      resolvedRunIdRef.current = result.run_id;
+      const url = new URL(window.location.href);
+      url.searchParams.set("runId", result.run_id);
+      window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+      setConversationalInstruction("");
+      setConversationalCopy("");
+      await load(false);
+    } catch (caught: unknown) {
+      const detail = String((caught as { message?: unknown } | null)?.message || "");
+      const error = new globalThis.Error(detail);
+      setMessage(error instanceof Error ? error.message : "LG-11 편집 실행을 시작하지 못했습니다.");
+    } finally {
+      setWorking(false);
+    }
+    */
+  };
+
   if (loading) return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-500">LangGraph 승인 상태를 확인하는 중...</section>;
   if (view?.status === "failed") {
     const failure = view.values.execution?.last_error;
@@ -375,7 +663,8 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   if (!view) return null;
   if (!pending) {
     const completedJobs = (view.values.generation?.jobs || []).filter((job) => job.output_asset_id);
-    const detailPageVersionId = view.values.rendering?.detail_page_version?.id;
+    const detailPageVersionId = view.values.rendering?.detail_page_version?.id
+      || view.values.edit?.version_restore?.detail_page_version_id;
     if (view.status === "completed" && (completedJobs.length > 0 || detailPageVersionId)) {
       return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-950" data-testid="lg5r-completed-gallery">
         <p className="text-xs font-bold text-emerald-700">LangGraph 상세페이지 생성 완료</p>
@@ -389,9 +678,38 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
           </figure>)}
         </div> : null}
         {detailPageVersionId ? <div className="mt-4 flex flex-wrap gap-2">
-          <a href={`/workspace/projects/${projectId}/render?version_id=${encodeURIComponent(detailPageVersionId)}`} className="inline-flex rounded-lg bg-emerald-700 px-3 py-2 text-xs font-bold text-white">완성 상세페이지 미리보기</a>
+          <label className="inline-flex items-center gap-1 rounded-lg border border-emerald-200 bg-white px-2 text-xs font-semibold text-emerald-900">채널<select data-testid="lg11-channel-preview" value={previewChannel} onChange={(event) => setPreviewChannel(event.target.value as "smartstore" | "coupang")} className="bg-transparent py-2 outline-none"><option value="smartstore">스마트스토어</option><option value="coupang">쿠팡</option></select></label>
+          <a data-testid="lg11-channel-preview-link" href={`/workspace/projects/${projectId}/render?version_id=${encodeURIComponent(detailPageVersionId)}&channel=${previewChannel}`} className="inline-flex rounded-lg bg-emerald-700 px-3 py-2 text-xs font-bold text-white">완성 상세페이지 미리보기</a>
           <button type="button" data-testid="lg10-standalone-export" onClick={() => void createStandaloneExport(detailPageVersionId)} disabled={standaloneExporting} className="rounded-lg border border-emerald-300 bg-white px-3 py-2 text-xs font-bold text-emerald-800 disabled:opacity-50">{standaloneExporting ? "HTML/ZIP 준비 중..." : "HTML/ZIP 내보내기"}</button>
           {standaloneExport ? <><button type="button" data-testid="lg10-copyable-html-copy" onClick={() => void copyLg10Html()} className="rounded-lg border border-emerald-300 bg-white px-3 py-2 text-xs font-bold text-emerald-800">쇼핑몰 HTML 코드 복사</button><a data-testid="lg10-copyable-html-download" href={apiUrl(standaloneExport.html_download_url)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-800">독립 실행 HTML 다운로드</a><a data-testid="lg10-standalone-zip-download" href={apiUrl(standaloneExport.zip_download_url)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-800">독립 실행 ZIP 다운로드</a></> : null}
+        </div> : null}
+        {detailPageVersionId ? <div className="mt-4 rounded-lg border border-emerald-200 bg-white p-3 text-xs" data-testid="lg11-selected-conversation-editor">
+          <div className="mb-2 flex flex-wrap gap-2">
+            <button type="button" data-testid="lg11-edit-preview" onClick={() => void previewSelectedLg11Edit()} disabled={working || !conversationalInstruction.trim()} className="rounded border border-emerald-300 bg-emerald-50 px-3 py-2 font-bold text-emerald-900 disabled:opacity-50">Impact preview</button>
+            {conversationalPreview ? <div data-testid="lg11-edit-impact-preview" className="basis-full rounded border border-amber-200 bg-amber-50 p-3"><p className="font-bold">Impact preview</p><p>sections: {(conversationalPreview.impact_preview.affected_artifacts?.section_ids || []).join(", ") || "none"}</p><p>scenes: {(conversationalPreview.impact_preview.affected_artifacts?.scene_ids || []).join(", ") || "none"}</p><p>assets: {(conversationalPreview.impact_preview.affected_artifacts?.assets || []).map((asset) => `${asset.asset_id}:${asset.asset_content_hash}`).join(", ") || "none"}</p><p>copy refs: {(conversationalPreview.impact_preview.affected_artifacts?.copy_artifacts || []).map((copy) => `${copy.artifact_key}:${copy.artifact_hash}`).join(", ") || "none"}</p><p>facts/evidence: {(conversationalPreview.impact_preview.affected_artifacts?.facts || []).map((fact) => `${fact.fact_id}:${(fact.evidence_ids || []).join("/")}`).join(", ") || "none"}</p><p>layout/style: {(conversationalPreview.impact_preview.affected_artifacts?.style_layout_tokens || []).map((item) => `${item.section_id}:${item.layout_token}`).join(", ") || "none"}</p><p>provider cost: {JSON.stringify(conversationalPreview.impact_preview.expected_provider_cost || {})}</p><p>Brand Kit: {JSON.stringify(conversationalPreview.impact_preview.affected_artifacts?.brand_kit || {})}</p><p>evidence review: {String(Boolean(conversationalPreview.impact_preview.requires_evidence_review))}</p><p>execution blocked: {String(Boolean(conversationalPreview.impact_preview.execution_blocked))}</p><button type="button" data-testid="lg11-edit-confirm" onClick={() => void startConfirmedLg11Edit()} disabled={working || Boolean(conversationalPreview.impact_preview.execution_blocked)} className="mt-2 rounded bg-emerald-700 px-3 py-2 font-bold text-white disabled:opacity-50">Confirm and start edit</button></div> : null}
+            <select data-testid="lg11-edit-route" value={conversationalMode} onChange={(event) => { setConversationalMode(event.target.value as typeof conversationalMode); setConversationalPreview(null); setConfirmedEditPayload(null); }} className="rounded border border-slate-300 bg-white px-2 py-1">
+              <option value="canvas">Canvas edit</option><option value="copy">Copy edit</option><option value="fact">Fact change</option><option value="style">Style / Brand Kit</option><option value="scene_regenerate">Scene regenerate</option><option value="asset_replace">Scene asset replace</option><option value="restore">Frozen restore</option>
+            </select>
+            {conversationalMode === "scene_regenerate" || conversationalMode === "asset_replace" ? <><select data-testid="lg11-edit-scene" value={selectedEditSceneId} onChange={(event) => { setSelectedEditSceneId(event.target.value); setConversationalPreview(null); setConfirmedEditPayload(null); }} className="rounded border border-slate-300 bg-white px-2 py-1"><option value="">Scene</option>{Array.from(new Set(frozenCanvasSections.flatMap((section) => (section.approved_assets || []).map((asset) => asset.scene_id || "")).filter(Boolean))).map((sceneId) => <option key={sceneId} value={sceneId}>{sceneId}</option>)}</select>{conversationalMode === "asset_replace" ? <select data-testid="lg11-edit-replacement-asset" value={selectedReplacementAssetId} onChange={(event) => { setSelectedReplacementAssetId(event.target.value); setConversationalPreview(null); setConfirmedEditPayload(null); }} className="rounded border border-slate-300 bg-white px-2 py-1"><option value="">Rights-approved asset</option>{uploadAssets.map((asset) => <option key={asset.id} value={asset.id}>{asset.filename}</option>)}</select> : null}</> : null}
+            {conversationalMode === "style" ? <><select data-testid="lg11-edit-direction" value={selectedDesignDirection} onChange={(event) => { setSelectedDesignDirection(event.target.value); setConversationalPreview(null); setConfirmedEditPayload(null); }} className="rounded border border-slate-300 bg-white px-2 py-1"><option value="safe_information">safe_information</option><option value="image_centric">image_centric</option><option value="balanced_sale">balanced_sale</option></select><select data-testid="lg11-edit-brand-kit" value={selectedBrandKitVersionId} onChange={(event) => { setSelectedBrandKitVersionId(event.target.value); setConversationalPreview(null); setConfirmedEditPayload(null); }} className="rounded border border-slate-300 bg-white px-2 py-1"><option value="">Current Brand Kit</option>{brandKitVersionOptions.map((kit) => <option key={kit.id} value={kit.id}>Brand Kit v{kit.version || ""}</option>)}</select></> : null}
+            {conversationalMode === "restore" ? <select data-testid="lg11-restore-version" value={selectedRestoreVersionId} onChange={(event) => { setSelectedRestoreVersionId(event.target.value); setConversationalPreview(null); setConfirmedEditPayload(null); }} className="rounded border border-slate-300 bg-white px-2 py-1"><option value="">Frozen version to restore</option>{frozenVersionOptions.filter((version) => version.id !== detailPageVersionId && version.lg11_frozen).map((version) => <option key={version.id} value={version.id}>{version.name || version.id}</option>)}</select> : null}
+          </div>
+          <p className="font-bold text-emerald-900">선택 요소 기반 편집</p>
+          <p className="mt-1 text-slate-600">현재 frozen version의 선택 대상만 LG-11 확인 흐름으로 전달합니다.</p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <select data-testid="lg11-edit-section" value={selectedEditSectionId} onChange={(event) => { const nextSectionId = event.target.value; const nextSection = frozenCanvasSections.find((section) => section.section_id === nextSectionId); setSelectedEditSectionId(nextSectionId); setSelectedEditElementId(""); setSelectedEditCopyField(nextSection?.copy_ref?.fields?.[0] || ""); setConversationalPreview(null); setConfirmedEditPayload(null); }} className="rounded border border-slate-300 bg-white px-2 py-1">
+              <option value="">섹션 선택</option>
+              {frozenCanvasSections.map((section) => <option key={section.section_id} value={section.section_id}>{section.section_id}</option>)}
+            </select>
+            <select data-testid="lg11-edit-element" value={selectedEditElementId} onChange={(event) => { setSelectedEditElementId(event.target.value); setConversationalPreview(null); setConfirmedEditPayload(null); }} className="rounded border border-slate-300 bg-white px-2 py-1">
+              <option value="">섹션 전체</option>
+              {(frozenCanvasSections.find((section) => section.section_id === selectedEditSectionId)?.canvas_elements || []).map((element) => <option key={element.element_id} value={element.element_id}>{element.kind} · {element.element_id}</option>)}
+            </select>
+            <select data-testid="lg11-edit-mode" value={conversationalMode} onChange={(event) => { setConversationalMode(event.target.value as typeof conversationalMode); setConversationalPreview(null); setConfirmedEditPayload(null); }} className="rounded border border-slate-300 bg-white px-2 py-1"><option value="canvas">Canvas 편집</option><option value="copy">카피 수정</option><option value="fact">사실값 수정</option><option value="style">스타일·Brand Kit</option><option value="scene_regenerate">장면 재생성</option><option value="asset_replace">장면 자산 교체</option><option value="restore">frozen 버전 복원</option></select>
+          </div>
+          <textarea data-testid="lg11-edit-instruction" value={conversationalInstruction} onChange={(event) => setConversationalInstruction(event.target.value)} placeholder="예: 선택한 요소를 오른쪽으로 옮겨 주세요" className="mt-2 min-h-16 w-full rounded border border-slate-300 p-2" />
+          {conversationalMode === "copy" ? <><select data-testid="lg11-edit-copy-field" value={selectedEditCopyField || frozenCanvasSections.find((section) => section.section_id === selectedEditSectionId)?.copy_ref?.fields?.[0] || ""} onChange={(event) => setSelectedEditCopyField(event.target.value)} className="mt-2 rounded border border-slate-300 bg-white px-2 py-1"><option value="">카피 필드 선택</option>{(frozenCanvasSections.find((section) => section.section_id === selectedEditSectionId)?.copy_ref?.fields || []).map((field) => <option key={field} value={field}>{field}</option>)}</select><textarea data-testid="lg11-edit-copy" value={conversationalCopy} onChange={(event) => setConversationalCopy(event.target.value)} placeholder="새 문구" className="mt-2 min-h-16 w-full rounded border border-slate-300 p-2" /></> : null}
+          <button type="button" data-testid="lg11-edit-start" onClick={() => void startSelectedLg11Edit()} disabled={working || !selectedEditSectionId || !conversationalInstruction.trim() || (conversationalMode === "copy" && !conversationalCopy.trim())} className="mt-2 rounded border border-emerald-300 bg-emerald-50 px-3 py-2 font-bold text-emerald-900 disabled:opacity-50">영향 미리보기·확인 시작</button>
         </div> : null}
         {standaloneExport ? <details className="mt-3 rounded-lg border border-emerald-100 bg-white p-3 text-xs text-slate-700"><summary className="cursor-pointer font-bold text-emerald-800">복사할 쇼핑몰 HTML 코드 보기</summary><textarea ref={copyableHtmlRef} data-testid="lg10-copyable-html-code" readOnly value={standaloneExport.copyable_html} className="mt-3 h-40 w-full rounded border border-slate-200 p-2 font-mono text-[10px] text-slate-700" aria-label="쇼핑몰에 붙여넣을 HTML 코드" /></details> : null}
         {message ? <p role="status" className="mt-3 text-xs font-semibold text-emerald-800">{message}</p> : null}
@@ -405,6 +723,30 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   const generationWaiting = pending.review_stage === "generation_pending";
   const providerWaiting = pending.review_stage === "provider_wait";
   const imageReview = pending.review_stage === "image_review";
+  const canvasEdit = pending.review_stage === "canvas_edit";
+  const canvasSections = view.values.canvas?.canonical_page_assembly_input?.sections || [];
+  const canvasFinalSpecIndex = canvasSections.findIndex((section) => section.section_id === "specs" || section.section_id.endsWith("_specs"));
+  const canvasAddPosition = canvasFinalSpecIndex >= 0 ? canvasFinalSpecIndex : canvasSections.length;
+  const canvasOperation = (kind: string, sectionId?: string, extra: Record<string, unknown> = {}) => ({
+    operation_id: `${kind}-${sectionId || "draft"}-${crypto.randomUUID()}`,
+    kind,
+    ...(sectionId ? { section_id: sectionId } : {}),
+    ...extra,
+  });
+  const canvasGroups = view.values.canvas?.element_groups || [];
+  const canvasReplacementAssets = Array.from(new Map<string, { id: string; filename: string; content_hash: string }>([
+    ...canvasSections.flatMap((section) => (section.canvas_elements || [])
+      .filter((element) => element.kind === "asset" && element.asset_id && element.asset_content_hash)
+      .map((element) => [element.asset_id!, { id: element.asset_id!, filename: "승인된 장면 자산", content_hash: element.asset_content_hash! }] as const)),
+    ...uploadAssets.flatMap((asset) => asset.content_hash
+      ? [[asset.id, { id: asset.id, filename: asset.filename, content_hash: asset.content_hash }] as const]
+      : []),
+  ]).values());
+  const canvasElementControls = <div className="mt-3 space-y-2 rounded border border-violet-100 bg-white p-3 text-xs" data-testid="lg11-canvas-elements">
+    <div className="flex flex-wrap items-center justify-between gap-2"><p className="font-bold">내부 요소 · 레이어</p><button type="button" data-testid="lg11-canvas-group-selected" disabled={working || selectedCanvasElements.length < 2} onClick={() => void resume("apply", { canvasOperation: canvasOperation("group", undefined, { element_ids: selectedCanvasElements }) })} className="rounded border px-2 py-1">선택 요소 그룹화</button></div>
+    {canvasSections.map((section) => <div key={`${section.section_id}-elements`} className="border-t pt-2"><p className="font-semibold">{section.section_id}</p><div className="flex gap-1"><button type="button" data-testid={`lg11-canvas-add-mask-${section.section_id}`} onClick={() => void resume("apply", { canvasOperation: canvasOperation("create_element", section.section_id, { element_kind: "mask", token: "rounded" }) })} className="rounded border px-2 py-1">마스크 추가</button><button type="button" data-testid={`lg11-canvas-add-icon-${section.section_id}`} onClick={() => void resume("apply", { canvasOperation: canvasOperation("create_element", section.section_id, { element_kind: "icon", token: "check" }) })} className="rounded border px-2 py-1">아이콘 추가</button><button type="button" data-testid={`lg11-canvas-add-decorative-${section.section_id}`} onClick={() => void resume("apply", { canvasOperation: canvasOperation("create_element", section.section_id, { element_kind: "decorative", token: "divider" }) })} className="rounded border px-2 py-1">장식 추가</button></div>{(section.canvas_elements || []).filter((element) => !element.deleted).map((element) => <div key={element.element_id} className="mt-1 flex flex-wrap items-center gap-1" data-testid={`lg11-canvas-element-${element.element_id}`}><input aria-label={`${element.element_id} 선택`} type="checkbox" checked={selectedCanvasElements.includes(element.element_id)} onChange={() => setSelectedCanvasElements((current) => current.includes(element.element_id) ? current.filter((value) => value !== element.element_id) : [...current, element.element_id])}/><span>{element.kind} · z{element.z_index}{element.locked ? " · 잠김" : ""}</span><button type="button" data-testid={`lg11-canvas-move-${element.element_id}`} disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("move_element", section.section_id, { element_id: element.element_id, dx: 10, dy: 0 }) })} className="rounded border px-2 py-1">오른쪽 이동</button><button type="button" data-testid={`lg11-canvas-resize-${element.element_id}`} disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("resize_element", section.section_id, { element_id: element.element_id, width: Math.min(760, element.width + 10), height: element.height }) })} className="rounded border px-2 py-1">너비 +10</button><button type="button" data-testid={`lg11-canvas-z-${element.element_id}`} disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("set_z_order", section.section_id, { element_id: element.element_id, z_index: Math.min(100, element.z_index + 1) }) })} className="rounded border px-2 py-1">앞으로</button><button type="button" data-testid={`lg11-canvas-lock-${element.element_id}`} disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("set_lock", section.section_id, { element_id: element.element_id, locked: !element.locked }) })} className="rounded border px-2 py-1">{element.locked ? "잠금 해제" : "잠금"}</button><button type="button" data-testid={`lg11-canvas-duplicate-${element.element_id}`} disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("duplicate_element", section.section_id, { element_id: element.element_id }) })} className="rounded border px-2 py-1">요소 복제</button><button type="button" data-testid={`lg11-canvas-delete-${element.element_id}`} disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("delete_element", section.section_id, { element_id: element.element_id }) })} className="rounded border border-rose-300 px-2 py-1">요소 삭제</button>{element.kind === "asset" ? <><select aria-label={`${element.element_id} 교체 자산`} value={canvasAssetReplacements[element.element_id] || ""} onChange={(event) => setCanvasAssetReplacements((current) => ({ ...current, [element.element_id]: event.target.value }))}><option value="">권리 보유 자산 선택</option>{canvasReplacementAssets.map((asset) => <option key={asset.id} value={asset.id}>{asset.filename}</option>)}</select><button type="button" data-testid={`lg11-canvas-replace-${element.element_id}`} disabled={working || !canvasAssetReplacements[element.element_id]} onClick={() => { const asset = canvasReplacementAssets.find((item) => item.id === canvasAssetReplacements[element.element_id]); if (asset?.content_hash) void resume("apply", { canvasOperation: canvasOperation("replace_element", section.section_id, { element_id: element.element_id, asset_id: asset.id, asset_content_hash: asset.content_hash }) }); }} className="rounded border px-2 py-1">자산 교체</button></> : null}</div>)}</div>)}
+    {canvasGroups.map((group) => <div key={group.group_id} className="flex flex-wrap items-center gap-1 border-t pt-2" data-testid={`lg11-canvas-group-${group.group_id}`}><span>그룹 {group.group_id.slice(-6)} · {group.child_element_ids.length}개{group.locked ? " · 잠김" : ""}</span><button type="button" disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("move_group", group.section_id, { group_id: group.group_id, dx: 10, dy: 0 }) })} className="rounded border px-2 py-1">그룹 이동</button><button type="button" disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("set_lock", group.section_id, { group_id: group.group_id, locked: !group.locked }) })} className="rounded border px-2 py-1">{group.locked ? "그룹 잠금 해제" : "그룹 잠금"}</button><button type="button" disabled={working || group.locked} onClick={() => void resume("apply", { canvasOperation: canvasOperation("ungroup", group.section_id, { group_id: group.group_id }) })} className="rounded border px-2 py-1">그룹 해제</button></div>)}
+  </div>;
   const jobs = view.values.generation?.jobs || [];
   const costPlan = view.values.generation?.cost_plan;
   const errorLabel = (code?: string | null) => ({
@@ -423,8 +765,10 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     {recoveryNotice ? <p role="status" className="mb-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-900">{recoveryNotice}</p> : null}
     <div className="flex flex-wrap items-start justify-between gap-3">
       <div><p className="text-xs font-bold text-violet-700">LangGraph 승인 대기 · {pending.review_stage}</p><h2 className="mt-1 font-black">{pending.title}</h2><p className="mt-1 leading-5 text-slate-700">{pending.description}</p>{pending.rejection_reason ? <p className="mt-2 text-xs text-rose-700">최근 반려 사유: {pending.rejection_reason}</p> : null}</div>
-      {generationWaiting ? <div className="flex gap-2"><button type="button" onClick={() => void resume("defer")} disabled={working} className="rounded-lg border border-violet-300 bg-white px-3 py-2 text-xs font-bold text-violet-800 disabled:opacity-50">대기 상태 저장</button><button type="button" onClick={() => void resume("approve")} disabled={working} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-50">{working ? "확인 중..." : "비용 승인 후 이미지 생성"}</button></div> : providerWaiting ? <button type="button" onClick={() => void resume("refresh")} disabled={working} className="rounded-lg border border-violet-300 bg-white px-3 py-2 text-xs font-bold text-violet-800 disabled:opacity-50">{working ? "확인 중..." : "작업 상태 새로고침"}</button> : imageReview ? <p className="rounded-lg bg-white px-3 py-2 text-xs font-bold text-violet-800">아래 장면별로 승인·거절·재생성·직접 업로드를 선택하세요.</p> : <div className="flex gap-2"><button type="button" onClick={() => void resume("reject")} disabled={working} className="rounded-lg border border-rose-300 bg-white px-3 py-2 text-xs font-bold text-rose-700 disabled:opacity-50">수정 후 재검토</button><button type="button" onClick={() => void resume("approve")} disabled={working} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-50">{working ? "승인 중..." : "확인·다음 단계"}</button></div>}
+      {generationWaiting ? <div className="flex gap-2"><button type="button" onClick={() => void resume("defer")} disabled={working} className="rounded-lg border border-violet-300 bg-white px-3 py-2 text-xs font-bold text-violet-800 disabled:opacity-50">대기 상태 저장</button><button type="button" onClick={() => void resume("approve")} disabled={working} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-50">{working ? "확인 중..." : "비용 승인 후 이미지 생성"}</button></div> : providerWaiting ? <button type="button" onClick={() => void resume("refresh")} disabled={working} className="rounded-lg border border-violet-300 bg-white px-3 py-2 text-xs font-bold text-violet-800 disabled:opacity-50">{working ? "확인 중..." : "작업 상태 새로고침"}</button> : imageReview ? <p className="rounded-lg bg-white px-3 py-2 text-xs font-bold text-violet-800">아래 장면별로 승인·거절·재생성·직접 업로드를 선택하세요.</p> : canvasEdit ? <div className="flex flex-wrap gap-2"><button type="button" onClick={() => void resume("undo", { canvasOperation: canvasOperation("undo") })} disabled={working} className="rounded-lg border px-3 py-2 text-xs font-bold">실행 취소</button><button type="button" onClick={() => void resume("redo", { canvasOperation: canvasOperation("redo") })} disabled={working} className="rounded-lg border px-3 py-2 text-xs font-bold">다시 실행</button><button type="button" onClick={() => void resume("commit", { canvasOperation: canvasOperation("commit") })} disabled={working} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white">변경 저장</button></div> : <div className="flex gap-2"><button type="button" onClick={() => void resume("reject")} disabled={working} className="rounded-lg border border-rose-300 bg-white px-3 py-2 text-xs font-bold text-rose-700 disabled:opacity-50">수정 후 재검토</button><button type="button" onClick={() => void resume("approve")} disabled={working} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-50">{working ? "승인 중..." : "확인·다음 단계"}</button></div>}
     </div>
+    {canvasEdit ? <div className="mt-4 space-y-2 rounded-lg border border-violet-100 bg-white p-3 text-xs" data-testid="lg11-canvas-draft"><p className="font-bold">섹션 구조 초안 · revision {view.values.canvas?.revision || 0}</p>{canvasSections.map((section, index) => <div key={section.section_id} className="flex flex-wrap items-center justify-between gap-2 border-t pt-2"><span>{index + 1}. {section.section_id}</span><span className="flex flex-wrap gap-1"><button type="button" disabled={working || index === 0} onClick={() => void resume("apply", { canvasOperation: canvasOperation("reorder", section.section_id, { position: index - 1 }) })} className="rounded border px-2 py-1">위로</button><button type="button" disabled={working || index === canvasSections.length - 1} onClick={() => void resume("apply", { canvasOperation: canvasOperation("reorder", section.section_id, { position: index + 1 }) })} className="rounded border px-2 py-1">아래로</button><button type="button" disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("duplicate", section.section_id, { position: index + 1 }) })} className="rounded border px-2 py-1">복제</button><button type="button" disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("set_visibility", section.section_id, { is_visible: section.canvas?.is_visible === false }) })} className="rounded border px-2 py-1">{section.canvas?.is_visible === false ? "표시" : "숨김"}</button><input aria-label={`${section.section_id} 높이`} type="number" min="160" max="2400" value={canvasHeights[section.section_id] ?? String(section.canvas?.height_px || 160)} onChange={(event) => setCanvasHeights((current) => ({ ...current, [section.section_id]: event.target.value }))} className="w-16 rounded border px-1 py-1"/><button type="button" disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("set_height", section.section_id, { height_px: Number(canvasHeights[section.section_id] ?? section.canvas?.height_px ?? 160) }) })} className="rounded border px-2 py-1">높이 적용</button><button type="button" disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("remove", section.section_id) })} className="rounded border border-rose-300 px-2 py-1 text-rose-700">삭제</button></span></div>)}<button type="button" disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("add", undefined, { position: canvasAddPosition === 0 && canvasSections.length ? canvasSections.length : canvasAddPosition }) })} className="rounded border border-violet-300 px-2 py-1 font-bold text-violet-800">섹션 추가</button></div> : null}
+    {canvasEdit ? canvasElementControls : null}
     {generationWaiting && costPlan ? <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-950" data-testid="lg5r-cost-plan">
       <p className="font-black">생성 전 비용 확인</p>
       <p className="mt-1">{costPlan.scene_count}개 장면 · {costPlan.provider} / {costPlan.model}</p>

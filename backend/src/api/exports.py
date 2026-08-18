@@ -27,6 +27,7 @@ from src.services.export_service import (
     build_lg10_copyable_html,
     build_lg10_standalone_export_bundle,
 )
+from src.services.page_visual_contract import LG11CanvasSafetyError, ensure_lg11_canvas_safe
 
 router = APIRouter(tags=["Exports"])
 logger = logging.getLogger(__name__)
@@ -75,6 +76,9 @@ class StandaloneExportRequest(BaseModel):
         None,
         description="The frozen LG-10 DetailPageVersion to package.",
     )
+    # Legacy LG-10 standalone callers retain the existing smartstore default.
+    # LG-11 checks that the field was explicitly supplied below.
+    channel: Literal["smartstore", "coupang"] = "smartstore"
 
 
 class StandaloneExportResponse(BaseModel):
@@ -125,6 +129,47 @@ def _asset_id_from_download_url(url: str) -> Optional[str]:
     if marker not in url:
         return None
     return url.rstrip("/").split(marker, 1)[1].split("?", 1)[0]
+
+
+_LG11_EXPORT_CHANNELS = frozenset({"smartstore", "coupang"})
+_LG11_CHANNEL_ARTIFACT_TYPES = frozenset({"channel_long", "channel_package"})
+_LG11_EXPORT_FORMATS = frozenset({"png", "jpg", "jpeg", "html", "zip"})
+
+
+def parse_lg11_export_artifact_token(artifact_token: str) -> Optional[Dict[str, str]]:
+    """Return the immutable LG-11 artifact identity encoded in an artifact token.
+
+    LG-11 artifacts encode the channel before the file format.  Keeping the
+    parser here makes download-time validation use the same channel identity
+    regardless of whether the artifact is a long image or a package.
+    """
+    parts = artifact_token.split(":")
+    if len(parts) == 3 and parts[0] in _LG11_CHANNEL_ARTIFACT_TYPES:
+        artifact_type, channel, output_format = parts
+        if channel in _LG11_EXPORT_CHANNELS and output_format in _LG11_EXPORT_FORMATS:
+            return {
+                "artifact_type": artifact_type,
+                "channel": channel,
+                "format": output_format,
+            }
+        return None
+
+    # LG-11 standalone artifacts use the established LG-10 artifact names
+    # with a channel suffix.  Preserve legacy unsuffixed names by declining to
+    # parse them here; this parser is only used for LG-11 frozen versions.
+    if len(parts) == 2 and parts[0] == _LG10_COPYABLE_HTML_ARTIFACT and parts[1] in _LG11_EXPORT_CHANNELS:
+        return {
+            "artifact_type": parts[0],
+            "channel": parts[1],
+            "format": "html",
+        }
+    if len(parts) == 2 and parts[0] == _LG10_STANDALONE_PACKAGE_ARTIFACT and parts[1] in _LG11_EXPORT_CHANNELS:
+        return {
+            "artifact_type": parts[0],
+            "channel": parts[1],
+            "format": "zip",
+        }
+    return None
 
 
 def _exported_image_asset_for_job(db: Session, job: ExportJob) -> Optional[Asset]:
@@ -237,6 +282,7 @@ def run_export_task(
         export_res = capture_next_render_export(
             project_id=project_id,
             version_id=version.id,
+            channel=preset_name,
             output_format=output_format,
             auth_headers={"Cookie": f"{settings.SELLFORM_SESSION_COOKIE_NAME}={render_token}"},
         )
@@ -419,6 +465,12 @@ def request_page_export(
     is_lg10_version = version_snapshot.get("schema_version") == "lg10-detail-page-version-v1"
     page = None if is_lg10_version else get_page_or_404(db, project_id, workspace.id)
 
+    if is_lg10_version and final_version:
+        try:
+            ensure_lg11_canvas_safe(version_snapshot=version_snapshot, channel=req.preset_name)
+        except LG11CanvasSafetyError as exc:
+            raise HTTPException(status_code=409, detail={"message": str(exc), "canvas_safety": exc.result}) from exc
+
     # 0. Readiness check (visual contract, edit markers, etc.)
     if not is_lg10_version:
         readiness = inspect_page_readiness(page, db)
@@ -544,6 +596,13 @@ def create_lg10_standalone_export(
     if snapshot.get("schema_version") != "lg10-detail-page-version-v1":
         raise HTTPException(status_code=409, detail="Standalone export is available only for frozen LG-10 DetailPageVersion snapshots.")
 
+    if isinstance(snapshot.get("lg11"), dict) and "channel" not in req.model_fields_set:
+        raise HTTPException(status_code=409, detail="LG-11 standalone export requires an explicit channel identity.")
+    try:
+        ensure_lg11_canvas_safe(version_snapshot=snapshot, channel=req.channel)
+    except LG11CanvasSafetyError as exc:
+        raise HTTPException(status_code=409, detail={"message": str(exc), "canvas_safety": exc.result}) from exc
+
     def _artifact_asset(artifact_type: str) -> tuple[ExportArtifact | None, Asset | None]:
         artifact = (
             db.query(ExportArtifact)
@@ -563,19 +622,32 @@ def create_lg10_standalone_export(
             db=db,
             project_id=project_id,
             version=version,
+            channel=req.channel,
         )
     except FrozenExportSnapshotError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    html_artifact, html_asset = _artifact_asset(_LG10_COPYABLE_HTML_ARTIFACT)
-    zip_artifact, zip_asset = _artifact_asset(_LG10_STANDALONE_PACKAGE_ARTIFACT)
+    is_lg11_snapshot = isinstance(snapshot.get("lg11"), dict)
+    # Only LG-11 artifacts carry channel identity.  Preserve the established
+    # LG-10 history keys rather than rewriting legacy export history.
+    html_artifact_type = (
+        f"{_LG10_COPYABLE_HTML_ARTIFACT}:{req.channel}"
+        if is_lg11_snapshot else _LG10_COPYABLE_HTML_ARTIFACT
+    )
+    zip_artifact_type = (
+        f"{_LG10_STANDALONE_PACKAGE_ARTIFACT}:{req.channel}"
+        if is_lg11_snapshot else _LG10_STANDALONE_PACKAGE_ARTIFACT
+    )
+    html_artifact, html_asset = _artifact_asset(html_artifact_type)
+    zip_artifact, zip_asset = _artifact_asset(zip_artifact_type)
     warnings: list[str] = list(copyable["warnings"])
     if not html_asset or not zip_asset:
         try:
             bundle = build_lg10_standalone_export_bundle(
-                db=db,
-                project_id=project_id,
-                version=version,
+            db=db,
+            project_id=project_id,
+            version=version,
+            channel=req.channel,
             )
         except FrozenExportSnapshotError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -605,9 +677,9 @@ def create_lg10_standalone_export(
             path=bundle["zip_path"], source_type="exported_standalone_zip", mime_type="application/zip"
         )
         if not html_artifact:
-            db.add(ExportArtifact(project_id=project_id, version_id=version.id, artifact_type=_LG10_COPYABLE_HTML_ARTIFACT, file_path=bundle["html_path"]))
+            db.add(ExportArtifact(project_id=project_id, version_id=version.id, artifact_type=html_artifact_type, file_path=bundle["html_path"]))
         if not zip_artifact:
-            db.add(ExportArtifact(project_id=project_id, version_id=version.id, artifact_type=_LG10_STANDALONE_PACKAGE_ARTIFACT, file_path=bundle["zip_path"]))
+            db.add(ExportArtifact(project_id=project_id, version_id=version.id, artifact_type=zip_artifact_type, file_path=bundle["zip_path"]))
         db.commit()
 
     html_url = f"/api/v1/projects/{project_id}/page/export/download/{html_asset.id}"
@@ -616,7 +688,7 @@ def create_lg10_standalone_export(
     # without changing the legacy image-export data model.
     db.add(ExportJob(
         project_id=project_id,
-        preset_name="lg10_standalone",
+        preset_name=f"lg10_standalone:{req.channel}" if is_lg11_snapshot else "lg10_standalone",
         status="completed",
         created_by=user.id,
         zip_asset_id=zip_asset.id,
@@ -696,6 +768,42 @@ def download_export_file(
 
     if not os.path.exists(asset.file_path):
         raise HTTPException(status_code=404, detail="File has been deleted or not ready on disk")
+
+    artifact = db.query(ExportArtifact).filter_by(project_id=project_id, file_path=asset.file_path).order_by(ExportArtifact.created_at.desc()).first()
+    if artifact and artifact.version_id:
+        version = db.query(DetailPageVersion).filter_by(id=artifact.version_id, project_id=project_id).first()
+        if (
+            version
+            and isinstance(version.sections_json, dict)
+            and isinstance(version.sections_json.get("lg11"), dict)
+        ):
+            try:
+                artifact_identity = parse_lg11_export_artifact_token(str(artifact.artifact_type or ""))
+                if artifact_identity is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={
+                            "message": "Frozen LG-11 export artifact has an invalid channel identity.",
+                            "canvas_safety": {
+                                "schema_version": "lg11-canvas-safety-v1",
+                                "checked": True,
+                                "safe": False,
+                                "channel": None,
+                                "issues": [{
+                                    "code": "invalid_export_artifact_channel",
+                                    "reason": "The frozen export artifact token does not contain a valid channel and format.",
+                                    "section_id": None,
+                                    "element_id": None,
+                                }],
+                            },
+                        },
+                    )
+                ensure_lg11_canvas_safe(
+                    version_snapshot=version.sections_json,
+                    channel=artifact_identity["channel"],
+                )
+            except LG11CanvasSafetyError as exc:
+                raise HTTPException(status_code=409, detail={"message": str(exc), "canvas_safety": exc.result}) from exc
 
     from urllib.parse import quote
     encoded_filename = quote(asset.filename)
