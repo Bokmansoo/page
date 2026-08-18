@@ -215,6 +215,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   const [brandKitVersionOptions, setBrandKitVersionOptions] = useState<BrandKitVersionOption[]>([]);
   const [conversationalPreview, setConversationalPreview] = useState<EditIntentPreview | null>(null);
   const [confirmedEditPayload, setConfirmedEditPayload] = useState<Record<string, unknown> | null>(null);
+  const [autoRefreshingGeneration, setAutoRefreshingGeneration] = useState(false);
   const inFlightRef = useRef(false);
   const copyableHtmlRef = useRef<HTMLTextAreaElement | null>(null);
   const resolvedRunIdRef = useRef<string | null>(runId ?? null);
@@ -342,13 +343,24 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   }, [completedDetailPageVersionId, projectId]);
 
   useEffect(() => {
-    if (view?.current_stage !== "provider_wait") return;
-    // Keep the current review card mounted during background polling.  A
-    // provider wait may last several seconds; replacing the whole panel with
-    // a loading placeholder on every poll makes images appear to vanish.
+    const stage = view?.current_stage;
+    const isWorkerWait = stage === "provider_wait";
+    // `generation_pending` normally waits for a seller's cost approval. It
+    // becomes safe to poll only after this panel has submitted that approval:
+    // some workers persist the queued state before publishing provider_wait.
+    const isQueuedAfterApproval = stage === "generation_pending" && autoRefreshingGeneration;
+    if (!isWorkerWait && !isQueuedAfterApproval) {
+      if (autoRefreshingGeneration && stage !== "generation_pending") {
+        setAutoRefreshingGeneration(false);
+      }
+      return;
+    }
+    // Keep the current review card mounted during background polling. A
+    // queued/provider wait may last several seconds; replacing the whole
+    // panel with a loading placeholder on every poll makes images vanish.
     const timer = window.setInterval(() => { void load(false); }, 1500);
     return () => window.clearInterval(timer);
-  }, [view?.current_stage, load]);
+  }, [view?.current_stage, autoRefreshingGeneration, load]);
 
   const resume = async (
     decision: "approve" | "reject" | "defer" | "refresh" | "regenerate" | "upload" | "apply" | "undo" | "redo" | "commit",
@@ -357,8 +369,10 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     if (!view || inFlightRef.current) return;
     const pending = view.values.review?.pending;
     if (!pending) return;
+    const startsImageGeneration = decision === "approve" && pending.review_stage === "generation_pending";
     inFlightRef.current = true;
     setWorking(true); setMessage(null);
+    if (startsImageGeneration) setAutoRefreshingGeneration(true);
     try {
       const response = await fetch(apiUrl(`/api/v1/graph-runs/${view.run_id}/resume`), {
         method: "POST",
@@ -381,6 +395,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
       });
       const payload = await response.json().catch(() => null);
       if (!response.ok) {
+        if (startsImageGeneration) setAutoRefreshingGeneration(false);
         const errorMessage = typeof payload?.detail === "string" ? payload.detail : "승인 요청을 처리하지 못했습니다.";
         await load();
         setMessage(errorMessage);
@@ -400,6 +415,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
       if (payload.current_stage === "planning_review") window.setTimeout(() => window.location.reload(), 150);
       if (["completed", "cancelled"].includes(payload.status)) window.setTimeout(() => window.location.reload(), 150);
     } catch (error) {
+      if (startsImageGeneration) setAutoRefreshingGeneration(false);
       await load();
       setMessage(error instanceof Error ? error.message : "승인 요청을 처리하지 못했습니다.");
     } finally {

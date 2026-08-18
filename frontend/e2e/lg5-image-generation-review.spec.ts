@@ -58,6 +58,8 @@ const reviewJobs = [
 
 test("LG-9 fake provider restores cost, worker wait and per-scene review across refresh without duplicate requests", async ({ page }) => {
   let state: Record<string, unknown> = view("generation_pending");
+  let costApprovalSubmitted = false;
+  let queuedGetCount = 0;
   let providerGetCount = 0;
   let assetRole = "unknown";
   const classificationBodies: Array<Record<string, unknown>> = [];
@@ -100,8 +102,15 @@ test("LG-9 fake provider restores cost, worker wait and per-scene review across 
         completed.values.review.pending = null as never;
         state = completed;
       } else if (response.decision === "approve") {
-        state = view("provider_wait");
+        // The approval response can arrive before the worker publishes its
+        // provider-wait checkpoint. The panel must continue polling this
+        // queued state without requiring a browser refresh.
+        costApprovalSubmitted = true;
+        state = view("generation_pending");
       }
+    } else if (costApprovalSubmitted && (state as { current_stage?: string }).current_stage === "generation_pending") {
+      queuedGetCount += 1;
+      if (queuedGetCount >= 2) state = view("provider_wait");
     } else if ((state as { current_stage?: string }).current_stage === "provider_wait") {
       providerGetCount += 1;
       if (providerGetCount >= 2) state = view("image_review", reviewJobs);
