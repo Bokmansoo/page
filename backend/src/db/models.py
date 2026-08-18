@@ -10,6 +10,8 @@ from sqlalchemy import (
     JSON,
     Float,
     Boolean,
+    DDL,
+    event,
     Index,
     UniqueConstraint,
     text,
@@ -769,6 +771,141 @@ class SellerCreativeDirectionVersion(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
 
 
+class ProductSourceSnapshotVersion(Base):
+    """Immutable, captured product-source identity for LG-12I intake."""
+
+    __tablename__ = "product_source_snapshot_versions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "version", name="uq_product_source_snapshot_project_version"),
+        UniqueConstraint("project_id", "canonical_hash", name="uq_product_source_snapshot_project_hash"),
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    workspace_id = Column(String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    creator_run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="RESTRICT"), nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    schema_version = Column(String(80), nullable=False)
+    input_mode = Column(String(40), nullable=False)
+    parent_version_id = Column(String(36), ForeignKey("product_source_snapshot_versions.id", ondelete="RESTRICT"), nullable=True)
+    parent_version = Column(Integer, nullable=True)
+    parent_version_hash = Column(String(64), nullable=True)
+    source_refs_json = Column(JSON, nullable=False, default=list)
+    provenance_json = Column(JSON, nullable=False, default=dict)
+    rights_json = Column(JSON, nullable=False, default=dict)
+    source_fidelity_json = Column(JSON, nullable=False, default=dict)
+    canonical_hash = Column(String(64), nullable=False, index=True)
+    created_by = Column(String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+
+class ProductTruthVersion(Base):
+    """Immutable normalized truth/provenance version derived from a source snapshot."""
+
+    __tablename__ = "product_truth_versions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "version", name="uq_product_truth_project_version"),
+        UniqueConstraint("project_id", "canonical_hash", name="uq_product_truth_project_hash"),
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    workspace_id = Column(String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    creator_run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="RESTRICT"), nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    schema_version = Column(String(80), nullable=False)
+    source_snapshot_version_id = Column(String(36), ForeignKey("product_source_snapshot_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    source_snapshot_version = Column(Integer, nullable=False)
+    source_snapshot_hash = Column(String(64), nullable=False)
+    parent_version_id = Column(String(36), ForeignKey("product_truth_versions.id", ondelete="RESTRICT"), nullable=True)
+    parent_version = Column(Integer, nullable=True)
+    parent_version_hash = Column(String(64), nullable=True)
+    fact_refs_json = Column(JSON, nullable=False, default=list)
+    evidence_refs_json = Column(JSON, nullable=False, default=list)
+    unknown_refs_json = Column(JSON, nullable=False, default=list)
+    conflict_refs_json = Column(JSON, nullable=False, default=list)
+    prohibited_inference_refs_json = Column(JSON, nullable=False, default=list)
+    canonical_hash = Column(String(64), nullable=False, index=True)
+    created_by = Column(String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+
+class SellerConfirmationVersion(Base):
+    """Immutable seller confirmation and rights decision over a truth version."""
+
+    __tablename__ = "seller_confirmation_versions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "version", name="uq_seller_confirmation_project_version"),
+        UniqueConstraint("project_id", "canonical_hash", name="uq_seller_confirmation_project_hash"),
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    workspace_id = Column(String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    creator_run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="RESTRICT"), nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    schema_version = Column(String(80), nullable=False)
+    truth_version_id = Column(String(36), ForeignKey("product_truth_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    truth_version = Column(Integer, nullable=False)
+    truth_version_hash = Column(String(64), nullable=False)
+    parent_version_id = Column(String(36), ForeignKey("seller_confirmation_versions.id", ondelete="RESTRICT"), nullable=True)
+    parent_version = Column(Integer, nullable=True)
+    parent_version_hash = Column(String(64), nullable=True)
+    answers_json = Column(JSON, nullable=False, default=list)
+    confirmed_fact_refs_json = Column(JSON, nullable=False, default=list)
+    rejected_fact_refs_json = Column(JSON, nullable=False, default=list)
+    unknown_fact_refs_json = Column(JSON, nullable=False, default=list)
+    rights_confirmations_json = Column(JSON, nullable=False, default=list)
+    canonical_hash = Column(String(64), nullable=False, index=True)
+    created_by = Column(String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+
+class CommerceCreativeMasterVersion(Base):
+    """Immutable reference index; it intentionally never copies large artifact bodies."""
+
+    __tablename__ = "commerce_creative_master_versions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "version", name="uq_commerce_creative_master_project_version"),
+        UniqueConstraint("project_id", "canonical_hash", name="uq_commerce_creative_master_project_hash"),
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    workspace_id = Column(String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    creator_run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="RESTRICT"), nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    schema_version = Column(String(80), nullable=False)
+    parent_version_id = Column(String(36), ForeignKey("commerce_creative_master_versions.id", ondelete="RESTRICT"), nullable=True)
+    parent_version = Column(Integer, nullable=True)
+    parent_version_hash = Column(String(64), nullable=True)
+    source_snapshot_version_id = Column(String(36), ForeignKey("product_source_snapshot_versions.id", ondelete="RESTRICT"), nullable=False)
+    source_snapshot_version = Column(Integer, nullable=False)
+    source_snapshot_hash = Column(String(64), nullable=False)
+    truth_version_id = Column(String(36), ForeignKey("product_truth_versions.id", ondelete="RESTRICT"), nullable=False)
+    truth_version = Column(Integer, nullable=False)
+    truth_version_hash = Column(String(64), nullable=False)
+    confirmation_version_id = Column(String(36), ForeignKey("seller_confirmation_versions.id", ondelete="RESTRICT"), nullable=False)
+    confirmation_version = Column(Integer, nullable=False)
+    confirmation_version_hash = Column(String(64), nullable=False)
+    creative_brief_version_id = Column(String(36), ForeignKey("product_creative_brief_versions.id", ondelete="RESTRICT"), nullable=False)
+    creative_brief_version = Column(Integer, nullable=False)
+    creative_brief_hash = Column(String(64), nullable=False)
+    brand_kit_version_id = Column(String(36), ForeignKey("brand_kit_versions.id", ondelete="RESTRICT"), nullable=False)
+    brand_kit_version = Column(Integer, nullable=False)
+    brand_kit_hash = Column(String(64), nullable=False)
+    evidence_artifact_refs_json = Column(JSON, nullable=False, default=list)
+    approved_fact_snapshot_ref_json = Column(JSON, nullable=False, default=dict)
+    approved_asset_manifest_ref_json = Column(JSON, nullable=False, default=dict)
+    copy_artifact_ref_json = Column(JSON, nullable=False, default=dict)
+    page_plan_artifact_ref_json = Column(JSON, nullable=False, default=dict)
+    target_channels = Column(JSON, nullable=False, default=list)
+    downstream_output_refs_json = Column(JSON, nullable=False, default=list)
+    canonical_hash = Column(String(64), nullable=False, index=True)
+    created_by = Column(String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+
 class ProductCreativeBriefVersion(Base):
     """Immutable compiler result consumed by every downstream planning node."""
 
@@ -1303,4 +1440,40 @@ class AgentRunStep(Base):
     error_message = Column(Text, nullable=True)
 
     run = relationship("AgentRun", back_populates="steps")
+
+
+_LG12I_IMMUTABLE_VERSION_MODELS = (
+    ProductSourceSnapshotVersion,
+    ProductTruthVersion,
+    SellerConfirmationVersion,
+    CommerceCreativeMasterVersion,
+)
+
+
+def _reject_lg12i_version_mutation(_mapper, _connection, _target) -> None:
+    raise ValueError("LG-12I intake and Commerce Creative Master versions are immutable.")
+
+
+for _lg12i_model in _LG12I_IMMUTABLE_VERSION_MODELS:
+    event.listen(_lg12i_model, "before_update", _reject_lg12i_version_mutation)
+    event.listen(_lg12i_model, "before_delete", _reject_lg12i_version_mutation)
+
+    # PostgreSQL is protected by the checked-in migration trigger. The SQLite
+    # mirror keeps local/test databases equally immutable and lets Core/SQL
+    # paths exercise the same durable contract instead of relying on mapper
+    # events alone.
+    for _operation in ("UPDATE", "DELETE"):
+        event.listen(
+            _lg12i_model.__table__,
+            "after_create",
+            DDL(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS trg_{_lg12i_model.__tablename__}_{_operation.lower()}_immutable
+                BEFORE {_operation} ON {_lg12i_model.__tablename__}
+                BEGIN
+                    SELECT RAISE(ABORT, 'LG12I_IMMUTABLE_VERSION: {_lg12i_model.__tablename__} is immutable');
+                END
+                """
+            ).execute_if(dialect="sqlite"),
+        )
 
