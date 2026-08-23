@@ -825,6 +825,9 @@ class ProductTruthVersion(Base):
     unknown_refs_json = Column(JSON, nullable=False, default=list)
     conflict_refs_json = Column(JSON, nullable=False, default=list)
     prohibited_inference_refs_json = Column(JSON, nullable=False, default=list)
+    # Bounded normalized candidates/provenance only.  It intentionally never
+    # stores source bodies, OCR documents, or image bytes.
+    normalization_json = Column(JSON, nullable=False, default=dict)
     canonical_hash = Column(String(64), nullable=False, index=True)
     created_by = Column(String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
     created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
@@ -837,6 +840,14 @@ class SellerConfirmationVersion(Base):
     __table_args__ = (
         UniqueConstraint("project_id", "version", name="uq_seller_confirmation_project_version"),
         UniqueConstraint("project_id", "canonical_hash", name="uq_seller_confirmation_project_hash"),
+        # A single intake run may persist each immutable confirmation cycle
+        # only once.  The service additionally locks the project/run scope so
+        # the unique constraint is a durable race backstop, not the sole
+        # lineage policy.
+        UniqueConstraint(
+            "creator_run_id", "truth_version_id", "confirmation_cycle",
+            name="uq_seller_confirmation_run_truth_cycle",
+        ),
     )
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
@@ -852,12 +863,25 @@ class SellerConfirmationVersion(Base):
     parent_version = Column(Integer, nullable=True)
     parent_version_hash = Column(String(64), nullable=True)
     answers_json = Column(JSON, nullable=False, default=list)
+    # A confirmation cycle pins the deterministic clarification set that was
+    # presented to the seller.  It stores only bounded question/answer
+    # identities; source bodies stay in the source artifacts.
+    confirmation_cycle = Column(Integer, nullable=False, default=1)
+    clarification_refs_json = Column(JSON, nullable=False, default=list)
+    unresolved_refs_json = Column(JSON, nullable=False, default=list)
+    # The frozen seller-confirmation request and its submitted answer bundle
+    # allow a lost public resume response to be replayed without reapplying a
+    # later confirmation cycle.  They are immutable row content, not mutable
+    # request-session state.
+    resume_request_hash = Column(String(64), nullable=True, index=True)
+    resume_answer_bundle_hash = Column(String(64), nullable=True)
     confirmed_fact_refs_json = Column(JSON, nullable=False, default=list)
     rejected_fact_refs_json = Column(JSON, nullable=False, default=list)
     unknown_fact_refs_json = Column(JSON, nullable=False, default=list)
     rights_confirmations_json = Column(JSON, nullable=False, default=list)
     canonical_hash = Column(String(64), nullable=False, index=True)
     created_by = Column(String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    confirmed_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
     created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
 
 
@@ -906,6 +930,114 @@ class CommerceCreativeMasterVersion(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
 
 
+class QualityThresholdProfileVersion(Base):
+    """Immutable, project-scoped threshold contract for frozen DetailPage QA."""
+
+    __tablename__ = "quality_threshold_profile_versions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "canonical_hash", name="uq_quality_threshold_profile_project_hash"),
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    workspace_id = Column(String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    schema_version = Column(String(80), nullable=False)
+    parent_profile_id = Column(String(36), ForeignKey("quality_threshold_profile_versions.id", ondelete="RESTRICT"), nullable=True)
+    parent_profile_version = Column(Integer, nullable=True)
+    parent_profile_hash = Column(String(64), nullable=True)
+    applicable_artifact_type = Column(String(80), nullable=False)
+    applicable_channels_json = Column(JSON, nullable=False, default=list)
+    thresholds_json = Column(JSON, nullable=False, default=dict)
+    status = Column(String(40), nullable=False)
+    effective_from = Column(String(80), nullable=False)
+    canonical_hash = Column(String(64), nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+    def payload(self) -> dict:
+        payload = {
+            "profile_id": self.id, "profile_version": self.version, "schema_version": self.schema_version,
+            "applicable_artifact_type": self.applicable_artifact_type,
+            "applicable_channels": self.applicable_channels_json,
+            **dict(self.thresholds_json or {}), "status": self.status, "effective_from": self.effective_from,
+            "canonical_hash": self.canonical_hash,
+        }
+        if self.parent_profile_id:
+            payload["parent_profile_ref"] = {
+                "id": self.parent_profile_id, "version": self.parent_profile_version, "hash": self.parent_profile_hash,
+            }
+        return payload
+
+
+class QualityAssessmentReportVersion(Base):
+    """Immutable reference-only quality result over a frozen DetailPageVersion."""
+
+    __tablename__ = "quality_assessment_report_versions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "canonical_hash", name="uq_quality_assessment_report_project_hash"),
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    workspace_id = Column(String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    creator_run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="RESTRICT"), nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    schema_version = Column(String(80), nullable=False)
+    evaluator_bundle_version = Column(String(100), nullable=False)
+    target_detail_page_version_id = Column(String(36), ForeignKey("detail_page_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    target_artifact_version = Column(String(80), nullable=False)
+    target_artifact_hash = Column(String(64), nullable=False)
+    approved_asset_manifest_hash = Column(String(64), nullable=False)
+    target_channels_json = Column(JSON, nullable=False, default=list)
+    threshold_profile_id = Column(String(36), ForeignKey("quality_threshold_profile_versions.id", ondelete="RESTRICT"), nullable=False)
+    threshold_profile_version = Column(Integer, nullable=False)
+    threshold_profile_hash = Column(String(64), nullable=False)
+    report_json = Column(JSON, nullable=False, default=dict)
+    canonical_hash = Column(String(64), nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+
+class QualityPromotionVersion(Base):
+    """Immutable final-promotion authority for one LG-12 frozen page.
+
+    The Quality Bar remains a deterministic projection of the immutable QA
+    report.  This row pins that projection at the precise point a seller is
+    allowed to use final/export surfaces, so a later child page cannot inherit
+    an old PASS by accident.
+    """
+
+    __tablename__ = "quality_promotion_versions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "canonical_hash", name="uq_quality_promotion_project_hash"),
+        UniqueConstraint(
+            "project_id", "detail_page_version_id", "quality_bar_hash",
+            name="uq_quality_promotion_page_bar",
+        ),
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    workspace_id = Column(String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    creator_run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="RESTRICT"), nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    schema_version = Column(String(80), nullable=False)
+    detail_page_version_id = Column(String(36), ForeignKey("detail_page_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    detail_page_schema_version = Column(String(80), nullable=False)
+    detail_page_hash = Column(String(64), nullable=False)
+    quality_report_id = Column(String(36), ForeignKey("quality_assessment_report_versions.id", ondelete="RESTRICT"), nullable=False)
+    quality_report_version = Column(Integer, nullable=False)
+    quality_report_hash = Column(String(64), nullable=False)
+    quality_bar_result_id = Column(String(160), nullable=False)
+    quality_bar_hash = Column(String(64), nullable=False)
+    master_ref_json = Column(JSON, nullable=False, default=dict)
+    page_plan_ref_json = Column(JSON, nullable=False, default=dict)
+    brand_kit_ref_json = Column(JSON, nullable=False, default=dict)
+    target_channels_json = Column(JSON, nullable=False, default=list)
+    canonical_hash = Column(String(64), nullable=False, index=True)
+    created_by = Column(String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+
 class ProductCreativeBriefVersion(Base):
     """Immutable compiler result consumed by every downstream planning node."""
 
@@ -921,11 +1053,11 @@ class ProductCreativeBriefVersion(Base):
     run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False, index=True)
     version = Column(Integer, nullable=False)
     previous_version_id = Column(String(36), ForeignKey("product_creative_brief_versions.id"), nullable=True)
-    fact_snapshot_id = Column(String(36), ForeignKey("fact_snapshots.id"), nullable=False)
-    fact_snapshot_hash = Column(String(64), nullable=False)
-    compiled_prompt_artifact_id = Column(String(36), ForeignKey("compiled_prompt_artifacts.id"), nullable=False)
-    category_pack_version_id = Column(String(36), ForeignKey("prompt_pack_versions.id"), nullable=False)
-    channel_pack_version_id = Column(String(36), ForeignKey("prompt_pack_versions.id"), nullable=False)
+    fact_snapshot_id = Column(String(36), ForeignKey("fact_snapshots.id"), nullable=True)
+    fact_snapshot_hash = Column(String(64), nullable=True)
+    compiled_prompt_artifact_id = Column(String(36), ForeignKey("compiled_prompt_artifacts.id"), nullable=True)
+    category_pack_version_id = Column(String(36), ForeignKey("prompt_pack_versions.id"), nullable=True)
+    channel_pack_version_id = Column(String(36), ForeignKey("prompt_pack_versions.id"), nullable=True)
     brand_kit_version_id = Column(String(36), ForeignKey("brand_kit_versions.id"), nullable=True)
     brand_kit_hash = Column(String(64), nullable=True)
     creative_direction_version_id = Column(String(36), ForeignKey("seller_creative_direction_versions.id"), nullable=True)
@@ -936,6 +1068,24 @@ class ProductCreativeBriefVersion(Base):
     input_hash = Column(String(64), nullable=False, index=True)
     output_hash = Column(String(64), nullable=False, index=True)
     brief_json = Column(JSON, nullable=False, default=dict)
+    # LG-12I uses the established Creative Brief artifact, but pins the intake
+    # lineage that compiled it.  The legacy LG-7 columns above remain readable
+    # for historical briefs; LG-12I rows are identified by this explicit,
+    # one-way Source -> Truth -> Confirmation contract.
+    source_snapshot_version_id = Column(String(36), ForeignKey("product_source_snapshot_versions.id", ondelete="RESTRICT"), nullable=True, index=True)
+    source_snapshot_version = Column(Integer, nullable=True)
+    source_snapshot_hash = Column(String(64), nullable=True)
+    truth_version_id = Column(String(36), ForeignKey("product_truth_versions.id", ondelete="RESTRICT"), nullable=True, index=True)
+    truth_version = Column(Integer, nullable=True)
+    truth_version_hash = Column(String(64), nullable=True)
+    confirmation_version_id = Column(String(36), ForeignKey("seller_confirmation_versions.id", ondelete="RESTRICT"), nullable=True, index=True)
+    confirmation_version = Column(Integer, nullable=True)
+    confirmation_version_hash = Column(String(64), nullable=True)
+    target_channels = Column(JSON, nullable=False, default=list)
+    review_reference_refs_json = Column(JSON, nullable=False, default=list)
+    confirmed_fact_refs_json = Column(JSON, nullable=False, default=list)
+    usable_asset_refs_json = Column(JSON, nullable=False, default=list)
+    prohibited_claim_refs_json = Column(JSON, nullable=False, default=list)
     created_by = Column(String(36), ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
 
@@ -1447,6 +1597,10 @@ _LG12I_IMMUTABLE_VERSION_MODELS = (
     ProductTruthVersion,
     SellerConfirmationVersion,
     CommerceCreativeMasterVersion,
+    ProductCreativeBriefVersion,
+    QualityThresholdProfileVersion,
+    QualityAssessmentReportVersion,
+    QualityPromotionVersion,
 )
 
 

@@ -65,7 +65,11 @@ def test_lg11_canvas_draft_is_reversible_and_commits_only_one_immutable_child(cl
     assert rejected["status"] == "awaiting_review"
     assert rejected["values"]["edit"]["canvas_last_error"]
     completed = _resume(client, headers, rejected, "commit").json()
-    assert completed["status"] == "completed"
+    # The immutable Canvas child is now evaluated by the common TASK-12.9 QA
+    # gate.  This legacy fixture has no Master lineage, so QA fail-closes into
+    # the existing review transport after the child is persisted.
+    assert completed["status"] == "awaiting_review"
+    assert completed["current_stage"] == "quality_review"
     fork = completed["values"]["edit"]["canvas_version_fork"]
     child = db_session.query(DetailPageVersion).filter_by(id=fork["detail_page_version_id"]).one()
     assert child.sections_json["lg11"]["parent_detail_page_version_id"] == source.id

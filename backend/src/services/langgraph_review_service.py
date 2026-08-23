@@ -7,6 +7,7 @@ objects and never includes provider credentials, source text, or image bytes.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -15,17 +16,22 @@ from pydantic import BaseModel, Field, field_validator
 LG4_REVIEW_SCHEMA_VERSION = "lg4-v1"
 LG5_REVIEW_SCHEMA_VERSION = "lg5-v1"
 LG11_REVIEW_SCHEMA_VERSION = "lg11-v1"
+LG12I_REVIEW_SCHEMA_VERSION = "lg12i-v1"
 ReviewStage = Literal[
     "input_review", "evidence_review", "planning_review", "generation_pending", "provider_wait", "image_review",
-    "edit_confirmation", "canvas_edit",
+    "edit_confirmation", "canvas_edit", "seller_confirmation", "quality_review",
 ]
-ReviewDecision = Literal["approve", "reject", "defer", "refresh", "regenerate", "upload", "apply", "undo", "redo", "commit"]
+ReviewDecision = Literal["approve", "reject", "defer", "refresh", "regenerate", "upload", "apply", "undo", "redo", "commit", "submit"]
+_UNSAFE_CONFIRMATION_TEXT = re.compile(
+    r"<\s*/?\s*(?:script|html|iframe|object|embed)\b|javascript\s*:|data\s*:\s*text/html",
+    re.IGNORECASE,
+)
 
 
 class GraphReviewResumePayload(BaseModel):
     """The only value that may resume an LG-4 interrupt."""
 
-    schema_version: Literal["lg4-v1", "lg5-v1", "lg11-v1"] = LG4_REVIEW_SCHEMA_VERSION
+    schema_version: Literal["lg4-v1", "lg5-v1", "lg11-v1", "lg12i-v1"] = LG4_REVIEW_SCHEMA_VERSION
     review_stage: ReviewStage
     decision: ReviewDecision
     comment: str = Field(default="", max_length=1000)
@@ -34,11 +40,39 @@ class GraphReviewResumePayload(BaseModel):
     seller_attested: bool = False
     cost_plan_hash: str = Field(default="", max_length=64)
     canvas_operation: dict[str, Any] = Field(default_factory=dict)
+    # The server publishes this frozen seller-confirmation prompt identity in
+    # the interrupt.  The browser must echo it so an old response can be
+    # safely distinguished from a legitimate later confirmation cycle.
+    confirmation_request_hash: str = Field(default="", max_length=64)
+    confirmation_answers: list[dict[str, Any]] = Field(default_factory=list, max_length=3)
 
     @field_validator("comment")
     @classmethod
     def _strip_comment(cls, value: str) -> str:
         return value.strip()
+
+    @field_validator("confirmation_request_hash")
+    @classmethod
+    def _confirmation_request_hash(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value and (len(value) != 64 or any(char not in "0123456789abcdef" for char in value)):
+            raise ValueError("Seller confirmation request identity is invalid.")
+        return value
+
+    @field_validator("confirmation_answers")
+    @classmethod
+    def _bounded_confirmation_answers(cls, value: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        for answer in value:
+            if not isinstance(answer, dict) or set(answer) - {
+                "clarification_id", "decision", "answer_value", "unit", "selected_observation_id"
+            }:
+                raise ValueError("Seller confirmation answer has unsupported fields.")
+            for text in (answer.get("answer_value"), answer.get("unit"), answer.get("selected_observation_id")):
+                if text is not None and (
+                    not isinstance(text, str) or len(text) > 500 or _UNSAFE_CONFIRMATION_TEXT.search(text)
+                ):
+                    raise ValueError("Seller confirmation answer contains unsafe content.")
+        return value
 
 
 def review_interrupt_payload(
@@ -81,12 +115,26 @@ def review_interrupt_payload(
             "description": "생성 결과를 기준 사진과 비교한 뒤 승인·재생성·직접 업로드를 선택해 주세요.",
             "allowed_decisions": ["approve", "reject", "regenerate", "upload"],
         },
+        "seller_confirmation": {
+            "title": "상품 정보 확인",
+            "description": "확인이 필요한 상품 정보와 권리 상태만 최대 3개씩 확인합니다.",
+            "allowed_decisions": ["submit", "approve"],
+        },
+        "quality_review": {
+            "title": "Quality review required",
+            "description": "Review the frozen quality result before any seller-directed correction.",
+            "allowed_decisions": ["approve", "reject"],
+        },
     }[stage]
     snapshot = state.get("input_snapshot") or {}
     discovery = state.get("discovery") or {}
     commerce = state.get("commerce") or {}
     return {
-        "schema_version": schema_version or (LG5_REVIEW_SCHEMA_VERSION if stage in {"generation_pending", "provider_wait", "image_review"} else LG4_REVIEW_SCHEMA_VERSION),
+        "schema_version": schema_version or (
+            LG12I_REVIEW_SCHEMA_VERSION if stage in {"seller_confirmation", "quality_review"}
+            else LG5_REVIEW_SCHEMA_VERSION if stage in {"generation_pending", "provider_wait", "image_review"}
+            else LG4_REVIEW_SCHEMA_VERSION
+        ),
         "review_stage": stage,
         **content,
         "run_id": str(state.get("run_id") or ""),
@@ -98,6 +146,7 @@ def review_interrupt_payload(
             "discovery_stages": sorted(str(key) for key in discovery),
             "planning_stages": sorted(str(key) for key in commerce),
             "generation": dict(state.get("generation") or {}),
+            "seller_confirmation": dict((state.get("intake") or {}).get("seller_confirmation") or {}),
         },
         "rejection_reason": rejection_reason,
     }
@@ -115,6 +164,8 @@ def validate_resume_payload(value: Any, expected_stage: str) -> GraphReviewResum
         "image_review": {"approve", "reject", "regenerate", "upload"},
         "edit_confirmation": {"approve", "reject"},
         "canvas_edit": {"apply", "undo", "redo", "commit"},
+        "seller_confirmation": {"submit", "approve"},
+        "quality_review": {"approve", "reject"},
     }.get(expected_stage, {"approve", "reject"})
     if payload.decision not in allowed:
         raise ValueError(f"{expected_stage} does not accept the '{payload.decision}' decision.")
@@ -141,6 +192,12 @@ def validate_resume_against_interrupt(value: Any, pending: dict[str, Any]) -> Gr
             raise ValueError("검수할 장면이 변경되었습니다. 상태를 새로고침하고 장면을 다시 선택해 주세요.")
         if payload.decision == "regenerate" and payload.job_id and payload.job_id not in jobs:
             raise ValueError("재생성할 장면이 변경되었습니다. 상태를 새로고침해 주세요.")
+    if stage == "seller_confirmation":
+        expected_hash = str(
+            dict((pending.get("context") or {}).get("seller_confirmation") or {}).get("resume_request_hash") or ""
+        )
+        if not expected_hash or payload.confirmation_request_hash != expected_hash:
+            raise ValueError("Seller confirmation request has changed. Refresh and submit the current questions.")
     return payload
 
 

@@ -1376,6 +1376,15 @@ def get_final_page_endpoint(
     try:
         version = get_page_version_for_export(db, project_id, version_id) if version_id else get_final_page_version(db, project_id)
         snapshot = version.sections_json if isinstance(version.sections_json, dict) else {}
+        if isinstance(snapshot.get("lg12_quality_lineage"), dict):
+            from src.services.quality_promotion_service import QualityPromotionGateError, require_current_quality_promotion
+            try:
+                require_current_quality_promotion(
+                    db, workspace_id=workspace.id, project_id=project_id,
+                    page_id=version.id, channel=channel,
+                )
+            except QualityPromotionGateError as exc:
+                raise HTTPException(status_code=409, detail={"code": "quality_gate_blocked", "message": str(exc)}) from exc
         if snapshot.get("schema_version") == "lg10-detail-page-version-v1" and isinstance(snapshot.get("lg11"), dict):
             from src.services.page_visual_contract import LG11CanvasSafetyError, ensure_lg11_canvas_safe
             if channel not in {"smartstore", "coupang"}:

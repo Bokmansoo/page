@@ -13,6 +13,10 @@ from src.db.models import ProductProject, ProductPage, PageSection, Asset, Audit
 from src.services.validation import ALLOWED_EXTENSIONS, REVIEW_DOCUMENT_EXTENSIONS, validate_file_upload
 from src.services.commerce_policy import initial_asset_usage_status
 from src.services.channel_export_service import image_sha256
+from src.services.quality_promotion_service import (
+    QualityPromotionGateError,
+    require_current_quality_export_artifact,
+)
 
 router = APIRouter(prefix="/files", tags=["files"])
 
@@ -45,6 +49,7 @@ class AssetResponseSchema(BaseModel):
     is_representative: bool = False
     representative_source: str = "auto"
     classification_version: int = 0
+    content_hash: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -330,6 +335,23 @@ def get_asset_file(
     file_path = asset.file_path
     if not file_path or not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Asset file not found")
+
+    # Generic retrieval continues to serve ordinary seller assets after the
+    # workspace check above.  A persisted LG-12 export record is different:
+    # it is final output and must use the exact same current-page/promotion
+    # authority as the protected export-download endpoint.
+    try:
+        require_current_quality_export_artifact(
+            db,
+            workspace_id=workspace.id,
+            project_id=asset.project_id,
+            file_path=file_path,
+        )
+    except QualityPromotionGateError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "quality_gate_blocked", "message": str(exc)},
+        ) from exc
 
     # LG-10 immutable previews/export renders pin a final asset hash in their
     # DetailPageVersion.  Legacy callers omit this optional query parameter

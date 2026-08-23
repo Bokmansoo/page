@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.orm import Session
 
 from src.api.auth import get_current_user_and_workspace
@@ -38,10 +38,20 @@ class GraphRunStateResponse(BaseModel):
 
 
 class GraphRunResumeRequest(BaseModel):
-    """LG-4 resume envelope; thread_id prevents cross-run resumes."""
+    """A seller response, checkpoint repair, or a safe blocked-prerequisite continuation."""
 
+    model_config = ConfigDict(extra="forbid")
     thread_id: str
-    response: dict[str, Any]
+    mode: Literal["respond", "recover", "continue"] = "respond"
+    response: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _validate_mode_payload(self) -> "GraphRunResumeRequest":
+        if self.mode == "respond" and self.response is None:
+            raise ValueError("resume mode 'respond' requires a response payload.")
+        if self.mode in {"recover", "continue"} and self.response is not None:
+            raise ValueError(f"resume mode '{self.mode}' does not accept a seller response.")
+        return self
 
 
 class UnifiedProductIntakeRequest(BaseModel):
@@ -194,6 +204,9 @@ def resume_graph_run(
             db,
             thread_id=payload.thread_id if payload else None,
             resume_payload=payload.response if payload else None,
+            recovery_only=payload.mode == "recover" if payload else False,
+            continue_after_prerequisite=payload.mode == "continue" if payload else False,
+            actor_id=auth_ctx["user"].id,
         )
         return _state_response(LangGraphRunService.get_state(run.id, auth_ctx["workspace"].id, db))
     except ValueError as error:

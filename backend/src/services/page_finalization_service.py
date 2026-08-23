@@ -5,7 +5,7 @@ import os
 import re
 import uuid
 from copy import deepcopy
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from sqlalchemy.orm import Session
 
@@ -13,6 +13,7 @@ from src.db.models import (
     AgentRun,
     Asset,
     BrandKitVersion,
+    CommerceCreativeMasterVersion,
     DetailPageVersion,
     ImageGenerationJobRecord,
     ProductCreativeBriefVersion,
@@ -22,6 +23,10 @@ from src.db.models import (
 )
 from src.services.channel_export_service import image_sha256
 from src.services.commerce_policy import REFERENCE_SOURCE_TYPES, is_asset_final_output_eligible
+from src.services.product_identity_validator import (
+    ProductIdentityValidationError,
+    build_frozen_image_quality_evidence,
+)
 from src.services.commerce_renderer_service import FINAL_SPEC_TYPES, build_commerce_artifact
 from src.services.page_asset_policy import ORIGINAL_IMAGE_SOURCE_TYPES, get_page_eligible_assets
 from src.services.page_visual_contract import (
@@ -62,7 +67,10 @@ _COPY_FIELDS_BY_SECTION = {
     "feature_3": ("feature_3_title", "feature_3_body"),
     "usage_guide": ("usage_title", "usage_body"),
     "details_components": ("details_title", "details_body"),
-    "product_information": ("guarantee_title", "guarantee_body"),
+    # ``cta_text`` is already part of the frozen CopySet contract.  Keeping it
+    # in the canonical renderer gives LG-12 a real CTA role to evaluate rather
+    # than asking a quality reader to infer one from an arbitrary body field.
+    "product_information": ("guarantee_title", "guarantee_body", "cta_text"),
 }
 _SAFE_BRAND_TOKENS = {
     "color_tokens": {
@@ -92,11 +100,20 @@ def _artifact_reference(run: AgentRun, stage: str) -> tuple[dict[str, Any], dict
     artifact_hash = str(metadata.get("artifact_hash") or "")
     if not output or not _SHA256_HEX.fullmatch(artifact_hash):
         raise PageAssemblyInputError(f"LG-10 requires the immutable {stage} planning artifact.")
-    return {
+    reference = {
         "artifact_key": stage,
         "schema_version": str(artifact.get("schema_version") or ""),
         "artifact_hash": artifact_hash,
-    }, output
+    }
+    # Current planning artifacts can optionally carry their immutable logical
+    # identity in metadata.  Preserve it in the frozen renderer input when it
+    # is present; older artifacts remain readable with their hash-only shape.
+    artifact_id = str(metadata.get("artifact_id") or "")
+    artifact_version = metadata.get("artifact_version")
+    if artifact_id and isinstance(artifact_version, int) and artifact_version >= 1:
+        reference["artifact_id"] = artifact_id
+        reference["artifact_version"] = artifact_version
+    return reference, output
 
 
 def _manifest_entries(
@@ -124,14 +141,16 @@ def _manifest_entries(
 
     rows = list(manifest.get("assets") or [])
     asset_ids = [str(item.get("asset_id") or "") for item in rows]
-    required_asset_ids = {str(job.output_asset_id) for job in required_jobs}
+    required_by_job_id = {str(job.job_id): job for job in required_jobs}
+    manifest_job_ids = [str(item.get("job_id") or "") for item in rows]
     if (
         not rows
         or not all(asset_ids)
-        or len(set(asset_ids)) != len(asset_ids)
-        or set(asset_ids) != required_asset_ids
+        or not all(manifest_job_ids)
+        or len(set(manifest_job_ids)) != len(manifest_job_ids)
+        or set(manifest_job_ids) != set(required_by_job_id)
     ):
-        raise PageAssemblyInputError("LG-10 requires at least one uniquely identified approved asset.")
+        raise PageAssemblyInputError("LG-10 requires one approved manifest entry for every required scene job.")
 
     assets = {
         asset.id: asset
@@ -141,9 +160,16 @@ def _manifest_entries(
     for item in rows:
         asset_id = str(item.get("asset_id") or "")
         asset_hash = str(item.get("asset_content_hash") or "")
+        job_id = str(item.get("job_id") or "")
+        job = required_by_job_id.get(job_id)
         asset = assets.get(asset_id)
         if (
-            asset is None
+            job is None
+            or asset_id != str(job.output_asset_id)
+            or str(item.get("scene_id") or "") != str(job.scene_id or job.section_id)
+            or str(item.get("section_id") or "") != str(job.section_id or "")
+            or int(item.get("generation_attempt") or 1) != int(job.generation_attempt or 1)
+            or asset is None
             or not is_asset_final_output_eligible(asset)
             or not _SHA256_HEX.fullmatch(asset_hash)
             or asset.content_hash != asset_hash
@@ -265,6 +291,7 @@ def resolve_lg10_brand_renderer_tokens(
     typography = dict(version.typography or {})
     return {
         "brand_kit_version_id": version.id,
+        "brand_kit_version": int(version.version),
         "brand_kit_hash": version.content_hash,
         "color_tokens": {
             "accent": _safe_css_color(colors.get("primary") or colors.get("accent"), "#0f766e"),
@@ -273,6 +300,11 @@ def resolve_lg10_brand_renderer_tokens(
             "muted_surface": _safe_css_color(colors.get("secondary"), "#eef2f7"),
         },
         "typography": {"body_font": _safe_font(typography.get("body") or typography.get("font_family"))},
+        "contrast_minimum": (
+            float(dict(version.constraints or {}).get("minimum_contrast_ratio"))
+            if isinstance(dict(version.constraints or {}).get("minimum_contrast_ratio"), (int, float))
+            else None
+        ),
         "asset_layer": {"logo": logos[0] if logos else None, "watermark": watermark, "font_assets": fonts},
         "fallback": not bool(logos),
         "fallback_reason": "brand_asset_unavailable" if not logos else None,
@@ -315,7 +347,7 @@ def build_canonical_page_assembly_input(
 
     page_ref, page_plan = _artifact_reference(run, "page_planning")
     copy_ref, copy_set = _artifact_reference(run, "copywriting")
-    _, visual_plan = _artifact_reference(run, "visual_planning")
+    visual_plan_ref, visual_plan = _artifact_reference(run, "visual_planning")
     creative_snapshot = dict((run.input_snapshot or {}).get("creative_brief_snapshot") or {})
     brief = db.query(ProductCreativeBriefVersion).filter(
         ProductCreativeBriefVersion.id == creative_snapshot.get("id"),
@@ -375,6 +407,19 @@ def build_canonical_page_assembly_input(
                 **page_ref,
                 "field": "layout_concept",
                 "layout_concept": str(page_plan.get("layout_concept") or ""),
+            },
+            # A scene remains a reference inside the canonical PagePlan input;
+            # the renderer never copies visual-plan content into a page.
+            "scene_ref": {
+                "scene_id": str(scene.get("id") or ""),
+                "scene_type": str(scene.get("scene_type") or scene.get("generation_mode") or ""),
+                "scene_order": index,
+                "page_plan_id": str(page_ref.get("id") or page_ref.get("artifact_id") or ""),
+                "page_plan_version": page_ref.get("version") or page_ref.get("artifact_version"),
+                "page_plan_hash": str(page_ref.get("hash") or page_ref.get("artifact_hash") or ""),
+                "visual_plan_id": str(visual_plan_ref.get("id") or visual_plan_ref.get("artifact_id") or ""),
+                "visual_plan_version": visual_plan_ref.get("version") or visual_plan_ref.get("artifact_version"),
+                "visual_plan_hash": str(visual_plan_ref.get("hash") or visual_plan_ref.get("artifact_hash") or ""),
             },
             "approved_assets": section_assets,
             "seller_owned_fallback_assets": fallback,
@@ -699,6 +744,45 @@ def _lg10_preview_brand_assets(rendering: dict[str, Any]) -> dict[str, dict[str,
     return assets
 
 
+def _lg12_quality_lineage_for_run(*, db: Session, run: AgentRun) -> dict[str, Any] | None:
+    """Pin the latest immutable LG-12I Master when this run has one.
+
+    LG-10/11 pages remain valid production artifacts for runs that predate
+    intake Master creation.  A page that does have an LG-12I Master is frozen
+    with its exact source/truth/confirmation/manifest identities so quality
+    evaluation cannot substitute another same-project lineage.
+    """
+
+    master = (
+        db.query(CommerceCreativeMasterVersion)
+        .filter_by(workspace_id=run.workspace_id, project_id=run.project_id, creator_run_id=run.id)
+        .order_by(CommerceCreativeMasterVersion.version.desc())
+        .first()
+    )
+    if master is None:
+        return None
+    return {
+        "schema_version": "lg12-detail-page-quality-lineage-v1",
+        "creator_run_id": str(run.id),
+        "source_snapshot_ref": {
+            "id": str(master.source_snapshot_version_id), "version": int(master.source_snapshot_version),
+            "hash": str(master.source_snapshot_hash),
+        },
+        "truth_ref": {
+            "id": str(master.truth_version_id), "version": int(master.truth_version),
+            "hash": str(master.truth_version_hash),
+        },
+        "confirmation_ref": {
+            "id": str(master.confirmation_version_id), "version": int(master.confirmation_version),
+            "hash": str(master.confirmation_version_hash),
+        },
+        "master_ref": {
+            "id": str(master.id), "version": int(master.version), "hash": str(master.canonical_hash),
+        },
+        "approved_asset_manifest_ref": deepcopy(dict(master.approved_asset_manifest_ref_json or {})),
+    }
+
+
 def persist_lg10_detail_page_version(
     *,
     run: AgentRun,
@@ -732,6 +816,7 @@ def persist_lg10_detail_page_version(
     brand_tokens = dict(rendering.get("brand_tokens") or {})
     preview_sections = _lg10_preview_sections(rendering)
     preview_brand_assets = _lg10_preview_brand_assets(rendering)
+    lg12_quality_lineage = _lg12_quality_lineage_for_run(db=db, run=run)
     snapshot_payload = {
         "schema_version": LG10_DETAIL_PAGE_VERSION_SCHEMA_VERSION,
         "lg10": {
@@ -751,6 +836,11 @@ def persist_lg10_detail_page_version(
         },
         "sections": preview_sections,
     }
+    if lg12_quality_lineage is not None:
+        # This is a bounded immutable reference index, not a copy of any
+        # Intake/Master payload.  It lets TASK-12.3 reject a same-project page
+        # paired with an unrelated Master during quality evaluation.
+        snapshot_payload["lg12_quality_lineage"] = lg12_quality_lineage
     snapshot = {**snapshot_payload, "snapshot_hash": _canonical_hash(snapshot_payload)}
     existing = db.query(DetailPageVersion).filter(
         DetailPageVersion.id == version_id,
@@ -1096,6 +1186,15 @@ def _lg11_frozen_scene_costs(*, scene_ids: list[str]) -> dict[str, Any]:
     }
 
 
+def _lg11_is_whitespace_only_copy_change(*, source_text: str, new_text: str) -> bool:
+    """Return true only for a semantic no-op whitespace normalisation."""
+
+    return (
+        new_text != source_text
+        and re.sub(r"\s+", "", new_text) == re.sub(r"\s+", "", source_text)
+    )
+
+
 def _lg11_fact_change_risk(
     *,
     scope: str,
@@ -1109,6 +1208,22 @@ def _lg11_fact_change_risk(
 
     if scope == "fact":
         return True, sorted({item["target_id"] for item in target_descriptions})
+    if copy_changes:
+        frozen_copy_set = _lg11_copy_set_from_frozen_rendering(
+            canonical_input=targets["canonical_input"],
+            rendering=targets["rendering"],
+        )
+        if all(
+            _lg11_is_whitespace_only_copy_change(
+                source_text=frozen_copy_set[field], new_text=str(new_text),
+            )
+            for fields in copy_changes.values()
+            for field, new_text in fields.items()
+        ):
+            # Fact-related wording in an instruction must not turn a verified
+            # semantic no-op (for example, repeated-space repair) into a fact
+            # edit. The exact frozen field/value remains unchanged.
+            return False, []
     lower_instruction = instruction.lower()
     changed_text = "\n".join(
         str(value)
@@ -1266,7 +1381,17 @@ def _lg11_copy_change_provenance(
             }
             numeric_value = bool(_FACT_VALUE_PATTERN.search(new_text))
             new_claim_cues = sorted(new_cues - source_cues)
-            if numeric_value:
+            # Whitespace-only normalisation preserves every visible token and
+            # numeric/factual cue from the frozen source. It is a bounded
+            # cosmetic change, not a new value claim, even where the source
+            # text legitimately contains a number or fact-backed cue.
+            whitespace_only_change = _lg11_is_whitespace_only_copy_change(
+                source_text=source_text, new_text=new_text,
+            )
+            if whitespace_only_change:
+                classification = "fact_backed" if source_fact_ids else "narrative_only"
+                reason = "cosmetic_whitespace_normalization"
+            elif numeric_value:
                 classification = "needs_evidence_review"
                 reason = "numeric_or_unit_value_change"
             elif new_claim_cues:
@@ -2426,7 +2551,9 @@ def _lg11_canvas_validate_draft(draft: dict[str, Any]) -> None:
     _lg11_canvas_validate_groups(dict(draft["canonical_page_assembly_input"]), list(draft.get("element_groups") or []))
 
 
-def _lg11_canvas_rehash(canonical: dict[str, Any]) -> dict[str, Any]:
+def _lg11_canvas_rehash(
+    canonical: dict[str, Any], *, enforce_safety: bool = True,
+) -> dict[str, Any]:
     payload = deepcopy(canonical)
     payload.pop("input_hash", None)
     sections = list(payload.get("sections") or [])
@@ -2442,7 +2569,8 @@ def _lg11_canvas_rehash(canonical: dict[str, Any]) -> dict[str, Any]:
         _lg11_canvas_normalize_section_elements(section)
         sections[index] = section
     payload["sections"] = sections
-    _lg11_validate_canvas_safety(payload)
+    if enforce_safety:
+        _lg11_validate_canvas_safety(payload)
     return {**payload, "input_hash": _canonical_hash(payload)}
 
 
@@ -2463,7 +2591,13 @@ def _lg11_validate_canvas_safety(canonical: dict[str, Any]) -> None:
         raise EditIntentValidationError("LG-11 Canvas requires the final specification section to remain visible and last.")
 
 
-def build_lg11_canvas_draft(*, source_version: DetailPageVersion, edit_run_id: str, intent: dict[str, Any]) -> dict[str, Any]:
+def build_lg11_canvas_draft(
+    *,
+    source_version: DetailPageVersion,
+    edit_run_id: str,
+    intent: dict[str, Any],
+    allow_unsafe_source_repair: bool = False,
+) -> dict[str, Any]:
     """Derive a reversible, section-only draft without touching the source version."""
     frozen = _lg11_frozen_edit_targets(source_version)
     payload = deepcopy(dict(intent or {}))
@@ -2477,7 +2611,15 @@ def build_lg11_canvas_draft(*, source_version: DetailPageVersion, edit_run_id: s
         or str(payload.get("base_snapshot_hash") or "") != frozen["snapshot_hash"]
     ):
         raise EditIntentValidationError("LG-11 canvas requires a matching frozen page EditIntent.")
-    canonical = _lg11_canvas_rehash(deepcopy(frozen["canonical_input"]))
+    # A frozen legacy/page-assembly snapshot can itself be the object that a
+    # deterministic quality rework must repair.  Permit that one caller to
+    # construct a draft from the unsafe source, but keep the normalised draft
+    # bounded and require Canvas safety again after every applied command and
+    # before an immutable child can be frozen.
+    canonical = _lg11_canvas_rehash(
+        deepcopy(frozen["canonical_input"]),
+        enforce_safety=not allow_unsafe_source_repair,
+    )
     source_canvas_groups = deepcopy(list(dict(source_version.sections_json or {}).get("lg11", {}).get("canvas_element_groups") or []))
     source_canvas_groups = _lg11_canvas_validate_groups(canonical, source_canvas_groups)
     return _lg11_canvas_finalize_draft({
@@ -2713,11 +2855,69 @@ def apply_lg11_canvas_command(*, canvas_draft: dict[str, Any], decision: str, co
     return _lg11_canvas_finalize_draft(draft)
 
 
-def build_lg11_canvas_version_fork(*, run: AgentRun, source_version: DetailPageVersion, edit_run_id: str, intent: dict[str, Any], canvas_draft: dict[str, Any]) -> dict[str, Any]:
+def _apply_lg11_page_plan_successor(
+    *, canonical: dict[str, Any], page_plan_reference: Mapping[str, Any],
+    section_scene_contract: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Replace only frozen PagePlan identities after a verified plan successor.
+
+    A Canvas reorder keeps all copy, assets, facts and unrelated sections in
+    place.  This helper gives the child its own exact PagePlan/scene contract
+    without mutating the source page or accepting an arbitrary caller ref.
+    """
+
+    plan_id = str(page_plan_reference.get("id") or "")
+    plan_version = page_plan_reference.get("version")
+    plan_hash = str(page_plan_reference.get("hash") or "")
+    if not plan_id or not isinstance(plan_version, int) or plan_version < 1 or not _SHA256_HEX.fullmatch(plan_hash):
+        raise EditIntentValidationError("LG-11 Canvas PagePlan successor identity is invalid.")
+    contract = {str(item.get("section_id") or ""): dict(item) for item in section_scene_contract}
+    value = deepcopy(canonical)
+    sections = [dict(item) for item in list(value.get("sections") or [])]
+    section_ids = [str(item.get("section_id") or "") for item in sections]
+    if not sections or set(section_ids) != set(contract) or len(section_ids) != len(set(section_ids)):
+        raise EditIntentValidationError("LG-11 Canvas PagePlan successor does not cover the frozen sections.")
+    planning_refs = dict(value.get("planning_refs") or {})
+    current_ref = dict(planning_refs.get("page_plan") or {})
+    if not str(current_ref.get("artifact_id") or current_ref.get("id") or ""):
+        raise EditIntentValidationError("LG-11 Canvas source has no frozen PagePlan reference.")
+    planning_refs["page_plan"] = {
+        **current_ref,
+        "artifact_key": "page_planning",
+        "artifact_id": plan_id,
+        "artifact_version": plan_version,
+        "artifact_hash": plan_hash,
+    }
+    value["planning_refs"] = planning_refs
+    for section in sections:
+        entry = contract[str(section["section_id"])]
+        scene_ref = dict(section.get("scene_ref") or {})
+        if not str(entry.get("scene_id") or "") or not str(entry.get("scene_type") or "") or not isinstance(entry.get("scene_order"), int):
+            raise EditIntentValidationError("LG-11 Canvas PagePlan successor scene contract is incomplete.")
+        section["scene_ref"] = {
+            **scene_ref,
+            "page_plan_id": plan_id,
+            "page_plan_version": plan_version,
+            "page_plan_hash": plan_hash,
+            "scene_id": str(entry["scene_id"]),
+            "scene_type": str(entry["scene_type"]),
+            "scene_order": int(entry["scene_order"]),
+        }
+    value["sections"] = sections
+    return _lg11_canvas_rehash(value)
+
+
+def build_lg11_canvas_version_fork(*, run: AgentRun, source_version: DetailPageVersion, edit_run_id: str, intent: dict[str, Any], canvas_draft: dict[str, Any], page_plan_successor_ref: Mapping[str, Any] | None = None, page_plan_scene_contract: Sequence[Mapping[str, Any]] = (), quality_lineage_override: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Commit a canvas draft as one immutable, deterministic child version."""
     frozen = _lg11_frozen_edit_targets(source_version); draft = deepcopy(canvas_draft); _lg11_canvas_validate_draft(draft)
     if str(draft.get("edit_run_id") or "") != edit_run_id or str(draft.get("source_detail_page_version_id") or "") != source_version.id: raise EditIntentValidationError("LG-11 canvas draft lineage does not match its edit run.")
     canonical = deepcopy(dict(draft["canonical_page_assembly_input"]))
+    if page_plan_successor_ref is not None:
+        canonical = _apply_lg11_page_plan_successor(
+            canonical=canonical,
+            page_plan_reference=page_plan_successor_ref,
+            section_scene_contract=page_plan_scene_contract,
+        )
     _lg11_validate_canvas_safety(canonical)
     try:
         assembly = build_page_assembly_structure(canonical_page_assembly_input=canonical)
@@ -2727,6 +2927,12 @@ def build_lg11_canvas_version_fork(*, run: AgentRun, source_version: DetailPageV
     rendering = {**rendering_payload, "render_hash": _canonical_hash(rendering_payload)}
     snapshot = deepcopy(dict(source_version.sections_json or {})); snapshot.pop("snapshot_hash", None)
     snapshot["lg10"] = {**dict(snapshot.get("lg10") or {}), "canonical_page_assembly_input": canonical, "page_assembly": assembly, "canonical_rendering": rendering}
+    if quality_lineage_override is not None:
+        override = deepcopy(dict(quality_lineage_override))
+        required = {"schema_version", "creator_run_id", "source_snapshot_ref", "truth_ref", "confirmation_ref", "master_ref", "approved_asset_manifest_ref"}
+        if set(override) != required or str(override.get("creator_run_id") or "") != run.id:
+            raise EditIntentValidationError("LG-11 Canvas successor quality lineage is invalid.")
+        snapshot["lg12_quality_lineage"] = override
     preview_sections = _lg10_preview_sections(rendering); tokens = dict(rendering.get("brand_tokens") or {})
     snapshot["commerce_renderer"] = {"theme_color": str((tokens.get("color_tokens") or {}).get("surface") or "#ffffff"), "font_family": str((tokens.get("typography") or {}).get("body_font") or "system-ui, sans-serif"), "brand_assets": _lg10_preview_brand_assets(rendering), "sections": preview_sections}; snapshot["sections"] = preview_sections
     intent_hash = str(intent.get("intent_hash") or "")
@@ -2768,7 +2974,11 @@ def build_lg11_scene_version_fork(*, source_version: DetailPageVersion, edit_run
     replaced = False
     for entry in assets:
         if str(entry.get("scene_id") or "") == scene_id:
-            entry.update({"job_id": job.job_id, "generation_attempt": int(job.generation_attempt or 1), "asset_id": asset.id, "asset_content_hash": asset.content_hash, "provider": job.provider, "model": job.model})
+            try:
+                frozen_quality_evidence = build_frozen_image_quality_evidence(asset=asset, job=job)
+            except ProductIdentityValidationError as exc:
+                raise EditIntentValidationError("LG-11 scene fork image evidence cannot be frozen safely.") from exc
+            entry.update({"job_id": job.job_id, "generation_attempt": int(job.generation_attempt or 1), "asset_id": asset.id, "asset_content_hash": asset.content_hash, "provider": job.provider, "model": job.model, "lg12_frozen_image_evidence": frozen_quality_evidence})
             replaced = True
     if not replaced:
         raise EditIntentValidationError("LG-11 scene fork target is absent from the frozen approved manifest.")

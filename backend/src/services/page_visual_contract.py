@@ -89,9 +89,16 @@ def validate_lg11_canvas_safety(
     lg10 = dict(snapshot.get("lg10") or {})
     rendering = dict(lg10.get("canonical_rendering") or {})
     canonical = dict(lg10.get("canonical_page_assembly_input") or {})
-    # LG-10 versions without a Canvas child remain governed by their existing
-    # immutable export rules.  Do not retroactively invent Canvas geometry.
-    if not isinstance(snapshot.get("lg11"), dict):
+    # Older LG-10 versions with no frozen Canvas geometry remain governed by
+    # their existing immutable export rules.  A renderer that *did* freeze
+    # Canvas elements is evaluable even before it has an LG-11 edit child:
+    # otherwise TASK-12 would silently skip a real frozen layout defect and
+    # could never route its first selective Canvas repair.
+    has_frozen_canvas = any(
+        isinstance(section, dict) and bool(section.get("canvas_elements"))
+        for section in list(canonical.get("sections") or [])
+    )
+    if not isinstance(snapshot.get("lg11"), dict) and not has_frozen_canvas:
         return {"schema_version": "lg11-canvas-safety-v1", "channel": channel, "safe": True, "issues": [], "checked": False}
     try:
         preset = get_channel_preset(channel)

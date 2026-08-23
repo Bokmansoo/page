@@ -499,6 +499,9 @@ class ProjectAssetResponse(BaseModel):
     is_representative: bool = False
     representative_source: str = "auto"
     classification_version: int = 0
+    # LG-12I photo-only intake sends an immutable asset reference. Expose the
+    # persisted digest so clients never need to invent one after upload.
+    content_hash: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 

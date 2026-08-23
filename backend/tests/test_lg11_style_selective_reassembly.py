@@ -122,8 +122,8 @@ def test_lg11_style_reassembly_reuses_frozen_product_contract_without_provider_w
     result = _resume(client, auth_headers, state)
     assert result.status_code == 200, result.text
     completed = result.json()
-    assert completed["status"] == "completed"
-    assert completed["current_stage"] == "style_version_reassembled"
+    assert completed["status"] == "awaiting_review"
+    assert completed["current_stage"] == "quality_review"
     assert completed["values"]["edit"]["impact_preview"]["expected_provider_cost"] == {
         "status": "not_required",
         "source": "lg11_style_selective_reassembly",
@@ -141,7 +141,7 @@ def test_lg11_style_reassembly_reuses_frozen_product_contract_without_provider_w
     assert canonical["approved_asset_manifest"] == source_snapshot["lg10"]["canonical_page_assembly_input"]["approved_asset_manifest"]
     assert canonical["sections"][0]["approved_assets"][0]["asset_id"] == product_asset_id
     assert child.sections_json["lg10"]["canonical_rendering"]["sections"] == source_snapshot["lg10"]["canonical_rendering"]["sections"]
-    assert not (set(child.sections_json["lg10"]["canonical_rendering"]) - {"design_direction", "renderer_tokens", "brand_tokens", "brand_geometry", "css", "html", "sections", "schema_version", "canonical_input_ref", "page_assembly_ref", "render_hash"})
+    assert not (set(child.sections_json["lg10"]["canonical_rendering"]) - {"design_direction", "renderer_tokens", "brand_tokens", "brand_geometry", "css", "html", "sections", "schema_version", "canonical_input_ref", "page_assembly_ref", "render_hash", "lg12_layout_evidence"})
     assert db_session.query(DetailPageVersion).filter_by(project_id=source_run.project_id).count() == before_versions + 1
     db_session.refresh(source)
     assert source.sections_json == source_snapshot
@@ -149,7 +149,7 @@ def test_lg11_style_reassembly_reuses_frozen_product_contract_without_provider_w
     assert db_session.query(ImageGenerationOutboxRecord).filter_by(run_id=started["run_id"]).count() == 0
     assert db_session.query(ImageGenerationCostApprovalRecord).filter_by(run_id=started["run_id"]).count() == 0
 
-    duplicate = _resume(client, auth_headers, state)
+    duplicate = _resume(client, auth_headers, completed)
     assert duplicate.status_code == 200
     assert db_session.query(DetailPageVersion).filter_by(project_id=source_run.project_id).count() == before_versions + 1
 
@@ -251,7 +251,10 @@ def test_lg11_style_reassembly_public_resume_rebuilds_checkpointed_child_lineage
     edit_run.status = "running"
     db_session.commit()
 
-    recovered = client.post(f"/api/v1/graph-runs/{started['run_id']}/resume", headers=auth_headers)
+    recovered = client.post(
+        f"/api/v1/graph-runs/{started['run_id']}/resume", headers=auth_headers,
+        json={"mode": "recover", "thread_id": started["run_id"]},
+    )
     assert recovered.status_code == 200, recovered.text
     db_session.refresh(edit_run)
     restored_fork = edit_run.outputs_json["langgraph_edit"]["style_version_fork"]

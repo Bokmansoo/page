@@ -121,10 +121,13 @@ def test_lg10_production_completes_without_required_image_jobs(
     run = db_session.query(AgentRun).filter_by(id=run.id).one()
     _configure_no_generation_plan(db_session, run, information_only=information_only)
 
-    completed = _resume(client, auth_headers, planning_review, "approve")
-    assert completed.status_code == 200, completed.text
-    state = completed.json()
-    assert state["status"] == "completed"
+    resumed = _resume(client, auth_headers, planning_review, "approve")
+    assert resumed.status_code == 200, resumed.text
+    state = resumed.json()
+    assert state["status"] == "awaiting_review"
+    assert state["values"]["review"]["pending"]["review_stage"] == "quality_review"
+    assert state["values"]["quality"]["quality_bar_verdict"] == "NEEDS_REVIEW"
+    assert state["values"]["quality"]["seller_review_required"] is True
     generation = state["values"]["generation"]
     assert generation["image_generation_required"] is False
     assert generation["completion_basis"] == "no_required_image_scenes"
@@ -257,13 +260,16 @@ def test_lg10_fake_provider_production_golden_matrix(
     )
 
     state = client.get(f"/api/v1/graph-runs/{run.id}", headers=auth_headers).json()
-    while state["status"] != "completed":
+    while state["status"] == "awaiting_review" and state["values"]["review"]["pending"]["review_stage"] == "image_review":
         target = next(
             job for job in state["values"]["generation"]["jobs"] if job["status"] == "needs_review"
         )
         response = _resume(client, auth_headers, state, "approve", job_id=target["job_id"])
         assert response.status_code == 200, response.text
         state = response.json()
+    assert state["status"] == "awaiting_review"
+    assert state["values"]["review"]["pending"]["review_stage"] == "quality_review"
+    assert state["values"]["quality"]["quality_bar_verdict"] == "NEEDS_REVIEW"
 
     generation = state["values"]["generation"]
     manifest = generation["approved_asset_manifest"]

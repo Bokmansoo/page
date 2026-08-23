@@ -62,6 +62,28 @@ export type GraphView = {
     edit?: {
       version_restore?: { detail_page_version_id?: string };
     };
+    quality?: {
+      quality_bar_verdict?: "PASS" | "FAIL" | "NEEDS_REVIEW";
+      routing_code?: string;
+      seller_review_required?: boolean;
+      rework_targets?: Array<Record<string, unknown>>;
+    };
+    intake?: {
+      input_mode?: string;
+      requested_generation_mode?: string;
+      target_channels?: string[];
+      envelope?: {
+        input_mode?: string;
+        requested_generation_mode?: string;
+        target_channels?: string[];
+      };
+      creative_brief?: {
+        brief_version?: { id?: string; version?: number; canonical_hash?: string };
+      };
+      commerce_creative_master?: {
+        master_version?: { id?: string; version?: number; canonical_hash?: string };
+      };
+    };
     canvas?: {
       canonical_page_assembly_input?: { sections?: Array<{ section_id: string; canvas?: { is_visible?: boolean; height_px?: number | null }; canvas_elements?: Array<{ element_id: string; kind: string; x: number; y: number; width: number; height: number; z_index: number; locked: boolean; group_id?: string | null; deleted?: boolean; asset_id?: string; asset_content_hash?: string }> }> };
       element_groups?: Array<{ group_id: string; section_id: string; child_element_ids: string[]; locked: boolean }>;
@@ -86,8 +108,8 @@ type GraphExecutionError = {
 };
 
 type ReviewRequest = {
-  schema_version: "lg4-v1" | "lg5-v1" | "lg11-v1";
-  review_stage: "input_review" | "evidence_review" | "planning_review" | "generation_pending" | "provider_wait" | "image_review" | "edit_confirmation" | "canvas_edit";
+  schema_version: "lg4-v1" | "lg5-v1" | "lg11-v1" | "lg12i-v1";
+  review_stage: "input_review" | "evidence_review" | "planning_review" | "generation_pending" | "provider_wait" | "image_review" | "edit_confirmation" | "canvas_edit" | "seller_confirmation" | "quality_review";
   title: string;
   description: string;
   allowed_decisions: string[];
@@ -154,6 +176,16 @@ type EditIntentPreview = {
 
 type FrozenVersionOption = { id: string; name: string; is_final: boolean; lg11_frozen?: boolean };
 type BrandKitVersionOption = { id: string; version?: number; status?: string };
+type QualityStatus = {
+  status: "pass" | "ready_to_promote" | "needs_attention" | "not_available";
+  quality_verdict?: "PASS" | "FAIL" | "NEEDS_REVIEW";
+  score?: number;
+  promotion_status?: "promoted" | "ready" | "blocked" | "not_required";
+  export_readiness?: Record<string, boolean>;
+  review_required?: boolean;
+  message?: string;
+  attempt_summary?: { automatic_rework_count?: number };
+};
 
 type Props = {
   projectId: string;
@@ -213,6 +245,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   const [selectedRestoreVersionId, setSelectedRestoreVersionId] = useState("");
   const [frozenVersionOptions, setFrozenVersionOptions] = useState<FrozenVersionOption[]>([]);
   const [brandKitVersionOptions, setBrandKitVersionOptions] = useState<BrandKitVersionOption[]>([]);
+  const [qualityStatus, setQualityStatus] = useState<QualityStatus | null>(null);
   const [conversationalPreview, setConversationalPreview] = useState<EditIntentPreview | null>(null);
   const [confirmedEditPayload, setConfirmedEditPayload] = useState<Record<string, unknown> | null>(null);
   const [autoRefreshingGeneration, setAutoRefreshingGeneration] = useState(false);
@@ -252,7 +285,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
       onStateChange?.(null);
       setRecoveryNotice(null);
         if (requestedRunId) {
-          setLoadIssue("이 주소의 LangGraph 실행을 찾을 수 없습니다. 실행이 만료되었거나 새 실행으로 교체되었습니다. 작업 목록에서 현재 실행을 다시 열거나 새 프로젝트 실행을 시작해 주세요.");
+          setLoadIssue("이 주소의 작업 실행을 찾을 수 없습니다. 실행이 만료되었거나 새 실행으로 교체되었습니다. 작업 목록에서 현재 실행을 다시 열거나 새 프로젝트 실행을 시작해 주세요.");
         }
         return;
       }
@@ -295,6 +328,42 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
 
   const completedDetailPageVersionId = view?.values.rendering?.detail_page_version?.id
     || view?.values.edit?.version_restore?.detail_page_version_id;
+  useEffect(() => {
+    if (view?.current_stage !== "quality_promotion_ready" || !completedDetailPageVersionId) {
+      setQualityStatus(null);
+      return;
+    }
+    let active = true;
+    void fetch(apiUrl(`/api/v1/projects/${projectId}/quality-status`), {
+      credentials: "include", cache: "no-store",
+    }).then(async (response) => {
+      if (!response.ok) throw new Error("품질 상태를 불러오지 못했습니다.");
+      return response.json() as Promise<QualityStatus>;
+    }).then((status) => { if (active) setQualityStatus(status); })
+      .catch((error) => { if (active) setMessage(error instanceof Error ? error.message : "품질 상태를 불러오지 못했습니다."); });
+    return () => { active = false; };
+  }, [completedDetailPageVersionId, projectId, view?.current_stage]);
+
+  const promoteQualityPage = async () => {
+    if (!completedDetailPageVersionId || inFlightRef.current) return;
+    inFlightRef.current = true;
+    setWorking(true); setMessage(null);
+    try {
+      const response = await fetch(apiUrl(`/api/v1/projects/${projectId}/page/promotion`), {
+        method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include",
+        body: JSON.stringify({ detail_page_version_id: completedDetailPageVersionId }),
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(payload?.detail?.message || "최종 사용 가능 상태로 전환하지 못했습니다.");
+      const statusResponse = await fetch(apiUrl(`/api/v1/projects/${projectId}/quality-status`), { credentials: "include", cache: "no-store" });
+      if (statusResponse.ok) setQualityStatus(await statusResponse.json() as QualityStatus);
+      setMessage("품질 검토를 통과했습니다. 선택한 채널로 내보낼 수 있습니다.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "최종 사용 가능 상태로 전환하지 못했습니다.");
+    } finally {
+      inFlightRef.current = false; setWorking(false);
+    }
+  };
   useEffect(() => {
     if (!completedDetailPageVersionId) {
       setFrozenCanvasSections([]);
@@ -442,7 +511,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
       }
       setView(payload);
       onStateChange?.(payload);
-      setMessage("같은 LangGraph 실행을 재개했습니다.");
+      setMessage("같은 작업 실행을 재개했습니다.");
       if (payload.current_stage === "planning_review") window.setTimeout(() => window.location.reload(), 150);
     } catch (error) {
       await load();
@@ -453,7 +522,10 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     }
   };
 
-  const createStandaloneExport = async (detailPageVersionId: string) => {
+  const createStandaloneExport = async (
+    detailPageVersionId: string,
+    channel: "smartstore" | "coupang" = previewChannel,
+  ) => {
     setStandaloneExporting(true);
     setMessage(null);
     try {
@@ -461,7 +533,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
-          body: JSON.stringify({ final_version_id: detailPageVersionId, channel: previewChannel }),
+          body: JSON.stringify({ final_version_id: detailPageVersionId, channel }),
       });
       const payload = await response.json().catch(() => null);
       if (!response.ok) {
@@ -652,11 +724,14 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     */
   };
 
-  if (loading) return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-500">LangGraph 승인 상태를 확인하는 중...</section>;
-  if (view?.status === "failed") {
+  if (loading) return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-500">승인 상태를 확인하는 중...</section>;
+  const quality = view?.values.quality;
+  const qualityReworkActive = quality?.quality_bar_verdict === "FAIL"
+    && ["quality_selective_rework", "quality_copy_rework", "quality_image_rework", "quality_visual_rework"].includes(view?.current_stage || "");
+  if (view?.status === "failed" && !qualityReworkActive) {
     const failure = view.values.execution?.last_error;
     return <section role="alert" className="mx-auto mb-5 max-w-4xl rounded-xl border border-rose-300 bg-rose-50 p-5 text-sm text-rose-950">
-      <p className="text-xs font-bold text-rose-700">LangGraph 실행 복구 필요 · {failure?.stage || view.current_stage}</p>
+      <p className="text-xs font-bold text-rose-700">작업 실행 복구 필요 · {failure?.stage || view.current_stage}</p>
       <h2 className="mt-1 font-black">다음 단계로 진행하지 못했습니다</h2>
       <p className="mt-2 leading-6">{failure?.user_message || "실행 중 오류가 발생했습니다. 원인을 해결한 뒤 같은 실행을 다시 시도해 주세요."}</p>
       {failure?.code ? <p className="mt-2 text-xs text-rose-700">오류 코드: {failure.code}</p> : null}
@@ -669,7 +744,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   }
   if (!view && loadIssue) {
     return <section role="alert" className="mx-auto mb-5 max-w-4xl rounded-xl border border-amber-300 bg-amber-50 p-5 text-sm text-amber-950">
-      <p className="text-xs font-bold text-amber-700">LangGraph 실행 주소 확인 필요</p>
+      <p className="text-xs font-bold text-amber-700">작업 실행 주소 확인 필요</p>
       <h2 className="mt-1 font-black">승인할 실행을 찾지 못했습니다</h2>
       <p className="mt-2 leading-6">{loadIssue}</p>
       <button type="button" onClick={() => void load()} className="mt-4 rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-bold text-amber-900">현재 실행 다시 찾기</button>
@@ -678,12 +753,66 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   const pending = view?.values.review?.pending;
   if (!view) return null;
   if (!pending) {
+    if (qualityReworkActive) {
+      const reworkMessages: Record<string, string> = {
+        COPY_REWORK: "문구 품질을 자동으로 수정하고 있습니다.",
+        IMAGE_REWORK: "이미지 품질을 자동으로 수정하고 있습니다.",
+        VISUAL_REWORK: "화면 구성 품질을 자동으로 수정하고 있습니다.",
+        BLOCKED_POLICY: "판매 전 확인이 필요한 항목을 점검하고 있습니다.",
+      };
+      const reworkMessage = reworkMessages[quality?.routing_code || ""] || "품질 기준을 다시 확인하고 있습니다.";
+      return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-amber-200 bg-amber-50 p-5 text-sm text-amber-950" data-testid="lg12-quality-rework">
+        <p className="text-xs font-bold text-amber-700">최종 품질 검토</p>
+        <h2 className="mt-1 font-black">{reworkMessage}</h2>
+        <dl className="mt-3 grid gap-2 rounded-lg border border-amber-200 bg-white p-3 text-xs sm:grid-cols-3">
+          <div><dt className="font-bold text-slate-700">현재 품질 상태</dt><dd>수정이 필요합니다</dd></div>
+          <div><dt className="font-bold text-slate-700">자동 수정</dt><dd>진행 중</dd></div>
+          <div><dt className="font-bold text-slate-700">최종 사용 및 내보내기</dt><dd>수정이 끝날 때까지 사용할 수 없습니다</dd></div>
+        </dl>
+        <p className="mt-3 text-xs leading-5">자동 수정 결과를 기다려 주세요. 추가 확인이 필요하면 알려드리겠습니다.</p>
+      </section>;
+    }
+    const intake = view.values.intake;
+    const briefVersion = intake?.creative_brief?.brief_version;
+    const masterVersion = intake?.commerce_creative_master?.master_version;
+    if (view.status === "completed" && view.current_stage === "master_ready" && masterVersion?.id) {
+      return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-950" data-testid="lg12i-master-ready">
+        <p className="text-xs font-bold text-emerald-700">LG-12I Commerce Creative Master 준비 완료</p>
+        <h2 className="mt-1 font-black">상품 사실과 판매자 확인을 고정한 Creative Master가 준비되었습니다</h2>
+        <p className="mt-1 text-xs leading-5 text-slate-600">새 페이지나 이미지 생성은 아직 시작하지 않았습니다. 이후 Planning 단계는 이 immutable Master reference를 사용합니다.</p>
+        <dl className="mt-3 grid gap-2 rounded-lg border border-emerald-200 bg-white p-3 text-xs sm:grid-cols-2">
+          <div><dt className="font-bold text-slate-700">Master</dt><dd>{masterVersion.id} · v{masterVersion.version || 1}</dd></div>
+          <div><dt className="font-bold text-slate-700">Creative Brief</dt><dd>{briefVersion?.id || "연결된 Brief"}{briefVersion?.version ? ` · v${briefVersion.version}` : ""}</dd></div>
+          <div><dt className="font-bold text-slate-700">입력 방식</dt><dd>{intake?.input_mode || intake?.envelope?.input_mode || "-"} · {intake?.requested_generation_mode || intake?.envelope?.requested_generation_mode || "-"}</dd></div>
+          <div><dt className="font-bold text-slate-700">대상 채널</dt><dd>{(intake?.target_channels || intake?.envelope?.target_channels || []).join(", ") || "-"}</dd></div>
+        </dl>
+      </section>;
+    }
     const completedJobs = (view.values.generation?.jobs || []).filter((job) => job.output_asset_id);
     const detailPageVersionId = view.values.rendering?.detail_page_version?.id
       || view.values.edit?.version_restore?.detail_page_version_id;
+    if (view.status === "completed" && view.current_stage === "quality_promotion_ready" && detailPageVersionId) {
+      const promoted = qualityStatus?.promotion_status === "promoted";
+      const channels = Object.entries(qualityStatus?.export_readiness || {});
+      return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-emerald-200 bg-emerald-50 p-5 text-sm text-emerald-950" data-testid="lg12-quality-status">
+        <p className="text-xs font-bold text-emerald-700">최종 품질 검토</p>
+        <h2 className="mt-1 font-black">{promoted ? "상세페이지를 내보낼 준비가 되었습니다" : "품질 검토를 통과했습니다"}</h2>
+        <p className="mt-2 leading-6">{promoted ? "현재 상세페이지 버전만 내보낼 수 있습니다." : "최종 사용 가능 상태로 전환하면 선택한 채널의 내보내기가 열립니다."}</p>
+        <dl className="mt-3 grid gap-2 rounded-lg border border-emerald-200 bg-white p-3 text-xs sm:grid-cols-3">
+          <div><dt className="font-bold text-slate-700">현재 버전</dt><dd>{detailPageVersionId}</dd></div>
+          <div><dt className="font-bold text-slate-700">품질 상태</dt><dd>{qualityStatus?.quality_verdict === "PASS" ? "품질 검토 통과" : "상태 확인 중"}</dd></div>
+          <div><dt className="font-bold text-slate-700">자동 수정</dt><dd>{qualityStatus?.attempt_summary?.automatic_rework_count || 0}회</dd></div>
+        </dl>
+        {!promoted ? <button type="button" data-testid="lg12-promote-page" onClick={() => void promoteQualityPage()} disabled={working || qualityStatus?.status === "needs_attention"} className="mt-4 rounded-lg bg-emerald-700 px-3 py-2 text-xs font-bold text-white disabled:opacity-50">{working ? "처리 중..." : "최종 사용 가능 상태로 전환"}</button> : <div className="mt-4 flex flex-wrap gap-2">{channels.filter(([, ready]) => ready).map(([channel]) => <a key={channel} data-testid={`lg12-export-ready-${channel}`} href={`/workspace/projects/${projectId}/render?version_id=${encodeURIComponent(detailPageVersionId)}&channel=${channel}`} className="rounded-lg bg-emerald-700 px-3 py-2 text-xs font-bold text-white">{channel === "smartstore" ? "SmartStore 미리보기" : "Coupang 미리보기"}</a>)}{qualityStatus?.export_readiness?.smartstore ? <button type="button" data-testid="lg12-smartstore-standalone-export" onClick={() => void createStandaloneExport(detailPageVersionId, "smartstore")} disabled={standaloneExporting} className="rounded-lg border border-emerald-300 bg-white px-3 py-2 text-xs font-bold text-emerald-800 disabled:opacity-50">{standaloneExporting ? "SmartStore HTML/ZIP 준비 중..." : "SmartStore HTML/ZIP 내보내기"}</button> : null}</div>}
+        {standaloneExport ? <div className="mt-3 flex flex-wrap gap-2" data-testid="lg12-smartstore-export-downloads"><a data-testid="lg12-smartstore-html-download" href={apiUrl(standaloneExport.html_download_url)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-800">SmartStore HTML 다운로드</a><a data-testid="lg12-smartstore-zip-download" href={apiUrl(standaloneExport.zip_download_url)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-800">SmartStore ZIP 다운로드</a></div> : null}
+        {qualityStatus?.review_required ? <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">확인이 필요한 항목이 있습니다. 기존 검토 단계에서 필요한 정보를 확인해 주세요.</p> : null}
+        {qualityStatus?.message ? <p role="status" className="mt-3 text-xs text-slate-700">{qualityStatus.message}</p> : null}
+        {message ? <p role="status" className="mt-3 text-xs font-semibold text-emerald-800">{message}</p> : null}
+      </section>;
+    }
     if (view.status === "completed" && (completedJobs.length > 0 || detailPageVersionId)) {
       return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-950" data-testid="lg5r-completed-gallery">
-        <p className="text-xs font-bold text-emerald-700">LangGraph 상세페이지 생성 완료</p>
+        <p className="text-xs font-bold text-emerald-700">상세페이지 생성 완료</p>
         <h2 className="mt-1 font-black">{completedJobs.length > 0 ? "승인된 장면 결과" : "정보형 상세페이지 결과"}</h2>
         <p className="mt-1 text-xs leading-5 text-slate-600">{completedJobs.length > 0 ? "이 실행에서 승인한 이미지를 다시 확인할 수 있습니다." : "추가 이미지 생성 없이 정보와 권리 보유 원본으로 상세페이지를 완성했습니다."}</p>
         {completedJobs.length > 0 ? <div className="mt-4 grid gap-3 sm:grid-cols-2">
@@ -734,7 +863,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     return null;
   }
   if (hidePlanningAction && pending.review_stage === "planning_review") {
-    return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">스토리보드가 승인 대기 중입니다. 아래의 <b>스토리보드 승인</b> 버튼은 동일한 LangGraph 실행을 재개합니다.</section>;
+    return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">스토리보드가 승인 대기 중입니다. 아래의 <b>스토리보드 승인</b> 버튼은 동일한 작업 실행을 재개합니다.</section>;
   }
   const generationWaiting = pending.review_stage === "generation_pending";
   const providerWaiting = pending.review_stage === "provider_wait";
@@ -780,7 +909,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   >
     {recoveryNotice ? <p role="status" className="mb-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-900">{recoveryNotice}</p> : null}
     <div className="flex flex-wrap items-start justify-between gap-3">
-      <div><p className="text-xs font-bold text-violet-700">LangGraph 승인 대기 · {pending.review_stage}</p><h2 className="mt-1 font-black">{pending.title}</h2><p className="mt-1 leading-5 text-slate-700">{pending.description}</p>{pending.rejection_reason ? <p className="mt-2 text-xs text-rose-700">최근 반려 사유: {pending.rejection_reason}</p> : null}</div>
+      <div><p className="text-xs font-bold text-violet-700">{pending.review_stage === "quality_review" ? "판매자 확인 대기" : `승인 대기 · ${pending.review_stage}`}</p><h2 className="mt-1 font-black">{pending.title}</h2><p className="mt-1 leading-5 text-slate-700">{pending.description}</p>{pending.rejection_reason ? <p className="mt-2 text-xs text-rose-700">최근 반려 사유: {pending.rejection_reason}</p> : null}</div>
       {generationWaiting ? <div className="flex gap-2"><button type="button" onClick={() => void resume("defer")} disabled={working} className="rounded-lg border border-violet-300 bg-white px-3 py-2 text-xs font-bold text-violet-800 disabled:opacity-50">대기 상태 저장</button><button type="button" onClick={() => void resume("approve")} disabled={working} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-50">{working ? "확인 중..." : "비용 승인 후 이미지 생성"}</button></div> : providerWaiting ? <button type="button" onClick={() => void resume("refresh")} disabled={working} className="rounded-lg border border-violet-300 bg-white px-3 py-2 text-xs font-bold text-violet-800 disabled:opacity-50">{working ? "확인 중..." : "작업 상태 새로고침"}</button> : imageReview ? <p className="rounded-lg bg-white px-3 py-2 text-xs font-bold text-violet-800">아래 장면별로 승인·거절·재생성·직접 업로드를 선택하세요.</p> : canvasEdit ? <div className="flex flex-wrap gap-2"><button type="button" onClick={() => void resume("undo", { canvasOperation: canvasOperation("undo") })} disabled={working} className="rounded-lg border px-3 py-2 text-xs font-bold">실행 취소</button><button type="button" onClick={() => void resume("redo", { canvasOperation: canvasOperation("redo") })} disabled={working} className="rounded-lg border px-3 py-2 text-xs font-bold">다시 실행</button><button type="button" onClick={() => void resume("commit", { canvasOperation: canvasOperation("commit") })} disabled={working} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white">변경 저장</button></div> : <div className="flex gap-2"><button type="button" onClick={() => void resume("reject")} disabled={working} className="rounded-lg border border-rose-300 bg-white px-3 py-2 text-xs font-bold text-rose-700 disabled:opacity-50">수정 후 재검토</button><button type="button" onClick={() => void resume("approve")} disabled={working} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-50">{working ? "승인 중..." : "확인·다음 단계"}</button></div>}
     </div>
     {canvasEdit ? <div className="mt-4 space-y-2 rounded-lg border border-violet-100 bg-white p-3 text-xs" data-testid="lg11-canvas-draft"><p className="font-bold">섹션 구조 초안 · revision {view.values.canvas?.revision || 0}</p>{canvasSections.map((section, index) => <div key={section.section_id} className="flex flex-wrap items-center justify-between gap-2 border-t pt-2"><span>{index + 1}. {section.section_id}</span><span className="flex flex-wrap gap-1"><button type="button" disabled={working || index === 0} onClick={() => void resume("apply", { canvasOperation: canvasOperation("reorder", section.section_id, { position: index - 1 }) })} className="rounded border px-2 py-1">위로</button><button type="button" disabled={working || index === canvasSections.length - 1} onClick={() => void resume("apply", { canvasOperation: canvasOperation("reorder", section.section_id, { position: index + 1 }) })} className="rounded border px-2 py-1">아래로</button><button type="button" disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("duplicate", section.section_id, { position: index + 1 }) })} className="rounded border px-2 py-1">복제</button><button type="button" disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("set_visibility", section.section_id, { is_visible: section.canvas?.is_visible === false }) })} className="rounded border px-2 py-1">{section.canvas?.is_visible === false ? "표시" : "숨김"}</button><input aria-label={`${section.section_id} 높이`} type="number" min="160" max="2400" value={canvasHeights[section.section_id] ?? String(section.canvas?.height_px || 160)} onChange={(event) => setCanvasHeights((current) => ({ ...current, [section.section_id]: event.target.value }))} className="w-16 rounded border px-1 py-1"/><button type="button" disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("set_height", section.section_id, { height_px: Number(canvasHeights[section.section_id] ?? section.canvas?.height_px ?? 160) }) })} className="rounded border px-2 py-1">높이 적용</button><button type="button" disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("remove", section.section_id) })} className="rounded border border-rose-300 px-2 py-1 text-rose-700">삭제</button></span></div>)}<button type="button" disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("add", undefined, { position: canvasAddPosition === 0 && canvasSections.length ? canvasSections.length : canvasAddPosition }) })} className="rounded border border-violet-300 px-2 py-1 font-bold text-violet-800">섹션 추가</button></div> : null}

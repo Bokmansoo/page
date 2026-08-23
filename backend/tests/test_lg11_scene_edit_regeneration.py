@@ -8,7 +8,15 @@ from copy import deepcopy
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
-from src.db.models import AgentRun, Asset, DetailPageVersion, ImageGenerationJobRecord, ImageGenerationOutboxRecord, ProductProject
+from src.db.models import (
+    AgentRun,
+    Asset,
+    DetailPageVersion,
+    ImageGenerationCostApprovalRecord,
+    ImageGenerationJobRecord,
+    ImageGenerationOutboxRecord,
+    ProductProject,
+)
 from test_lg11_edit_intent_preview import _canonical_hash, _frozen_lg10_version
 from test_lg5_image_generation_subgraph import _create_run, auth_headers as _lg5_auth_headers
 
@@ -181,7 +189,8 @@ def test_lg11_regenerates_only_target_after_new_cost_approval_and_forks_frozen_v
     completed = _resume(client, auth_headers, review, "approve", job_id=target["job_id"])
     assert completed.status_code == 200, completed.text
     final = completed.json()
-    assert final["status"] == "completed"
+    assert final["status"] == "awaiting_review"
+    assert final["current_stage"] == "quality_review"
     fork = final["values"]["edit"]["scene_version_fork"]
     child = db_session.query(DetailPageVersion).filter_by(id=fork["detail_page_version_id"]).one()
     assert child.sections_json["lg11"]["source_detail_page_version_id"] == source.id
@@ -194,7 +203,10 @@ def test_lg11_regenerates_only_target_after_new_cost_approval_and_forks_frozen_v
 
     duplicate = client.post(
         f"/api/v1/graph-runs/{started['run_id']}/resume", headers=auth_headers,
-        json={"thread_id": started["run_id"], "response": {"schema_version": "lg5-v1", "review_stage": "image_review", "decision": "approve", "job_id": target["job_id"]}},
+        # The image decision already produced the immutable child.  Its new
+        # common QA review is now the only resumable interrupt, and resolving
+        # it must not create another scene child or provider delivery.
+        json={"thread_id": started["run_id"], "response": {"schema_version": "lg12i-v1", "review_stage": "quality_review", "decision": "approve"}},
     )
     assert duplicate.status_code == 200
     assert db_session.query(DetailPageVersion).filter_by(id=fork["detail_page_version_id"]).count() == 1
@@ -235,7 +247,8 @@ def test_lg11_seller_owned_replacement_is_zero_provider_and_rejects_unapproved_a
     job = review["values"]["generation"]["jobs"][0]
     complete = _resume(client, auth_headers, review, "approve", job_id=job["job_id"])
     assert complete.status_code == 200
-    assert complete.json()["status"] == "completed"
+    assert complete.json()["status"] == "awaiting_review"
+    assert complete.json()["current_stage"] == "quality_review"
 
 
 def test_lg11_scene_provider_failure_does_not_touch_source_or_create_child(
@@ -302,3 +315,104 @@ def test_lg11_scene_pending_cost_checkpoint_rebuilds_before_public_resume(
     assert edit_run.outputs_json["langgraph_edit"]["lineage"] == expected_lineage
     assert edit_run.outputs_json["langgraph_review"]["pending"]["review_stage"] == "generation_pending"
     assert edit_run.outputs_json["langgraph_generation"]["cost_plan"]["scene_count"] == 1
+
+
+def test_lg11_explicit_recovery_rebuilds_pending_cost_without_side_effects(
+    client, auth_headers, db_session, tmp_path, lg11_runtime
+):
+    """Only an explicit recovery may return the restored pending cost state."""
+
+    run = _create_run(client, auth_headers, db_session, tmp_path)
+    source, _, _ = _frozen_lg10_version(db_session, run)
+    _make_source_dispatchable(db_session, run)
+    started, state = _start_scene_edit(client, auth_headers, run, source, _scene_request(operation="regenerate"))
+    pending = _resume(client, auth_headers, state, "approve").json()
+    assert pending["current_stage"] == "generation_pending"
+    edit_run = db_session.query(AgentRun).filter_by(id=started["run_id"]).one()
+    expected_lineage = deepcopy(edit_run.outputs_json["langgraph_edit"]["lineage"])
+    before = {
+        "outbox": db_session.query(ImageGenerationOutboxRecord).filter_by(run_id=edit_run.id).count(),
+        "jobs": db_session.query(ImageGenerationJobRecord).filter_by(project_id=edit_run.project_id).count(),
+        "cost_status": edit_run.cost_approval_status,
+        "cost_records": [
+            (record.id, record.cost_plan_hash, record.status)
+            for record in db_session.query(ImageGenerationCostApprovalRecord)
+            .filter_by(run_id=edit_run.id)
+            .order_by(ImageGenerationCostApprovalRecord.id)
+            .all()
+        ],
+        "page_versions": db_session.query(DetailPageVersion).filter_by(project_id=edit_run.project_id).count(),
+    }
+    edit_run.outputs_json = {}
+    edit_run.status = "running"
+    db_session.commit()
+
+    payload = {"thread_id": started["run_id"], "mode": "recover"}
+    recovered = client.post(f"/api/v1/graph-runs/{started['run_id']}/resume", headers=auth_headers, json=payload)
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["current_stage"] == "generation_pending"
+    db_session.refresh(edit_run)
+    assert edit_run.outputs_json["langgraph_edit"]["lineage"] == expected_lineage
+    assert edit_run.outputs_json["langgraph_review"]["pending"]["review_stage"] == "generation_pending"
+    assert edit_run.cost_approval_status == before["cost_status"]
+    assert [
+        (record.id, record.cost_plan_hash, record.status)
+        for record in db_session.query(ImageGenerationCostApprovalRecord)
+        .filter_by(run_id=edit_run.id)
+        .order_by(ImageGenerationCostApprovalRecord.id)
+        .all()
+    ] == before["cost_records"]
+    assert db_session.query(ImageGenerationOutboxRecord).filter_by(run_id=edit_run.id).count() == before["outbox"] == 0
+    assert db_session.query(ImageGenerationJobRecord).filter_by(project_id=edit_run.project_id).count() == before["jobs"]
+    assert db_session.query(DetailPageVersion).filter_by(project_id=edit_run.project_id).count() == before["page_versions"]
+
+    duplicate = client.post(f"/api/v1/graph-runs/{started['run_id']}/resume", headers=auth_headers, json=payload)
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["values"]["review"]["pending"]["review_stage"] == "generation_pending"
+    assert db_session.query(ImageGenerationOutboxRecord).filter_by(run_id=edit_run.id).count() == 0
+    assert db_session.query(DetailPageVersion).filter_by(project_id=edit_run.project_id).count() == before["page_versions"]
+
+    missing_respond = client.post(
+        f"/api/v1/graph-runs/{started['run_id']}/resume",
+        headers=auth_headers,
+        json={"thread_id": started["run_id"], "mode": "respond"},
+    )
+    assert missing_respond.status_code == 422
+    invalid_recovery = client.post(
+        f"/api/v1/graph-runs/{started['run_id']}/resume",
+        headers=auth_headers,
+        json={"thread_id": started["run_id"], "mode": "recover", "response": {"decision": "approve"}},
+    )
+    assert invalid_recovery.status_code == 422
+
+    approved = _resume(
+        client,
+        auth_headers,
+        recovered.json(),
+        "approve",
+        cost_plan_hash=recovered.json()["values"]["generation"]["cost_plan"]["cost_plan_hash"],
+    )
+    assert approved.status_code == 200, approved.text
+    deliveries = db_session.query(ImageGenerationOutboxRecord).filter_by(run_id=edit_run.id).all()
+    assert len(deliveries) == 1 and deliveries[0].provider_dispatch_count == 0
+    duplicate_approval = _resume(
+        client,
+        auth_headers,
+        recovered.json(),
+        "approve",
+        cost_plan_hash=recovered.json()["values"]["generation"]["cost_plan"]["cost_plan_hash"],
+    )
+    assert duplicate_approval.status_code == 409
+    assert db_session.query(ImageGenerationOutboxRecord).filter_by(run_id=edit_run.id).count() == 1
+
+    # ``recover`` is a deliberately closed recovery surface: an arbitrary
+    # graph mode cannot turn the public endpoint into a generic graph retry.
+    edit_run.mode = "unsupported_checkpoint_mode"
+    db_session.commit()
+    unsupported = client.post(
+        f"/api/v1/graph-runs/{started['run_id']}/resume",
+        headers=auth_headers,
+        json={"thread_id": started["run_id"], "mode": "recover"},
+    )
+    assert unsupported.status_code == 409
+    assert db_session.query(ImageGenerationOutboxRecord).filter_by(run_id=edit_run.id).count() == 1

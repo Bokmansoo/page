@@ -18,7 +18,8 @@ from sqlalchemy.orm import Session
 
 from src.db.models import (
     AgentRun, Asset, BrandKitVersion, CompiledPromptArtifact, FactSnapshot, ProductCreativeBriefVersion,
-    ProductFact, ProductProject, ReferenceInputVersion, ReferenceInsightVersion,
+    ProductFact, ProductProject, ProductSourceSnapshotVersion, ProductTruthVersion,
+    ReferenceInputVersion, ReferenceInsightVersion, SellerConfirmationVersion,
     PromptPackVersion, ReviewInputVersion, ReviewInsightVersion, SellerCreativeDirectionVersion,
     WorkflowGateEvent,
 )
@@ -27,8 +28,15 @@ from src.services.creative_brief_llm_service import (
     generate_structured_creative_brief,
 )
 from src.services.provider_adapters import TextProviderProtocol
+from src.services.channel_export_service import supported_channel_keys
+from src.services.product_intake_version_service import (
+    IntakeVersionContractError,
+    resolve_lg12i_final_use_assets,
+    validate_lg12i_brand_kit_scope,
+)
 
 COMPILER_VERSION = "lg7-creative-brief-v1"
+LG12I_CREATIVE_BRIEF_COMPILER_VERSION = "lg12i-product-creative-brief-v1"
 
 
 class CreativeBriefInputError(ValueError):
@@ -45,6 +53,312 @@ class CreativeBriefInputError(ValueError):
 def canonical_hash(value: Any) -> str:
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _lg12i_reference(value: Any, label: str) -> dict[str, Any]:
+    """Validate a bounded immutable identity without accepting copied bodies."""
+
+    if not isinstance(value, dict):
+        raise CreativeBriefInputError("invalid_reference", f"{label} must be an immutable reference.", "Use ID/version/hash only.")
+    allowed = {"id", "version", "hash", "schema_version", "artifact_key"}
+    if set(value) - allowed or not isinstance(value.get("id"), str) or not value["id"]:
+        raise CreativeBriefInputError("invalid_reference", f"{label} must be an ID/version/hash reference.", "Remove copied artifact content.")
+    if not isinstance(value.get("version"), int) or value["version"] < 1:
+        raise CreativeBriefInputError("invalid_reference", f"{label}.version is invalid.", "Use the persisted positive version.")
+    digest = value.get("hash")
+    if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise CreativeBriefInputError("invalid_reference", f"{label}.hash is invalid.", "Use the persisted SHA-256 hash.")
+    return {key: value[key] for key in allowed if key in value}
+
+
+def _lg12i_row_reference(row: Any, *, hash_field: str = "canonical_hash") -> dict[str, Any]:
+    return {"id": str(row.id), "version": int(row.version), "hash": str(getattr(row, hash_field))}
+
+
+def _lg12i_require_exact_reference(row: Any, reference: dict[str, Any], label: str, *, hash_field: str = "canonical_hash") -> None:
+    if _lg12i_reference(reference, label) != _lg12i_row_reference(row, hash_field=hash_field):
+        raise CreativeBriefInputError("stale_reference", f"{label} does not match its persisted immutable version.", "Reload the frozen reference.")
+
+
+def _lg12i_resolved_brand_kit(db: Session, run: AgentRun, brand_kit_reference: dict[str, Any] | None) -> BrandKitVersion:
+    if brand_kit_reference is not None:
+        reference = _lg12i_reference(brand_kit_reference, "brand_kit")
+        kit = db.query(BrandKitVersion).filter_by(id=reference["id"], workspace_id=run.workspace_id).one_or_none()
+        if kit is None:
+            raise CreativeBriefInputError("brand_kit_missing", "Brand Kit reference is unavailable in this workspace.", "Choose an active project Brand Kit.")
+        _lg12i_require_exact_reference(kit, reference, "brand_kit", hash_field="content_hash")
+        try:
+            return validate_lg12i_brand_kit_scope(
+                kit, workspace_id=run.workspace_id, project_id=run.project_id
+            )
+        except IntakeVersionContractError as exc:
+            raise CreativeBriefInputError("brand_kit_scope", str(exc), "Choose a Brand Kit available to this project.") from exc
+    project = db.query(ProductProject).filter_by(id=run.project_id, workspace_id=run.workspace_id).one()
+    version_id = project.brand_kit_override_version_id or project.brand_kit_version_id
+    kit = (
+        db.query(BrandKitVersion).filter_by(id=version_id, workspace_id=run.workspace_id).one_or_none()
+        if version_id else None
+    )
+    if kit is None:
+        kit = db.query(BrandKitVersion).filter_by(
+            workspace_id=run.workspace_id, scope="workspace", status="active"
+        ).order_by(BrandKitVersion.activated_at.desc()).first()
+    if kit is None:
+        raise CreativeBriefInputError("brand_kit_missing", "LG-12I needs a pinned Brand Kit version.", "Create or activate a Brand Kit before compiling the Brief.")
+    try:
+        return validate_lg12i_brand_kit_scope(
+            kit, workspace_id=run.workspace_id, project_id=run.project_id
+        )
+    except IntakeVersionContractError as exc:
+        raise CreativeBriefInputError("brand_kit_scope", str(exc), "Choose a Brand Kit available to this project.") from exc
+
+
+_LG12I_REVIEW_REFERENCE_ARTIFACT_KEYS = frozenset({
+    "review_input", "review_insight", "reference_input", "reference_insight",
+})
+
+
+def _lg12i_resolved_review_reference(
+    db: Session, run: AgentRun, value: Any, label: str,
+) -> dict[str, Any]:
+    """Resolve review/reference provenance from persisted rows, never caller data."""
+
+    reference = _lg12i_reference(value, label)
+    artifact_key = str(reference.get("artifact_key") or "").strip().lower()
+    if artifact_key not in _LG12I_REVIEW_REFERENCE_ARTIFACT_KEYS:
+        raise CreativeBriefInputError(
+            "review_reference_type", f"{label} has an unsupported review/reference artifact type.",
+            "Use a persisted review or reference input/insight reference.",
+        )
+    row: Any | None
+    version: int
+    digest: str
+    if artifact_key == "review_input":
+        row = db.query(ReviewInputVersion).filter_by(
+            id=reference["id"], workspace_id=run.workspace_id, project_id=run.project_id,
+        ).one_or_none()
+        version = int(row.version) if row is not None else 0
+        digest = str(row.content_hash) if row is not None else ""
+    elif artifact_key == "reference_input":
+        row = db.query(ReferenceInputVersion).filter_by(
+            id=reference["id"], workspace_id=run.workspace_id, project_id=run.project_id,
+        ).one_or_none()
+        version = int(row.version) if row is not None else 0
+        digest = str(row.content_hash) if row is not None else ""
+        if row is not None and str(row.usage_scope or "").lower() != "analysis_only":
+            raise CreativeBriefInputError(
+                "reference_usage_scope", "Reference input is not analysis-only provenance.",
+                "Keep reference material out of product facts and final-use assets.",
+            )
+    elif artifact_key == "review_insight":
+        row = db.query(ReviewInsightVersion).filter_by(id=reference["id"], project_id=run.project_id).one_or_none()
+        input_row = (
+            db.query(ReviewInputVersion).filter_by(
+                id=row.review_input_version_id, workspace_id=run.workspace_id, project_id=run.project_id,
+            ).one_or_none() if row is not None else None
+        )
+        if row is not None and (input_row is None or str(row.usage_status or "").lower() != "available"):
+            row = None
+        version = int(input_row.version) if row is not None and input_row is not None else 0
+        digest = str(row.content_hash) if row is not None else ""
+    else:  # reference_insight
+        row = db.query(ReferenceInsightVersion).filter_by(id=reference["id"], project_id=run.project_id).one_or_none()
+        input_row = (
+            db.query(ReferenceInputVersion).filter_by(
+                id=row.reference_input_version_id, workspace_id=run.workspace_id, project_id=run.project_id,
+            ).one_or_none() if row is not None else None
+        )
+        if row is not None and (
+            input_row is None or str(input_row.usage_scope or "").lower() != "analysis_only"
+            or str(row.usage_status or "").lower() != "available"
+        ):
+            row = None
+        version = int(input_row.version) if row is not None and input_row is not None else 0
+        digest = str(row.content_hash) if row is not None else ""
+    if row is None:
+        raise CreativeBriefInputError(
+            "review_reference_missing", f"{label} is not available to this project.",
+            "Reload a persisted review/reference artifact from this project.",
+        )
+    expected = {"id": str(row.id), "version": version, "hash": digest, "artifact_key": artifact_key}
+    supplied = {key: reference[key] for key in ("id", "version", "hash", "artifact_key") if key in reference}
+    if supplied != expected:
+        raise CreativeBriefInputError(
+            "review_reference_stale", f"{label} does not match its persisted artifact identity.",
+            "Reload the exact persisted review/reference version.",
+        )
+    return expected
+
+
+def compile_lg12i_product_creative_brief(
+    db: Session,
+    run: AgentRun,
+    *,
+    source_reference: dict[str, Any],
+    truth_reference: dict[str, Any],
+    confirmation_reference: dict[str, Any],
+    target_channels: list[str],
+    brand_kit_reference: dict[str, Any] | None = None,
+    review_reference_refs: list[dict[str, Any]] | None = None,
+) -> ProductCreativeBriefVersion:
+    """Compile a deterministic LG-12I Brief directly from frozen intake versions.
+
+    This compiler intentionally has no Master argument.  It consumes only
+    Source/Truth/Confirmation, Brand Kit and bounded review/reference
+    provenance, then persists one immutable Brief that a later Master indexes.
+    """
+
+    source_ref = _lg12i_reference(source_reference, "source")
+    truth_ref = _lg12i_reference(truth_reference, "truth")
+    confirmation_ref = _lg12i_reference(confirmation_reference, "confirmation")
+    source = db.query(ProductSourceSnapshotVersion).filter_by(id=source_ref["id"], project_id=run.project_id).one_or_none()
+    truth = db.query(ProductTruthVersion).filter_by(id=truth_ref["id"], project_id=run.project_id).one_or_none()
+    confirmation = db.query(SellerConfirmationVersion).filter_by(id=confirmation_ref["id"], project_id=run.project_id).one_or_none()
+    if not source or not truth or not confirmation:
+        raise CreativeBriefInputError("intake_lineage_missing", "LG-12I Brief needs persisted Source, Truth and Confirmation versions.", "Restart from the frozen intake lineage.")
+    _lg12i_require_exact_reference(source, source_ref, "source")
+    _lg12i_require_exact_reference(truth, truth_ref, "truth")
+    _lg12i_require_exact_reference(confirmation, confirmation_ref, "confirmation")
+    if any(row.workspace_id != run.workspace_id or row.creator_run_id != run.id for row in (source, truth, confirmation)):
+        raise CreativeBriefInputError("intake_lineage_scope", "LG-12I Brief lineage must belong to this exact run and workspace.", "Use the selected intake run only.")
+    if truth.source_snapshot_version_id != source.id or confirmation.truth_version_id != truth.id:
+        raise CreativeBriefInputError("intake_lineage_broken", "LG-12I Source → Truth → Confirmation lineage is invalid.", "Reload the frozen intake lineage.")
+    if list(confirmation.unresolved_refs_json or []):
+        raise CreativeBriefInputError("confirmation_unresolved", "Required seller confirmation remains unresolved.", "Resolve the pending clarification before compiling.")
+
+    channels = sorted(set(str(channel) for channel in target_channels if isinstance(channel, str) and channel))
+    allowed_channels = set(supported_channel_keys())
+    if not channels or any(channel not in allowed_channels for channel in channels):
+        raise CreativeBriefInputError("invalid_channels", "LG-12I Brief target channels are unsupported.", "Use SmartStore and/or Coupang.")
+    kit = _lg12i_resolved_brand_kit(db, run, brand_kit_reference)
+    review_refs = [
+        _lg12i_resolved_review_reference(db, run, item, f"review_reference_refs[{index}]")
+        for index, item in enumerate(review_reference_refs or [])
+    ]
+    review_refs.sort(key=lambda item: (item["id"], item["version"], item["hash"]))
+
+    confirmed = [dict(item) for item in confirmation.confirmed_fact_refs_json or []]
+    confirmed.sort(key=lambda item: (str(item.get("fact_id") or ""), str(item.get("provenance_hash") or "")))
+    truth_normalization = dict(truth.normalization_json or {})
+    prohibited = [dict(item) for item in truth_normalization.get("prohibited_inferences") or []]
+    prohibited_refs = [
+        _lg12i_reference(item["reference"], f"prohibited_inferences[{index}]")
+        for index, item in enumerate(prohibited) if isinstance(item.get("reference"), dict)
+    ]
+    prohibited_refs.sort(key=lambda item: (item["id"], item["version"], item["hash"]))
+    # Only seller-confirmed values can be turned into fact-backed USPs.  Unknown,
+    # conflict and prohibited truth items stay absent from this list.
+    supported_usps = [
+        {
+            "fact_id": str(item["fact_id"]), "field_id": str(item["field_id"]),
+            "value": str(item["normalized_value"]), "unit": item.get("unit"),
+            "confirmed_fact_id": str(item["confirmed_fact_id"]),
+            "provenance_hash": str(item["provenance_hash"]),
+            "truth_item_ref": _lg12i_reference(dict(item["original_truth_item_ref"]), "confirmed_fact.original_truth_item"),
+        }
+        for item in confirmed
+    ]
+    usable_assets, asset_exclusions = resolve_lg12i_final_use_assets(
+        db, project_id=run.project_id, source=source, confirmation=confirmation,
+    )
+
+    brief_body = {
+        "schema_version": "lg12i-product-creative-brief-output-v1",
+        "source": source_ref, "truth": truth_ref, "confirmation": confirmation_ref,
+        "brand_kit": _lg12i_row_reference(kit, hash_field="content_hash"),
+        "target_channels": channels,
+        "target_audience": "seller_defined_or_review_backed_only",
+        "value_proposition": "confirmed_source_backed_facts_only",
+        "supported_usp_candidates": supported_usps,
+        "tone_style": {
+            "creative_direction_mode": "style_only",
+            "brand_kit_ref": _lg12i_row_reference(kit, hash_field="content_hash"),
+            "review_reference_refs": review_refs,
+        },
+        "visual_direction": {
+            "brand_kit_ref": _lg12i_row_reference(kit, hash_field="content_hash"),
+            "usable_asset_refs": usable_assets,
+            "asset_exclusions": asset_exclusions,
+            "review_reference_refs": review_refs,
+        },
+        "content_priorities": ["product_identity", "seller_confirmed_facts", "channel_safety"],
+        "prohibited_claim_refs": prohibited_refs,
+        "review_reference_refs": review_refs,
+        "constraints": {
+            "unknown_or_unresolved_as_fact_forbidden": True,
+            "prohibited_inference_as_fact_forbidden": True,
+            "creative_direction_is_not_fact": True,
+            "rights_unconfirmed_assets_are_not_final_use": True,
+        },
+    }
+    input_manifest = {
+        "compiler_version": LG12I_CREATIVE_BRIEF_COMPILER_VERSION,
+        "source": source_ref, "truth": truth_ref, "confirmation": confirmation_ref,
+        "brand_kit": _lg12i_row_reference(kit, hash_field="content_hash"),
+        "target_channels": channels, "review_reference_refs": review_refs,
+        "confirmed_fact_refs": confirmed, "usable_asset_refs": usable_assets,
+        "asset_exclusions": asset_exclusions,
+        "prohibited_claim_refs": prohibited_refs,
+    }
+    input_hash = canonical_hash(input_manifest)
+    existing = db.query(ProductCreativeBriefVersion).filter_by(run_id=run.id, input_hash=input_hash).one_or_none()
+    if existing is not None:
+        return existing
+    previous = db.query(ProductCreativeBriefVersion).filter_by(project_id=run.project_id).order_by(ProductCreativeBriefVersion.version.desc()).first()
+    row = ProductCreativeBriefVersion(
+        workspace_id=run.workspace_id, project_id=run.project_id, run_id=run.id,
+        version=int(db.query(func.max(ProductCreativeBriefVersion.version)).filter_by(project_id=run.project_id).scalar() or 0) + 1,
+        previous_version_id=previous.id if previous else None,
+        brand_kit_version_id=kit.id, brand_kit_hash=kit.content_hash,
+        review_insight_version_ids=[], reference_insight_version_ids=[],
+        approved_fact_ids=[item["fact_id"] for item in supported_usps],
+        compiler_version=LG12I_CREATIVE_BRIEF_COMPILER_VERSION,
+        input_hash=input_hash, output_hash=canonical_hash(brief_body), brief_json=brief_body,
+        source_snapshot_version_id=source.id, source_snapshot_version=source.version, source_snapshot_hash=source.canonical_hash,
+        truth_version_id=truth.id, truth_version=truth.version, truth_version_hash=truth.canonical_hash,
+        confirmation_version_id=confirmation.id, confirmation_version=confirmation.version, confirmation_version_hash=confirmation.canonical_hash,
+        target_channels=channels, review_reference_refs_json=review_refs,
+        confirmed_fact_refs_json=confirmed, usable_asset_refs_json=usable_assets,
+        prohibited_claim_refs_json=prohibited_refs, created_by=run.created_by,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def create_lg12i_approved_fact_snapshot(
+    db: Session, run: AgentRun, *, creative_brief: ProductCreativeBriefVersion,
+) -> FactSnapshot:
+    """Materialize the small confirmed-fact index consumed by the Master.
+
+    It contains value/provenance identities only, never copied source documents
+    or observation bodies.  The function is idempotent for the frozen Brief.
+    """
+
+    if creative_brief.compiler_version != LG12I_CREATIVE_BRIEF_COMPILER_VERSION or creative_brief.run_id != run.id:
+        raise CreativeBriefInputError("invalid_brief", "Approved fact snapshot requires this run's LG-12I Brief.", "Use the frozen Brief produced by this intake run.")
+    fact_refs = [dict(item) for item in creative_brief.confirmed_fact_refs_json or []]
+    facts = [
+        {
+            "id": item["id"], "version": item["version"], "hash": item["hash"],
+            "fact_id": item["fact_id"], "field_id": item["field_id"],
+            "value": item["normalized_value"], "unit": item.get("unit"),
+            "provenance_hash": item["provenance_hash"],
+        }
+        for item in fact_refs
+    ]
+    facts.sort(key=lambda item: (str(item["fact_id"]), str(item["provenance_hash"])))
+    snapshot_hash = canonical_hash({"kind": "lg12i-approved-fact-snapshot-v1", "creative_brief": _lg12i_row_reference(creative_brief, hash_field="output_hash"), "facts": facts})
+    existing = db.query(FactSnapshot).filter_by(project_id=run.project_id, purpose="lg12i-approved-facts", snapshot_hash=snapshot_hash).one_or_none()
+    if existing is not None:
+        return existing
+    snapshot = FactSnapshot(
+        project_id=run.project_id, purpose="lg12i-approved-facts", snapshot_hash=snapshot_hash,
+        facts_json=facts, created_by=run.created_by,
+    )
+    db.add(snapshot)
+    db.flush()
+    return snapshot
 
 
 def normalize_interaction_mode(value: str | None) -> str:
@@ -578,6 +892,48 @@ def create_reference_input(db: Session, *, project: ProductProject, user_id: str
                            rights_status: str = "unverified", source_metadata: dict[str, Any] | None = None) -> ReferenceInputVersion:
     if input_kind not in {"url", "image", "pdf", "text"}:
         raise ValueError("Reference kind must be url, image, pdf, or text.")
+    # LG-12I manual intake reuses this established reference-input entry point,
+    # but pins seller-entered input with its stricter immutable artifact hash.
+    # It intentionally skips reference analysis: manual facts remain candidates
+    # until the later ProductTruth and seller-confirmation tasks.
+    from src.services.product_intake_version_service import (
+        MANUAL_INPUT_ARTIFACT_SCHEMA_VERSION,
+        OWNED_PRODUCT_URL_CAPTURE_REQUEST_SCHEMA_VERSION,
+        create_manual_input_artifact,
+        create_owned_product_url_capture_request,
+    )
+
+    if (source_metadata or {}).get("manual_payload_schema_version") == MANUAL_INPUT_ARTIFACT_SCHEMA_VERSION:
+        if input_kind != "text" or source_url.strip() or asset_id:
+            raise ValueError("A manual intake artifact must be a text-only reference input.")
+        row = create_manual_input_artifact(
+            db,
+            workspace_id=project.workspace_id,
+            project_id=project.id,
+            created_by=user_id,
+            raw_body=text,
+            source_metadata=source_metadata or {},
+        )
+        db.commit(); db.refresh(row)
+        return row
+    # An owned product URL is a product-source capture command, not an LG-7
+    # reference/style input.  Keep it in the established immutable reference
+    # table but deliberately skip reference analysis and final-use promotion.
+    if (source_metadata or {}).get(
+        "owned_product_url_capture_request_schema_version"
+    ) == OWNED_PRODUCT_URL_CAPTURE_REQUEST_SCHEMA_VERSION:
+        if input_kind != "url" or text.strip() or asset_id:
+            raise ValueError("An owned product URL capture request must be a URL-only reference input.")
+        row = create_owned_product_url_capture_request(
+            db,
+            workspace_id=project.workspace_id,
+            project_id=project.id,
+            created_by=user_id,
+            source_url=source_url,
+            source_metadata=source_metadata or {},
+        )
+        db.commit(); db.refresh(row)
+        return row
     if asset_id:
         asset = db.query(Asset).filter(Asset.id == asset_id, Asset.project_id == project.id).first()
         if asset is None:

@@ -49,4 +49,8 @@ markers = [
     "lg11_fake_e2e: zero-cost production LangGraph LG-11 edit, Canvas, restore, and export quality gate",
     "lg11_real_provider_smoke: opt-in smoke for an LG-11 scene edit through the configured real provider",
     "lg12i_fake_e2e: zero-cost production LangGraph LG-12I unified intake routing coverage",
+    "lg12_fake_quality_gate: zero-cost persisted LG-12 QA/rework/promotion Golden regression suite",
+    "lg12_real_provider_smoke: opt-in one-scene LG-12 quality smoke through the production provider worker",
+    "postgres: requires a guarded local PostgreSQL integration database",
+    "integration: persisted database/checkpoint integration coverage",
 ]

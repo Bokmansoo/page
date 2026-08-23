@@ -22,7 +22,9 @@ from src.db.models import (
     ProductSourceSnapshotVersion,
 )
 from src.schemas.lg12_golden_dataset import GOLDEN_DATASET_V1_CONTENT_HASH, load_golden_dataset
+from src.services.creative_brief_service import canonical_hash as creative_brief_hash
 from src.services.product_intake_version_service import (
+    LG12I_CREATIVE_BRIEF_COMPILER_VERSION,
     IntakeVersionContractError,
     canonical_version_hash,
     create_commerce_creative_master_version,
@@ -30,6 +32,8 @@ from src.services.product_intake_version_service import (
     create_product_truth_version,
     create_seller_confirmation_version,
     master_reference_index,
+    lg12i_approved_asset_manifest_reference,
+    lg12i_pending_production_artifact_reference,
     validate_immutable_version,
 )
 from test_lg5_image_generation_subgraph import _create_run, auth_headers as _lg5_auth_headers
@@ -52,6 +56,60 @@ def _fact_state_ref(identifier: str, version: int = 1, digest: str | None = None
     }
 
 
+def _seller_confirmed_fact_state_ref(identifier: str, version: int = 1, digest: str | None = None) -> dict[str, object]:
+    """Build the v3 self-sufficient confirmation ref used by Master tests."""
+
+    original = _ref(identifier, version, digest)
+    source_ref = _ref("seller-source:manual:fan")
+    evidence_ref = _ref(f"evidence:{identifier}", version)
+    clarification_ref = _ref(
+        f"clarification:{identifier}", schema_version="lg12i-seller-clarification-v1"
+    )
+    answer_ref = _ref(
+        f"seller-answer:{identifier}", schema_version="lg12i-seller-answer-v1"
+    )
+    identity = {
+        "original_truth_item_ref": original,
+        "fact_id": identifier,
+        "field_id": identifier,
+        "normalized_value": "confirmed",
+        "unit": None,
+        "source_kind": "product_truth_candidate",
+        "clarification_ref": clarification_ref,
+        "answer_ref": answer_ref,
+        "seller_actor_id": "00000000-0000-0000-0000-000000000001",
+        "confirmation_cycle": 1,
+        "source_refs": [source_ref],
+        "evidence_refs": [evidence_ref],
+        "selected_observation_ref": None,
+        "conflicting_observation_refs": [],
+        "decision_status": "confirmed",
+    }
+    provenance_hash = canonical_version_hash(identity)
+    return {
+        **original,
+        "provenance_ref": evidence_ref,
+        "confirmed_fact_id": "seller-confirmed-fact:" + provenance_hash[:24],
+        "fact_id": identifier,
+        "field_id": identifier,
+        "normalized_value": "confirmed",
+        "unit": None,
+        "value_structure": {"value": "confirmed", "unit": None},
+        "source_kind": "product_truth_candidate",
+        "original_truth_item_ref": original,
+        "clarification_ref": clarification_ref,
+        "answer_ref": answer_ref,
+        "seller_actor_id": "00000000-0000-0000-0000-000000000001",
+        "confirmation_cycle": 1,
+        "source_refs": [source_ref],
+        "evidence_refs": [evidence_ref],
+        "selected_observation_ref": None,
+        "conflicting_observation_refs": [],
+        "provenance_hash": provenance_hash,
+        "decision_status": "confirmed",
+    }
+
+
 @pytest.fixture
 def auth_headers():
     return _lg5_auth_headers.__wrapped__()
@@ -69,6 +127,9 @@ def _source_truth_confirmation(
     rejected_fact_ids=(),
     unknown_fact_ids=(),
     answers=None,
+    source_refs=None,
+    provenance=None,
+    rights=None,
 ):
     source = create_product_source_snapshot_version(
         db_session,
@@ -77,9 +138,9 @@ def _source_truth_confirmation(
         creator_run_id=run.id,
         created_by=run.created_by,
         input_mode="manual",
-        source_refs=[_ref("seller-source:manual:fan")],
-        provenance={"source": "seller"},
-        rights={"status": "confirmed"},
+        source_refs=source_refs if source_refs is not None else [_ref("seller-source:manual:fan")],
+        provenance=provenance if provenance is not None else {"source": "seller"},
+        rights=rights if rights is not None else {"status": "confirmed"},
         source_fidelity={"status": "complete"},
     )
     fact_ids = sorted(set(confirmed_fact_ids) | set(rejected_fact_ids) | set(unknown_fact_ids))
@@ -91,7 +152,7 @@ def _source_truth_confirmation(
         created_by=run.created_by,
         source_reference=_ref(source.id, source.version, source.canonical_hash),
         fact_refs=[_ref(identifier) for identifier in fact_ids],
-        evidence_refs=[_ref(f"evidence:{identifier}") for identifier in fact_ids],
+        evidence_refs=[_ref("evidence:source"), *[_ref(f"evidence:{identifier}") for identifier in fact_ids]],
     )
     confirmation = create_seller_confirmation_version(
         db_session,
@@ -101,7 +162,7 @@ def _source_truth_confirmation(
         created_by=run.created_by,
         truth_reference=_ref(truth.id, truth.version, truth.canonical_hash),
         answers=answers if answers is not None else [{"question_id": "confirm-capacity", "answer": "confirmed"}],
-        confirmed_fact_refs=[_fact_state_ref(identifier) for identifier in confirmed_fact_ids],
+        confirmed_fact_refs=[_seller_confirmed_fact_state_ref(identifier) for identifier in confirmed_fact_ids],
         rejected_fact_refs=[_fact_state_ref(identifier) for identifier in rejected_fact_ids],
         unknown_fact_refs=[_fact_state_ref(identifier) for identifier in unknown_fact_ids],
         rights_confirmations=[{"asset_id": "seller-source:manual:fan", "status": "confirmed"}],
@@ -109,12 +170,18 @@ def _source_truth_confirmation(
     return source, truth, confirmation
 
 
-def _master_dependencies(db_session, run):
+def _master_dependencies(db_session, run, chain, *, usable_asset_refs=()):
+    source, truth, confirmation = chain
+    fact_states = [
+        *[dict(item) for item in confirmation.confirmed_fact_refs_json or []],
+        *[dict(item) for item in confirmation.rejected_fact_refs_json or []],
+        *[dict(item) for item in confirmation.unknown_fact_refs_json or []],
+    ]
     fact_snapshot = FactSnapshot(
         project_id=run.project_id,
         purpose="lg12i-contract",
-        snapshot_hash=canonical_version_hash({"facts": ["fan capacity"]}),
-        facts_json=[{"id": "fact:fan:capacity"}],
+        snapshot_hash=canonical_version_hash({"facts": [item["id"] for item in fact_states]}),
+        facts_json=[{"id": item["id"]} for item in fact_states],
         created_by=run.created_by,
     )
     sequence = db_session.query(BrandKit).filter_by(workspace_id=run.workspace_id).count() + 1
@@ -133,33 +200,52 @@ def _master_dependencies(db_session, run):
         created_by=run.created_by,
     )
     db_session.add(kit_version); db_session.flush()
+    source_ref = _ref(source.id, source.version, source.canonical_hash)
+    truth_ref = _ref(truth.id, truth.version, truth.canonical_hash)
+    confirmation_ref = _ref(confirmation.id, confirmation.version, confirmation.canonical_hash)
+    brand_ref = _ref(kit_version.id, kit_version.version, kit_version.content_hash)
+    normalized_usable_assets = [dict(item) for item in usable_asset_refs]
+    brief_body = {
+        "schema_version": "lg12i-product-creative-brief-output-v1",
+        "source": source_ref, "truth": truth_ref, "confirmation": confirmation_ref,
+        "brand_kit": brand_ref, "target_channels": ["coupang", "smartstore"],
+        "supported_usp_candidates": [], "visual_direction": {"usable_asset_refs": normalized_usable_assets},
+        "review_reference_refs": [], "prohibited_claim_refs": [],
+    }
     brief = ProductCreativeBriefVersion(
         workspace_id=run.workspace_id,
         project_id=run.project_id,
         run_id=run.id,
         version=db_session.query(ProductCreativeBriefVersion).filter_by(project_id=run.project_id).count() + 1,
-        fact_snapshot_id=fact_snapshot.id,
-        fact_snapshot_hash=fact_snapshot.snapshot_hash,
-        compiled_prompt_artifact_id="compiled-prompt-lg12i",
-        category_pack_version_id="category-pack-lg12i",
-        channel_pack_version_id="channel-pack-lg12i",
+        fact_snapshot_id=fact_snapshot.id, fact_snapshot_hash=fact_snapshot.snapshot_hash,
         brand_kit_version_id=kit_version.id,
         brand_kit_hash=kit_version.content_hash,
         review_insight_version_ids=[],
         reference_insight_version_ids=[],
-        approved_fact_ids=["fact:fan:capacity"],
-        input_hash=canonical_version_hash({"brief": "input", "sequence": sequence}),
-        output_hash=canonical_version_hash({"brief": "output", "sequence": sequence}),
-        brief_json={"sections": ["hero"]},
+        approved_fact_ids=[item["fact_id"] for item in confirmation.confirmed_fact_refs_json or []],
+        compiler_version=LG12I_CREATIVE_BRIEF_COMPILER_VERSION,
+        input_hash=canonical_version_hash({"brief": "input", "sequence": sequence, "source": source_ref}),
+        output_hash=creative_brief_hash(brief_body), brief_json=brief_body,
+        source_snapshot_version_id=source.id, source_snapshot_version=source.version, source_snapshot_hash=source.canonical_hash,
+        truth_version_id=truth.id, truth_version=truth.version, truth_version_hash=truth.canonical_hash,
+        confirmation_version_id=confirmation.id, confirmation_version=confirmation.version, confirmation_version_hash=confirmation.canonical_hash,
+        target_channels=["coupang", "smartstore"], confirmed_fact_refs_json=list(confirmation.confirmed_fact_refs_json or []),
+        usable_asset_refs_json=normalized_usable_assets, prohibited_claim_refs_json=[], review_reference_refs_json=[],
         created_by=run.created_by,
     )
     db_session.add(brief); db_session.flush()
     return fact_snapshot, kit_version, brief
 
 
-def _create_master(db_session, run, *, chain=None, parent_version_id=None, downstream_output_refs=(), **overrides):
+def _create_master(
+    db_session, run, *, chain=None, parent_version_id=None, downstream_output_refs=(),
+    usable_asset_refs=(), **overrides,
+):
     source, truth, confirmation = chain or _source_truth_confirmation(db_session, run)
-    fact_snapshot, kit, brief = _master_dependencies(db_session, run)
+    normalized_usable_assets = [dict(item) for item in usable_asset_refs]
+    fact_snapshot, kit, brief = _master_dependencies(
+        db_session, run, (source, truth, confirmation), usable_asset_refs=normalized_usable_assets,
+    )
     payload = {
         "workspace_id": run.workspace_id,
         "project_id": run.project_id,
@@ -170,11 +256,17 @@ def _create_master(db_session, run, *, chain=None, parent_version_id=None, downs
         "confirmation_reference": _ref(confirmation.id, confirmation.version, confirmation.canonical_hash),
         "creative_brief_reference": _ref(brief.id, brief.version, brief.output_hash),
         "brand_kit_reference": _ref(kit.id, kit.version, kit.content_hash),
-        "evidence_artifact_refs": [_ref("evidence-artifact:fan")],
+        "evidence_artifact_refs": list(truth.evidence_refs_json),
         "approved_fact_snapshot_ref": _ref(fact_snapshot.id, 1, fact_snapshot.snapshot_hash),
-        "approved_asset_manifest_ref": _ref("manifest:fan"),
-        "copy_artifact_ref": _ref("copywriting:fan", artifact_key="copywriting", schema_version="lg10-copy-v1"),
-        "page_plan_artifact_ref": _ref("page-planning:fan", artifact_key="page_planning", schema_version="lg10-page-plan-v1"),
+        "approved_asset_manifest_ref": lg12i_approved_asset_manifest_reference(
+            source_reference=_ref(source.id, source.version, source.canonical_hash), usable_asset_refs=normalized_usable_assets,
+        ),
+        "copy_artifact_ref": lg12i_pending_production_artifact_reference(
+            artifact_key="copywriting", creative_brief_reference=_ref(brief.id, brief.version, brief.output_hash),
+        ),
+        "page_plan_artifact_ref": lg12i_pending_production_artifact_reference(
+            artifact_key="page_planning", creative_brief_reference=_ref(brief.id, brief.version, brief.output_hash),
+        ),
         "target_channels": ["smartstore", "coupang"],
         "parent_version_id": parent_version_id,
         "downstream_output_refs": downstream_output_refs,
@@ -354,8 +446,12 @@ def test_lg12i_confirmation_pins_confirmed_rejected_unknown_fact_states_and_reje
             db_session, workspace_id=run.workspace_id, project_id=run.project_id, creator_run_id=run.id,
             created_by=run.created_by, truth_reference=_ref(truth.id, truth.version, truth.canonical_hash),
             answers=[{"question_id": "same", "answer": "ambiguous"}],
-            confirmed_fact_refs=[_fact_state_ref("fact:confirmed")],
+            confirmed_fact_refs=[_seller_confirmed_fact_state_ref("fact:confirmed")],
             rejected_fact_refs=[_fact_state_ref("fact:confirmed")], unknown_fact_refs=[], rights_confirmations=[],
+            confirmation_cycle=2,
+            parent_confirmation_reference=_ref(
+                confirmation.id, confirmation.version, confirmation.canonical_hash
+            ),
         )
 
 
@@ -377,8 +473,9 @@ def test_lg12i_answers_do_not_implicitly_promote_facts_or_allow_raw_master_artif
         confirmed_fact_ids=(),
         answers=[{"question_id": "confirm-capacity", "answer": "confirmed"}],
     )
-    with pytest.raises(IntakeVersionContractError, match="Only seller-confirmed facts"):
-        _create_master(db_session, run, chain=no_state_chain)
+    master = _create_master(db_session, run, chain=no_state_chain)
+    snapshot = db_session.query(FactSnapshot).filter_by(id=master.approved_fact_snapshot_ref_json["id"]).one()
+    assert snapshot.facts_json == []
 
     chain = _source_truth_confirmation(db_session, run)
     with pytest.raises(IntakeVersionContractError, match="not a copied artifact body"):
@@ -415,7 +512,7 @@ def test_lg12i_master_requires_every_reference_and_never_touches_provider_cost_o
         # Directly exercise the missing required reference contract while all
         # upstream versions remain valid and immutable.
         source, truth, confirmation = _source_truth_confirmation(db_session, run)
-        fact_snapshot, kit, brief = _master_dependencies(db_session, run)
+        fact_snapshot, kit, brief = _master_dependencies(db_session, run, (source, truth, confirmation))
         create_commerce_creative_master_version(
             db_session, workspace_id=run.workspace_id, project_id=run.project_id, creator_run_id=run.id,
             created_by=run.created_by,
@@ -426,7 +523,7 @@ def test_lg12i_master_requires_every_reference_and_never_touches_provider_cost_o
             brand_kit_reference=_ref(kit.id, kit.version, kit.content_hash), evidence_artifact_refs=[],
             approved_fact_snapshot_ref=_ref(fact_snapshot.id, 1, fact_snapshot.snapshot_hash),
             approved_asset_manifest_ref=_ref("manifest:fan"), copy_artifact_ref=_ref("copywriting:fan"),
-            page_plan_artifact_ref=_ref("page-planning:fan"), target_channels=["smartstore"],
+            page_plan_artifact_ref=_ref("page-planning:fan"), target_channels=["smartstore", "coupang"],
         )
     assert db_session.query(ImageGenerationOutboxRecord).count() == before["outbox"]
     assert db_session.query(ImageGenerationCostApprovalRecord).count() == before["cost"]

@@ -373,6 +373,15 @@ def execute_image_generation(
                     role=record.role,
                     identity_constraints=dict(scene_prompt.get("identity_constraints") or {}),
                 )
+                # Preserve only the provider interface's bounded visual
+                # observation.  It remains non-factual QA evidence and is
+                # checked against frozen Truth/confirmation when the child
+                # DetailPage is evaluated.
+                if result.observed_identity:
+                    identity_report = {
+                        **identity_report,
+                        "observed_identity": dict(result.observed_identity),
+                    }
                 warnings = list(identity_report.get("warnings") or [])
             else:
                 warnings = ProductIdentityValidator.validate_identity_preservation(

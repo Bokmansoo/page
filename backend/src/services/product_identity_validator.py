@@ -1,11 +1,196 @@
+import hashlib
 import io
+import json
+from pathlib import Path
 import re
 from PIL import Image
-from typing import Any, List
+from typing import Any, List, Mapping
+
+from src.services.image_asset_inspector import (
+    MAX_ASPECT_RATIO,
+    MIN_ASPECT_RATIO,
+    MIN_RECOMMENDED_EDGE,
+)
 
 
 class ProductIdentityValidationError(Exception):
     pass
+
+
+LG12_FROZEN_IMAGE_EVIDENCE_SCHEMA_VERSION = "lg12-frozen-image-evidence-v1"
+_LG12_IDENTITY_FIELDS = frozenset({
+    "product_identity", "product_name", "model", "model_name", "sku",
+    "variant", "product_variant", "color", "colour", "finish", "material",
+    "material_grade", "component", "components", "component_count",
+})
+
+
+def _canonical_image_evidence_hash(value: Mapping[str, Any]) -> str:
+    """Hash bounded frozen evidence without treating its self-hash as content."""
+
+    body = dict(value)
+    body.pop("evidence_hash", None)
+    encoded = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _bounded_identity_metadata(value: Any) -> dict[str, str]:
+    """Keep only explicit, small visual identity labels; never infer pixels."""
+
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, str] = {}
+    for key, raw in value.items():
+        normalized = str(key or "").strip().lower()
+        if normalized not in _LG12_IDENTITY_FIELDS or not isinstance(raw, str):
+            continue
+        text = raw.strip()
+        if text and len(text) <= 160:
+            result[normalized] = text
+    return dict(sorted(result.items()))
+
+
+def _bounded_lg9_validation_summary(value: Any) -> dict[str, Any]:
+    """Freeze the structured LG-9 signals used by TASK-12.4, not raw output."""
+
+    result = dict(value or {}) if isinstance(value, Mapping) else {}
+    details = dict(result.get("details") or {})
+    identity = dict(details.get("identity") or {})
+    checks: list[dict[str, str]] = []
+    raw_checks = identity.get("checks") or {}
+    if isinstance(raw_checks, Mapping):
+        raw_checks = [
+            {"feature": key, **dict(item)} if isinstance(item, Mapping) else {"feature": key, "status": item}
+            for key, item in raw_checks.items()
+        ]
+    if isinstance(raw_checks, list):
+        for item in raw_checks:
+            if not isinstance(item, Mapping):
+                continue
+            feature = str(item.get("feature") or "").strip().lower()
+            status = str(item.get("status") or "").strip().lower()
+            if feature and status and len(feature) <= 64 and len(status) <= 64:
+                checks.append({"feature": feature, "status": status})
+    checks.sort(key=lambda item: (item["feature"], item["status"]))
+    crop = dict(details.get("crop") or {})
+    return {
+        "status": str(result.get("status") or "").strip().lower(),
+        "identity_status": str(identity.get("status") or "").strip().lower(),
+        "identity_checks": checks,
+        "identity_metadata": _bounded_identity_metadata(
+            identity.get("observed_identity") or identity.get("identity_metadata")
+        ),
+        "quality_warnings": sorted({str(item).upper() for item in list(result.get("warnings") or []) if isinstance(item, str)}),
+        "risk_codes": sorted({str(item).lower() for item in list(result.get("risk_codes") or []) if isinstance(item, str)}),
+        "safe_crop_status": str(crop.get("safe_crop_status") or "").strip().lower(),
+    }
+
+
+def build_frozen_image_quality_evidence(*, asset: Any, job: Any | None) -> dict[str, Any]:
+    """Capture bounded image QA input exactly when an asset enters a frozen page.
+
+    The evaluator can later consult a mutable Asset row only for its storage
+    locator and to re-check the bytes.  Quality, crop, and identity semantics
+    must come from this immutable manifest evidence snapshot.
+    """
+
+    inspection = inspect_frozen_image_file(
+        file_path=str(getattr(asset, "file_path", "") or ""),
+        declared_mime_type=str(getattr(asset, "mime_type", "") or ""),
+    )
+    asset_hash = str(getattr(asset, "content_hash", "") or "")
+    if not asset_hash or inspection["content_hash"] != asset_hash:
+        raise ProductIdentityValidationError("Frozen image asset content hash does not match its storage bytes.")
+    validation = _bounded_lg9_validation_summary(getattr(job, "validation_result", {}) if job is not None else {})
+    metadata = {
+        "identity_status": str(getattr(asset, "identity_status", "") or "").strip().lower(),
+        "product_identity_preserved": bool(getattr(asset, "product_identity_preserved", False)),
+        "safe_crop_status": str(getattr(asset, "safe_crop_status", "") or "").strip().lower(),
+        "quality_warnings": sorted({
+            str(item).upper() for item in list(getattr(asset, "quality_warnings", None) or []) if isinstance(item, str)
+        }),
+        "identity_metadata": validation["identity_metadata"],
+    }
+    generation = None
+    if job is not None:
+        generation = {
+            "record_id": str(getattr(job, "id", "") or ""),
+            "job_id": str(getattr(job, "job_id", "") or ""),
+            "output_asset_id": str(getattr(job, "output_asset_id", "") or ""),
+            "validation_result_hash": _canonical_image_evidence_hash({"validation": validation}),
+            "validation": validation,
+        }
+    body = {
+        "schema_version": LG12_FROZEN_IMAGE_EVIDENCE_SCHEMA_VERSION,
+        "asset": {"id": str(getattr(asset, "id", "") or ""), "version": 1, "hash": asset_hash},
+        "file": {
+            "content_hash": inspection["content_hash"], "width": int(inspection["width"]),
+            "height": int(inspection["height"]), "format": str(inspection["image_format"]),
+        },
+        "metadata": metadata,
+        "generation": generation,
+    }
+    return {**body, "evidence_hash": _canonical_image_evidence_hash(body)}
+
+
+def inspect_frozen_image_file(*, file_path: str, declared_mime_type: str) -> dict[str, Any]:
+    """Read only bounded integrity metadata for one frozen local image.
+
+    This deliberately returns no image body or pixels.  The quality evaluator
+    uses the same established image inspection limits as LG-9 and verifies the
+    file once before deriving dimensions/format metadata.
+    """
+
+    mime_by_format = {
+        "PNG": "image/png",
+        "JPEG": "image/jpeg",
+        "WEBP": "image/webp",
+    }
+    path = Path(str(file_path or ""))
+    if not path.is_file():
+        raise ProductIdentityValidationError("Frozen image file is missing.")
+    byte_size = path.stat().st_size
+    if byte_size <= 0:
+        raise ProductIdentityValidationError("Frozen image file is empty.")
+    if declared_mime_type not in mime_by_format.values():
+        raise ProductIdentityValidationError("Frozen image MIME type is unsupported.")
+
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    try:
+        # Pillow documents that verify() must be immediately followed by a
+        # reopen before metadata/pixels are accessed.  Loading after reopen
+        # catches defects that are only visible while decoding the raster.
+        with Image.open(path) as image:
+            image.verify()
+        with Image.open(path) as image:
+            image.load()
+            image_format = str(image.format or "")
+            width, height = image.size
+    except Exception as exc:  # Pillow raises format-specific decode errors.
+        raise ProductIdentityValidationError("Frozen image bytes are corrupt or undecodable.") from exc
+
+    if mime_by_format.get(image_format) != declared_mime_type:
+        raise ProductIdentityValidationError("Frozen image MIME type does not match decoded format.")
+    if width <= 0 or height <= 0:
+        raise ProductIdentityValidationError("Frozen image dimensions are invalid.")
+
+    warnings: list[str] = []
+    if width < MIN_RECOMMENDED_EDGE or height < MIN_RECOMMENDED_EDGE:
+        warnings.append("LOW_RESOLUTION")
+    aspect_ratio = width / height
+    if aspect_ratio < MIN_ASPECT_RATIO or aspect_ratio > MAX_ASPECT_RATIO:
+        warnings.append("EXTREME_ASPECT_RATIO")
+    return {
+        "content_hash": digest.hexdigest(),
+        "byte_size": byte_size,
+        "image_format": image_format,
+        "width": width,
+        "height": height,
+        "warnings": warnings,
+    }
 
 
 class ProductIdentityValidator:

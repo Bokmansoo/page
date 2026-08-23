@@ -89,8 +89,11 @@ def test_lg11_copy_edit_forks_frozen_version_without_provider_or_asset_changes(
         source,
         copy_changes={"hero": {"hero_subtitle": "제품을 더 간결하게 소개합니다"}},
     )
-    assert state["status"] == "completed"
-    assert state["current_stage"] == "copy_version_forked"
+    # Every immutable LG-11 child now passes through the shared LG-12 QA
+    # gate.  This legacy fixture has no LG-12 Master lineage, so it safely
+    # stops at the bounded review gate rather than bypassing QA.
+    assert state["status"] == "awaiting_review"
+    assert state["current_stage"] == "quality_review"
     fork = state["values"]["edit"]["copy_version_fork"]
     assert fork["source_detail_page_version_id"] == source.id
     assert fork["parent_detail_page_version_id"] == source.id
@@ -173,10 +176,13 @@ def test_lg11_copy_fork_rebuilds_checkpointed_result_without_duplicate_version(
     edit_run.status = "running"
     db_session.add(edit_run)
     db_session.commit()
-    recovered = client.post(f"/api/v1/graph-runs/{edit_run.id}/resume", headers=auth_headers)
+    recovered = client.post(
+        f"/api/v1/graph-runs/{edit_run.id}/resume", headers=auth_headers,
+        json={"mode": "recover", "thread_id": edit_run.id},
+    )
     assert recovered.status_code == 200, recovered.text
     db_session.refresh(edit_run)
-    assert edit_run.status == "completed"
+    assert edit_run.status == "awaiting_review"
     assert edit_run.outputs_json["langgraph_edit"]["copy_version_fork"] == expected_fork
     assert db_session.query(DetailPageVersion).filter_by(project_id=source_run.project_id).count() == version_count
 
@@ -263,7 +269,7 @@ def test_lg11_existing_fact_rewrite_keeps_only_verified_field_provenance(
         source,
         copy_changes={"hero": {"hero_title": "저소음 모터를 강조한 선풍기"}},
     )
-    assert state["current_stage"] == "copy_version_forked"
+    assert state["current_stage"] == "quality_review"
     fork = state["values"]["edit"]["copy_version_fork"]
     edited = db_session.query(DetailPageVersion).filter_by(id=fork["detail_page_version_id"]).one()
     copy_ref = edited.sections_json["lg10"]["canonical_page_assembly_input"]["sections"][0]["copy_ref"]

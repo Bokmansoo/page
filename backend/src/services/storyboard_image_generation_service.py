@@ -857,9 +857,14 @@ def start_storyboard_job(
     allow_mock_provider: bool = False,
 ) -> dict[str, Any]:
     job = _job_for_project(project, job_id, db)
+    frozen_lg11_source = bool((job.usage_metadata or {}).get("lg11_source_version_id"))
     cards_by_id = {card.get("id"): card for card in _cards(project)}
     card = cards_by_id.get(job.section_id)
-    if card is None:
+    # An LG-11 regeneration is derived from its frozen source version.  Its
+    # dispatch must not depend on a later mutable planning-card projection
+    # still containing the historical scene; that would make a valid frozen
+    # rework unrecoverable after a planning edit.
+    if card is None and not frozen_lg11_source:
         raise StoryboardImageGenerationError("The storyboard scene for this job no longer exists.")
     if job.status in {"approved", "needs_review", "running", "generating", "queued"}:
         return _job_payload(job, card)
@@ -868,7 +873,6 @@ def start_storyboard_job(
         db.commit()
         return _job_payload(job, card)
 
-    frozen_lg11_source = bool((job.usage_metadata or {}).get("lg11_source_version_id"))
     if frozen_lg11_source:
         # An LG-11 child is derived from an immutable final version.  Preserve
         # the original LG-9 prompt/reference/fact snapshot verbatim rather
@@ -895,7 +899,7 @@ def start_storyboard_job(
         db.commit()
         return _job_payload(job, card)
 
-    confirmed_facts = _confirmed_facts(project, card, db)
+    confirmed_facts = [] if frozen_lg11_source else _confirmed_facts(project, card, db)
     if not frozen_lg11_source and not _power_scene_is_grounded(card, confirmed_facts):
         job.status = "blocked"
         job.error_code = "POWER_FACT_REQUIRED"
@@ -1134,35 +1138,37 @@ def approve_storyboard_job(project: ProductProject, job_id: str, db: Session, id
     if not asset.content_hash:
         asset.content_hash = image_sha256(asset.file_path)
 
+    frozen_lg11_source = bool((job.usage_metadata or {}).get("lg11_source_version_id"))
     draft = deepcopy(project.planning_draft or {})
     matched = next((card for card in draft.get("cards") or [] if card.get("id") == job.section_id), None)
-    if matched is None:
+    if matched is None and not frozen_lg11_source:
         raise StoryboardImageGenerationError("The storyboard scene for this job no longer exists.")
-    matched["image_asset_id"] = asset.id
-    matched["image_requirement"] = "asset_ready"
-    matched["missing_reasons"] = []
-    matched["candidate_asset_ids"] = [asset.id, *(matched.get("candidate_asset_ids") or [])]
-    matched["candidate_asset_ids"] = list(dict.fromkeys(matched["candidate_asset_ids"]))
-    project.planning_draft = record_storyboard_revision(draft, "ai_redesign_approved")
-    # A seller may have assembled a text-first page while waiting for API
-    # budget or credentials. Once this scene is approved, upgrade the matching
-    # live page section in place instead of forcing the seller to rebuild the
-    # entire page and lose their later text/layout edits.
-    page = db.query(ProductPage).filter(ProductPage.project_id == project.id).first()
-    if page:
-        section = (
-            db.query(PageSection)
-            .filter(PageSection.page_id == page.id, PageSection.section_type == matched.get("type"))
-            .order_by(PageSection.sort_order.asc())
-            .first()
-        )
-        if section:
-            section.image_asset_id = asset.id
-            section.visual_kind = "image"
-            section.visual_payload = {
-                **dict(section.visual_payload or {}),
-                "image_generation_pending": False,
-            }
+    if matched is not None:
+        matched["image_asset_id"] = asset.id
+        matched["image_requirement"] = "asset_ready"
+        matched["missing_reasons"] = []
+        matched["candidate_asset_ids"] = [asset.id, *(matched.get("candidate_asset_ids") or [])]
+        matched["candidate_asset_ids"] = list(dict.fromkeys(matched["candidate_asset_ids"]))
+        project.planning_draft = record_storyboard_revision(draft, "ai_redesign_approved")
+        # A seller may have assembled a text-first page while waiting for API
+        # budget or credentials. Once this scene is approved, upgrade the matching
+        # live page section in place instead of forcing the seller to rebuild the
+        # entire page and lose their later text/layout edits.
+        page = db.query(ProductPage).filter(ProductPage.project_id == project.id).first()
+        if page:
+            section = (
+                db.query(PageSection)
+                .filter(PageSection.page_id == page.id, PageSection.section_type == matched.get("type"))
+                .order_by(PageSection.sort_order.asc())
+                .first()
+            )
+            if section:
+                section.image_asset_id = asset.id
+                section.visual_kind = "image"
+                section.visual_payload = {
+                    **dict(section.visual_payload or {}),
+                    "image_generation_pending": False,
+                }
     job.status = "approved"
     if is_generated_output:
         # Promote only the explicitly approved candidate into the final-output

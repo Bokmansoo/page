@@ -302,7 +302,7 @@ export default function CreativeBriefInputPanel({ projectId, runId }: { projectI
         </div>
         <div className="mt-3"><strong>섹션 계약</strong><div className="mt-1 space-y-1">{(data.trace.sections ?? []).map((section, index) => <p key={`${section.section}-${index}`}>{section.section} · target: {section.target} · objective: {section.objective} · facts: {section.fact_ids.join(", ") || "없음"} · copy: {section.copy_classification}</p>)}</div></div>
         <div className="mt-3"><strong>자동 승인 이력</strong><div>{(data.trace.auto_approval_history ?? []).length ? data.trace.auto_approval_history?.map((event, index) => <p key={`${event.stage}-${index}`}>{event.stage} · {event.decision} · {event.rationale}</p>) : <p>없음</p>}</div></div>
-        <div className="mt-3"><strong>stale artifact / 영향 범위</strong><div>{(data.trace.stale_artifacts ?? []).length ? data.trace.stale_artifacts?.map((item, index) => <p key={`${item.artifact}-${index}`}>{item.artifact} · {JSON.stringify(item.impact)} · {item.reason}</p>) : <p>없음</p>}</div></div>
+        <div className="mt-3"><strong>이전 자료 및 영향 범위</strong><div>{(data.trace.stale_artifacts ?? []).length ? data.trace.stale_artifacts?.map((item, index) => <p key={`${item.artifact}-${index}`}>{item.artifact} · {JSON.stringify(item.impact)} · {item.reason}</p>) : <p>없음</p>}</div></div>
       </details>}
       {message && <p role="status" className={`mt-3 rounded p-2 ${message.startsWith("[") ? "bg-rose-50 text-rose-800" : "bg-emerald-50 text-emerald-800"}`}>{message}</p>}
     </section>

@@ -11,25 +11,242 @@ from io import BytesIO
 from html import escape
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 from urllib.parse import urlencode
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from sqlalchemy.orm import Session
 from src.db.models import Asset, ExportArtifact
 from src.services.commerce_policy import REFERENCE_SOURCE_TYPES, is_asset_final_output_eligible
 from src.services.page_asset_policy import get_page_eligible_assets
-from src.services.channel_export_service import image_sha256
-from src.services.page_visual_contract import LG11CanvasSafetyError, ensure_lg11_canvas_safe
+from src.services.channel_export_service import get_channel_preset, image_sha256, supported_channel_keys
+from src.services.page_visual_contract import LG11CanvasSafetyError, ensure_lg11_canvas_safe, validate_lg11_canvas_safety
+from src.services.prompt_intelligence_service import canonical_hash
 
 
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _LG10_DETAIL_PAGE_VERSION_SCHEMA = "lg10-detail-page-version-v1"
 _LG10_COPYABLE_HTML_ARTIFACT = "lg10_copyable_html"
 _LG10_STANDALONE_PACKAGE_ARTIFACT = "lg10_standalone_package"
+LG12_FROZEN_EXPORT_PARITY_EVIDENCE_SCHEMA_VERSION = "lg12-frozen-export-parity-evidence-v1"
+LG12_CHANNEL_TRANSFORM_VERSION = "channel-export-bundle-v1"
+LG12_STANDALONE_TRANSFORM_VERSION = "lg10-standalone-export-v1"
+_LG11_CHANNEL_ARTIFACT_TYPES = frozenset({"channel_long", "channel_package"})
+_LG11_EXPORT_FORMATS = frozenset({"png", "jpg", "jpeg", "html", "zip"})
 
 
 class FrozenExportSnapshotError(ValueError):
     """The immutable LG-10 version cannot safely be converted to a package."""
+
+
+def parse_lg11_export_artifact_token(artifact_token: str) -> dict[str, str] | None:
+    """Parse one channel-bound frozen artifact without guessing its channel.
+
+    The same parser is consumed by download admission and LG-12 parity checks.
+    In particular, the last token is always a format, never a fallback channel.
+    """
+
+    parts = str(artifact_token or "").split(":")
+    if len(parts) == 3 and parts[0] in _LG11_CHANNEL_ARTIFACT_TYPES:
+        artifact_type, channel, output_format = parts
+        if channel in supported_channel_keys() and output_format in _LG11_EXPORT_FORMATS:
+            return {"artifact_type": artifact_type, "channel": channel, "format": output_format}
+        return None
+    if len(parts) == 2 and parts[1] in supported_channel_keys():
+        if parts[0] == _LG10_COPYABLE_HTML_ARTIFACT:
+            return {"artifact_type": parts[0], "channel": parts[1], "format": "html"}
+        if parts[0] == _LG10_STANDALONE_PACKAGE_ARTIFACT:
+            return {"artifact_type": parts[0], "channel": parts[1], "format": "zip"}
+    return None
+
+
+def _lg12_hash_reference(*, identifier: str, version: str | int, digest: str, artifact_type: str) -> dict[str, Any]:
+    if not identifier or not digest or not _SHA256_HEX.fullmatch(str(digest)):
+        raise FrozenExportSnapshotError("Frozen export parity evidence requires an exact ID/version/hash reference.")
+    return {"id": str(identifier), "version": version, "hash": str(digest), "type": artifact_type}
+
+
+def _lg12_frozen_preview_parity_evidence(version, *, channel: str) -> dict[str, Any]:
+    """Derive bounded preview identity only from an immutable DetailPageVersion."""
+
+    if channel not in supported_channel_keys():
+        raise FrozenExportSnapshotError("Frozen preview parity requires an explicit supported channel.")
+    # Export creation enforces LG-11 safety.  Read-only QA must instead be
+    # able to return the frozen violation as structured evidence.
+    snapshot, rendering, manifest = _frozen_lg10_export_inputs(
+        version, channel=channel, enforce_channel_safety=False,
+    )
+    snapshot_body = dict(snapshot)
+    snapshot_hash = str(snapshot_body.pop("snapshot_hash", "") or "")
+    if not snapshot_hash or canonical_hash(snapshot_body) != snapshot_hash:
+        raise FrozenExportSnapshotError("Frozen DetailPageVersion hash is invalid for parity evidence.")
+    rendering_body = dict(rendering)
+    render_hash = str(rendering_body.pop("render_hash", "") or "")
+    if not render_hash or canonical_hash(rendering_body) != render_hash:
+        raise FrozenExportSnapshotError("Frozen renderer hash is invalid for parity evidence.")
+    manifest_body = dict(manifest)
+    manifest_hash = str(manifest_body.pop("manifest_hash", "") or "")
+    if not manifest_hash or canonical_hash(manifest_body) != manifest_hash:
+        raise FrozenExportSnapshotError("Frozen approved asset manifest hash is invalid for parity evidence.")
+    canonical = dict(dict(snapshot.get("lg10") or {}).get("canonical_page_assembly_input") or {})
+    rendered_sections = [dict(item) for item in list(rendering.get("sections") or []) if isinstance(item, Mapping)]
+    if not rendered_sections:
+        raise FrozenExportSnapshotError("Frozen preview parity requires rendered section identities.")
+    sections = [
+        {
+            "section_id": str(section.get("section_id") or ""),
+            "sort_order": int(section.get("sort_order")),
+            "visible": bool(dict(section.get("canvas") or {}).get("is_visible", True)),
+            "height_px": int(dict(section.get("canvas") or {}).get("height_px") or 0),
+        }
+        for section in rendered_sections
+    ]
+    if not all(item["section_id"] for item in sections) or len({item["section_id"] for item in sections}) != len(sections):
+        raise FrozenExportSnapshotError("Frozen preview contains invalid section identities.")
+    copy_fields: list[dict[str, str]] = []
+    element_refs: list[dict[str, str]] = []
+    preview_height = 0
+    for section in rendered_sections:
+        canvas = dict(section.get("canvas") or {})
+        if bool(canvas.get("is_visible", True)):
+            preview_height += max(0, int(canvas.get("height_px") or 0))
+        section_id = str(section.get("section_id") or "")
+        for element in list(section.get("canvas_elements") or []):
+            if not isinstance(element, Mapping) or bool(element.get("deleted", False)):
+                continue
+            element_id = str(element.get("element_id") or "")
+            if not element_id:
+                raise FrozenExportSnapshotError("Frozen preview contains an element without a stable identity.")
+            # Geometry, lock/group and visibility semantics are pinned by a
+            # hash only: QA reports never embed editable canvas payloads.
+            element_refs.append({
+                "section_id": section_id,
+                "element_id": element_id,
+                "element_hash": canonical_hash(dict(element)),
+            })
+        for field in list(section.get("text_layer") or []):
+            if not isinstance(field, Mapping):
+                continue
+            field_id = str(field.get("field") or "")
+            if field_id:
+                copy_fields.append({"field": field_id, "text_hash": canonical_hash(str(field.get("text") or ""))})
+    asset_refs = [
+        {"asset_id": str(item.get("asset_id") or ""), "asset_content_hash": str(item.get("asset_content_hash") or "")}
+        for item in list(manifest.get("assets") or []) if isinstance(item, Mapping)
+    ]
+    if any(not item["asset_id"] or not _SHA256_HEX.fullmatch(item["asset_content_hash"]) for item in asset_refs):
+        raise FrozenExportSnapshotError("Frozen preview asset manifest contains invalid asset references.")
+    if len(element_refs) > 256 or len({(item["section_id"], item["element_id"]) for item in element_refs}) != len(element_refs):
+        raise FrozenExportSnapshotError("Frozen preview contains invalid element identities.")
+    evidence = dict(rendering.get("lg12_layout_evidence") or {})
+    evidence_hash = str(evidence.get("evidence_hash") or "")
+    if evidence_hash:
+        evidence_body = dict(evidence); evidence_body.pop("evidence_hash", None)
+        if not _SHA256_HEX.fullmatch(evidence_hash) or canonical_hash(evidence_body) != evidence_hash:
+            raise FrozenExportSnapshotError("Frozen layout evidence hash is invalid for parity evidence.")
+    page_plan = dict((canonical.get("planning_refs") or {}).get("page_plan") or {})
+    brand_ref = dict(canonical.get("brand_kit_ref") or {})
+    return {
+        "page_ref": _lg12_hash_reference(identifier=str(version.id), version=str(snapshot.get("schema_version") or ""), digest=snapshot_hash, artifact_type="DetailPageVersion"),
+        "preview_ref": _lg12_hash_reference(identifier=f"canonical-preview:{version.id}", version=str(rendering.get("renderer_version") or "lg10"), digest=render_hash, artifact_type="frozen_preview"),
+        "renderer_ref": _lg12_hash_reference(identifier=f"canonical-renderer:{version.id}", version=str(rendering.get("renderer_version") or "lg10"), digest=render_hash, artifact_type="frozen_renderer"),
+        "channel": channel,
+        "manifest_hash": manifest_hash,
+        "sections": sections,
+        "element_refs": sorted(element_refs, key=lambda item: (item["section_id"], item["element_id"], item["element_hash"])),
+        "preview_dimensions": {
+            "width": int((validate_lg11_canvas_safety(version_snapshot=snapshot, channel=channel).get("viewport") or {}).get("width") or 0),
+            "height": preview_height,
+        },
+        "asset_refs": sorted(asset_refs, key=lambda item: (item["asset_id"], item["asset_content_hash"])),
+        "copy_refs": sorted(copy_fields, key=lambda item: (item["field"], item["text_hash"])),
+        "layout_evidence_hash": evidence_hash or None,
+        "page_plan_ref": {
+            "type": "PagePlanVersion",
+            "id": str(page_plan.get("id") or page_plan.get("artifact_id") or ""),
+            "version": page_plan.get("version") or page_plan.get("artifact_version"),
+            "hash": str(page_plan.get("hash") or page_plan.get("artifact_hash") or ""),
+        },
+        "brand_kit_ref": {
+            "type": "BrandKitVersion",
+            "id": str(brand_ref.get("brand_kit_version_id") or ""),
+            "version": str((rendering.get("brand_tokens") or {}).get("brand_kit_version") or ""),
+            "hash": str(brand_ref.get("brand_kit_hash") or ""),
+        },
+        "canvas_safety": validate_lg11_canvas_safety(version_snapshot=snapshot, channel=channel),
+    }
+
+
+def frozen_preview_parity_evidence(version, *, channel: str) -> dict[str, Any]:
+    """Public read-only frozen preview identity used by TASK-12.7."""
+
+    return _lg12_frozen_preview_parity_evidence(version, channel=channel)
+
+
+def _lg12_parity_evidence_path(file_path: str) -> Path:
+    return Path(f"{file_path}.lg12-parity.json")
+
+
+def write_lg12_frozen_export_parity_evidence(*, version, artifact: ExportArtifact, channel: str) -> dict[str, Any]:
+    """Freeze bounded lineage beside a produced export file.
+
+    This is deliberately called only after the output file and immutable
+    ExportArtifact row exist.  It never serializes HTML, images, ZIP members,
+    or mutable preview state.
+    """
+
+    parsed = parse_lg11_export_artifact_token(artifact.artifact_type)
+    if parsed is None or parsed["channel"] != channel:
+        raise FrozenExportSnapshotError("Export artifact channel identity is missing or mismatched.")
+    if not artifact.id or not artifact.file_path or not os.path.isfile(artifact.file_path):
+        raise FrozenExportSnapshotError("Frozen export artifact file is unavailable for parity evidence.")
+    # A produced artifact is still admitted only after the production LG-11
+    # safety check; the non-enforcing read above is QA-only.
+    _frozen_lg10_export_inputs(version, channel=channel)
+    preview = _lg12_frozen_preview_parity_evidence(version, channel=channel)
+    preset = get_channel_preset(channel)
+    file_hash = image_sha256(artifact.file_path)
+    transform = (
+        LG12_CHANNEL_TRANSFORM_VERSION
+        if parsed["artifact_type"] in _LG11_CHANNEL_ARTIFACT_TYPES
+        else LG12_STANDALONE_TRANSFORM_VERSION
+    )
+    body = {
+        "schema_version": LG12_FROZEN_EXPORT_PARITY_EVIDENCE_SCHEMA_VERSION,
+        "artifact_ref": _lg12_hash_reference(identifier=str(artifact.id), version=1, digest=file_hash, artifact_type="ExportArtifact"),
+        "artifact_type": parsed["artifact_type"], "channel": channel, "format": parsed["format"],
+        "file_sha256": file_hash,
+        "page_ref": preview["page_ref"], "preview_ref": preview["preview_ref"], "renderer_ref": preview["renderer_ref"],
+        "manifest_hash": preview["manifest_hash"], "sections": preview["sections"], "element_refs": preview["element_refs"],
+        "preview_dimensions": preview["preview_dimensions"], "asset_refs": preview["asset_refs"],
+        "copy_refs": preview["copy_refs"], "layout_evidence_hash": preview["layout_evidence_hash"],
+        "page_plan_ref": preview["page_plan_ref"], "brand_kit_ref": preview["brand_kit_ref"],
+        "preset": {"key": preset.key, "version": preset.version, "width": preset.width, "max_segment_height": preset.max_segment_height, "default_format": preset.default_format},
+        "transform_version": transform,
+    }
+    evidence = {**body, "evidence_hash": canonical_hash(body)}
+    _lg12_parity_evidence_path(artifact.file_path).write_text(
+        json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")), encoding="utf-8",
+    )
+    return evidence
+
+
+def load_lg12_frozen_export_parity_evidence(*, artifact: ExportArtifact) -> dict[str, Any] | None:
+    """Read and integrity-check an already frozen bounded export sidecar."""
+
+    path = _lg12_parity_evidence_path(artifact.file_path)
+    if not path.is_file():
+        return None
+    try:
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise FrozenExportSnapshotError("Frozen export parity evidence cannot be read.") from exc
+    if not isinstance(evidence, dict):
+        raise FrozenExportSnapshotError("Frozen export parity evidence is malformed.")
+    evidence_hash = str(evidence.pop("evidence_hash", "") or "")
+    if not _SHA256_HEX.fullmatch(evidence_hash) or canonical_hash(evidence) != evidence_hash:
+        raise FrozenExportSnapshotError("Frozen export parity evidence hash is invalid.")
+    evidence["evidence_hash"] = evidence_hash
+    return evidence
 
 
 def _frozen_lg10_brand_assets(rendering: dict[str, Any]) -> list[dict[str, str]]:
@@ -335,6 +552,7 @@ def _frozen_lg10_export_inputs(
     version,
     *,
     channel: str | None = "smartstore",
+    enforce_channel_safety: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     snapshot = version.sections_json if isinstance(version.sections_json, dict) else {}
     if snapshot.get("schema_version") != _LG10_DETAIL_PAGE_VERSION_SCHEMA:
@@ -342,12 +560,14 @@ def _frozen_lg10_export_inputs(
     if isinstance(snapshot.get("lg11"), dict):
         if channel not in {"smartstore", "coupang"}:
             raise FrozenExportSnapshotError("LG-11 frozen exports require an explicit channel identity.")
-        try:
-            # Direct service callers receive the same frozen Canvas gate as the
-            # HTTP preview/export APIs; this never consults a mutable draft.
-            ensure_lg11_canvas_safe(version_snapshot=snapshot, channel=channel)
-        except LG11CanvasSafetyError as exc:
-            raise FrozenExportSnapshotError(str(exc)) from exc
+        if enforce_channel_safety:
+            try:
+                # Direct service callers receive the same frozen Canvas gate as
+                # the HTTP preview/export APIs; this never consults a mutable
+                # draft.
+                ensure_lg11_canvas_safe(version_snapshot=snapshot, channel=channel)
+            except LG11CanvasSafetyError as exc:
+                raise FrozenExportSnapshotError(str(exc)) from exc
     lg10 = snapshot.get("lg10") if isinstance(snapshot.get("lg10"), dict) else {}
     canonical_input = lg10.get("canonical_page_assembly_input")
     rendering = lg10.get("canonical_rendering")

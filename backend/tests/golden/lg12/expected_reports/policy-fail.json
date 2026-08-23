@@ -1,0 +1,169 @@
+{
+  "frozen_page": {
+    "artifact_sha256": null,
+    "brand_kit_ref": null,
+    "id": "<uuid>",
+    "manifest_hash": "<sha256>",
+    "page_plan_ref": null,
+    "section_ids": [
+      "hero"
+    ],
+    "snapshot_hash": "<sha256>"
+  },
+  "graph": {
+    "attempt_ledger": [],
+    "promotion_export_readiness": "blocked",
+    "stage": "intake",
+    "status": "created"
+  },
+  "lineage": {
+    "brand_kit": {
+      "hash": "<sha256>",
+      "id": "<uuid>",
+      "version": 1
+    },
+    "brief": {
+      "hash": "<sha256>",
+      "id": "<uuid>",
+      "version": 1
+    },
+    "confirmation": {
+      "hash": "<sha256>",
+      "id": "<uuid>",
+      "version": 1
+    },
+    "master": {
+      "hash": "<sha256>",
+      "id": "<uuid>",
+      "version": 1
+    },
+    "source": {
+      "hash": "<sha256>",
+      "id": "<uuid>",
+      "version": 1
+    },
+    "truth": {
+      "hash": "<sha256>",
+      "id": "<uuid>",
+      "version": 1
+    }
+  },
+  "quality_bar": {
+    "blocking_domains": [
+      "factual_rights_policy"
+    ],
+    "canonical_hash": "<sha256>",
+    "rework_target_types": [
+      "factual_rights_policy:QualityDomainResult"
+    ],
+    "routing_code": "BLOCKED_POLICY",
+    "verdict": "FAIL"
+  },
+  "quality_report": {
+    "canonical_hash": "<sha256>",
+    "domains": [
+      {
+        "approved_asset_manifest_hash": "<sha256>",
+        "critical_count": 0,
+        "critical_rule_ids": [],
+        "domain_id": "channel_preview_export_parity",
+        "evaluation_hash": "<sha256>",
+        "evaluator_version": "lg12-channel-preview-export-parity-v1",
+        "finding_rule_ids": [],
+        "frozen_target_ref": {
+          "hash": "<sha256>",
+          "id": "<uuid>",
+          "type": "DetailPageVersion",
+          "version": "lg10-detail-page-version-v1"
+        },
+        "score": 85,
+        "status": "complete"
+      },
+      {
+        "approved_asset_manifest_hash": "<sha256>",
+        "critical_count": 2,
+        "critical_rule_ids": [],
+        "domain_id": "factual_rights_policy",
+        "evaluation_hash": "<sha256>",
+        "evaluator_version": "lg12-factual-rights-policy-v1",
+        "finding_rule_ids": [
+          "fact.approved_provenance",
+          "policy.price_advantage"
+        ],
+        "frozen_target_ref": {
+          "hash": "<sha256>",
+          "id": "<uuid>",
+          "type": "DetailPageVersion",
+          "version": "lg10-detail-page-version-v1"
+        },
+        "score": 50,
+        "status": "blocked"
+      },
+      {
+        "approved_asset_manifest_hash": "<sha256>",
+        "critical_count": 0,
+        "critical_rule_ids": [],
+        "domain_id": "image_identity_quality",
+        "evaluation_hash": "<sha256>",
+        "evaluator_version": "lg12-image-identity-quality-v1",
+        "finding_rule_ids": [],
+        "frozen_target_ref": {
+          "hash": "<sha256>",
+          "id": "<uuid>",
+          "type": "DetailPageVersion",
+          "version": "lg10-detail-page-version-v1"
+        },
+        "score": 85,
+        "status": "complete"
+      },
+      {
+        "approved_asset_manifest_hash": "<sha256>",
+        "critical_count": 0,
+        "critical_rule_ids": [],
+        "domain_id": "korean_copy_readability",
+        "evaluation_hash": "<sha256>",
+        "evaluator_version": "lg12-korean-copy-readability-v2",
+        "finding_rule_ids": [],
+        "frozen_target_ref": {
+          "hash": "<sha256>",
+          "id": "<uuid>",
+          "type": "DetailPageVersion",
+          "version": "lg10-detail-page-version-v1"
+        },
+        "score": 85,
+        "status": "complete"
+      },
+      {
+        "approved_asset_manifest_hash": "<sha256>",
+        "critical_count": 0,
+        "critical_rule_ids": [],
+        "domain_id": "layout_typography_brand_flow",
+        "evaluation_hash": "<sha256>",
+        "evaluator_version": "lg12-layout-typography-brand-flow-v2",
+        "finding_rule_ids": [],
+        "frozen_target_ref": {
+          "hash": "<sha256>",
+          "id": "<uuid>",
+          "type": "DetailPageVersion",
+          "version": "lg10-detail-page-version-v1"
+        },
+        "score": 85,
+        "status": "complete"
+      }
+    ],
+    "id": "<uuid>",
+    "threshold_profile_ref": {
+      "hash": "<sha256>",
+      "id": "profile:factual",
+      "version": 1
+    },
+    "version": 1
+  },
+  "scenario_details": {
+    "critical_count": 4,
+    "export": false,
+    "promotion": false
+  },
+  "schema_version": "lg12-quality-golden-baseline-v1",
+  "semantic_hash": "<sha256>"
+}

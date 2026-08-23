@@ -6,10 +6,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    APP_ENV: str = "development"
     # Sellform runtime uses PostgreSQL by default.
     # SQLite was used only in early MVP sprints and should not be used for
     # normal local development or product verification.
     DATABASE_URL: str = "postgresql://sellform:sellformpassword@localhost:5544/sellform_dev"
+    # PostgreSQL-only integration and browser E2E use an explicitly separate
+    # local database.  These are intentionally never implicit fallbacks for
+    # unit tests or ordinary runtime configuration.
+    TEST_DATABASE_URL: str | None = None
+    UNIT_TEST_DATABASE_URL: str | None = None
+    E2E_DATABASE_URL: str | None = None
+    SELLFORM_ALLOW_TEST_DATABASE: bool = False
     UPLOAD_DIR: str = "./uploads"
     MAX_UPLOAD_SIZE_MB: int = 10
 

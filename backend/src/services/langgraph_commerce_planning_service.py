@@ -25,6 +25,7 @@ from src.services.rule_based_copy_service import unsupported_claims
 
 
 COMMERCE_ARTIFACT_KEY = "langgraph_commerce_planning_artifacts"
+COMMERCE_ARTIFACT_HISTORY_KEY = "langgraph_commerce_planning_artifact_versions"
 COMMERCE_VERSION = "lg3-v1"
 _STAGES = ("sales_strategy", "page_planning", "copywriting", "visual_planning")
 _BLOCKED_COPY_TERMS = (
@@ -59,12 +60,28 @@ def _store(run: AgentRun, stage: str, output: dict[str, Any], *, metadata: dict[
         payload = dict(active_run.outputs_json or {})
         artifacts = dict(payload.get(COMMERCE_ARTIFACT_KEY) or {})
         artifact_hash = _canonical_hash({"stage": stage, "output": output, "metadata": metadata})
-        artifacts[stage] = {
+        record = {
             "schema_version": COMMERCE_VERSION,
             "output": deepcopy(output),
             "metadata": {**deepcopy(metadata), "artifact_hash": artifact_hash},
         }
-        active_run.outputs_json = {**payload, COMMERCE_ARTIFACT_KEY: artifacts}
+        artifacts[stage] = record
+        # The active projection remains the established LG-3 contract.  Keep
+        # immutable snapshots alongside it so a later frozen page can pin an
+        # exact PagePlan version instead of trusting today's mutable pointer.
+        history = dict(payload.get(COMMERCE_ARTIFACT_HISTORY_KEY) or {})
+        versions = [dict(value) for value in list(history.get(stage) or []) if isinstance(value, dict)]
+        if not any(
+            str(dict(value.get("metadata") or {}).get("artifact_hash") or "") == artifact_hash
+            for value in versions
+        ):
+            versions.append(deepcopy(record))
+        history[stage] = versions
+        active_run.outputs_json = {
+            **payload,
+            COMMERCE_ARTIFACT_KEY: artifacts,
+            COMMERCE_ARTIFACT_HISTORY_KEY: history,
+        }
         db.add(active_run)
         # Persist before a LangGraph checkpoint is written. LG-1 history replay
         # repairs an operational step projection if the process stops after it.
@@ -72,6 +89,147 @@ def _store(run: AgentRun, stage: str, output: dict[str, Any], *, metadata: dict[
         return {"artifact_key": stage, "artifact_hash": artifact_hash, "schema_version": COMMERCE_VERSION}
     finally:
         if owns_session:
+            db.close()
+
+
+def _artifact_identity(reference: dict[str, Any]) -> tuple[str, int, str]:
+    """Read the one canonical identity shape shared by Master and LG-10."""
+
+    identifier = str(reference.get("id") or reference.get("artifact_id") or "")
+    raw_version = reference.get("version", reference.get("artifact_version"))
+    digest = str(reference.get("hash") or reference.get("artifact_hash") or "")
+    try:
+        version = int(raw_version)
+    except (TypeError, ValueError):
+        version = 0
+    return identifier, version if version > 0 else 0, digest
+
+
+def resolve_commerce_planning_artifact_version(
+    *, run: AgentRun, stage: str, reference: dict[str, Any],
+) -> dict[str, Any]:
+    """Return one persisted immutable planning artifact by exact ID/version/hash.
+
+    This deliberately reads the run's append-only artifact history.  It never
+    treats the current ``page_planning`` projection as authority for a frozen
+    reference supplied by a caller.
+    """
+
+    if stage not in _STAGES:
+        raise ValueError("Unsupported commerce planning artifact stage.")
+    identifier, version, digest = _artifact_identity(dict(reference or {}))
+    if not identifier or not version or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("Commerce planning artifact reference is incomplete.")
+    history = dict((run.outputs_json or {}).get(COMMERCE_ARTIFACT_HISTORY_KEY) or {})
+    matches: list[dict[str, Any]] = []
+    for value in list(history.get(stage) or []):
+        item = dict(value or {})
+        metadata = dict(item.get("metadata") or {})
+        actual = _canonical_hash({
+            "stage": stage,
+            "output": dict(item.get("output") or {}),
+            "metadata": {key: val for key, val in metadata.items() if key != "artifact_hash"},
+        })
+        if actual != str(metadata.get("artifact_hash") or ""):
+            raise ValueError("Commerce planning artifact history hash is tampered.")
+        if (
+            str(metadata.get("artifact_id") or "") == identifier
+            and int(metadata.get("artifact_version") or 0) == version
+            and str(metadata.get("artifact_hash") or "") == digest
+        ):
+            matches.append(deepcopy(item))
+    if len(matches) != 1:
+        raise ValueError("Commerce planning artifact reference is not an exact persisted version.")
+    return matches[0]
+
+
+def create_page_plan_reorder_successor(
+    *, run: AgentRun, parent_reference: dict[str, Any], desired_section_ids: list[str],
+) -> dict[str, Any]:
+    """Append one immutable PagePlan successor for a verified Canvas reorder.
+
+    The parent page plan and the active planning projection are left untouched;
+    only the new Master/DetailPage child can reference this rework result.
+    """
+
+    parent = resolve_commerce_planning_artifact_version(
+        run=run, stage="page_planning", reference=parent_reference,
+    )
+    metadata = dict(parent["metadata"])
+    parent_id, parent_version, parent_hash = _artifact_identity(parent_reference)
+    output = DetailPagePlanOutput.model_validate(dict(parent["output"])).model_dump()
+    sections = [dict(section) for section in list(output.get("sections") or [])]
+    section_ids = [str(section.get("id") or "") for section in sections]
+    if (
+        len(section_ids) != len(set(section_ids))
+        or sorted(desired_section_ids) != sorted(section_ids)
+        or len(desired_section_ids) != len(section_ids)
+    ):
+        raise ValueError("PagePlan reorder must name every persisted section exactly once.")
+    by_id = {str(section["id"]): section for section in sections}
+    successor_output = {**output, "sections": [deepcopy(by_id[section_id]) for section_id in desired_section_ids]}
+    prior_contract = {
+        str(item.get("section_id") or ""): dict(item)
+        for item in list(metadata.get("section_scene_contract") or []) if isinstance(item, dict)
+    }
+    if set(prior_contract) != set(section_ids):
+        raise ValueError("PagePlan successor requires a complete frozen section/scene contract.")
+    successor_contract = []
+    for order, section_id in enumerate(desired_section_ids):
+        item = deepcopy(prior_contract[section_id])
+        item["section_order"] = order
+        item["scene_order"] = order
+        successor_contract.append(item)
+    successor_version = parent_version + 1
+    successor_metadata = {
+        **{key: value for key, value in metadata.items() if key not in {"artifact_hash", "artifact_id", "artifact_version", "section_scene_contract"}},
+        "artifact_id": "page-plan:" + _canonical_hash({
+            "parent": {"id": parent_id, "version": parent_version, "hash": parent_hash},
+            "sections": desired_section_ids,
+        })[:24],
+        "artifact_version": successor_version,
+        "parent_artifact_ref": {"id": parent_id, "version": parent_version, "hash": parent_hash, "type": "PagePlanVersion"},
+        "rework_action": "plan_reorder",
+        "section_scene_contract": successor_contract,
+    }
+    db, owns_session = _node_session()
+    completed = False
+    try:
+        active_run = db.query(AgentRun).filter(AgentRun.id == run.id).with_for_update().one()
+        payload = dict(active_run.outputs_json or {})
+        history = dict(payload.get(COMMERCE_ARTIFACT_HISTORY_KEY) or {})
+        artifact_hash = _canonical_hash({"stage": "page_planning", "output": successor_output, "metadata": successor_metadata})
+        record = {
+            "schema_version": COMMERCE_VERSION,
+            "output": deepcopy(successor_output),
+            "metadata": {**successor_metadata, "artifact_hash": artifact_hash},
+        }
+        versions = [dict(value) for value in list(history.get("page_planning") or []) if isinstance(value, dict)]
+        existing = [value for value in versions if str(dict(value.get("metadata") or {}).get("artifact_hash") or "") == artifact_hash]
+        if existing:
+            record = existing[0]
+        else:
+            versions.append(record)
+            history["page_planning"] = versions
+            active_run.outputs_json = {**payload, COMMERCE_ARTIFACT_HISTORY_KEY: history}
+            db.add(active_run)
+            db.flush()
+        completed = True
+        return {
+            "id": str(record["metadata"]["artifact_id"]),
+            "version": int(record["metadata"]["artifact_version"]),
+            "hash": str(record["metadata"]["artifact_hash"]),
+            "type": "PagePlanVersion",
+            "schema_version": COMMERCE_VERSION,
+            "artifact_key": "page_planning",
+            "section_scene_contract": deepcopy(list(record["metadata"].get("section_scene_contract") or [])),
+        }
+    finally:
+        if owns_session:
+            if completed:
+                db.commit()
+            else:
+                db.rollback()
             db.close()
 
 

@@ -13,6 +13,7 @@ from src.services.page_visual_contract import (
     lg10_renderer_direction_tokens,
     normalize_lg10_design_direction,
 )
+from src.services.prompt_intelligence_service import canonical_hash
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,164 @@ LG10_CANONICAL_RENDER_SCHEMA_VERSION = "lg10-canonical-render-v1"
 LG11_RENDERER_PAGE_WIDTH = 760
 LG11_BRAND_LOGO_GEOMETRY = {"x": 24, "y": 18, "width": 180, "height": 56}
 LG11_BRAND_WATERMARK_SIZE = {"width": 132, "height": 64, "right": 18, "bottom": 18}
+LG12_LAYOUT_EVIDENCE_SCHEMA_VERSION = "lg12-frozen-layout-evidence-v1"
+
+
+def lg12_renderer_typography_role_tokens(
+    *,
+    field: str,
+    index: int,
+    renderer_tokens: dict[str, Any],
+    brand_tokens: dict[str, Any],
+) -> dict[str, str]:
+    """Return the renderer-owned typography contract for one frozen text role.
+
+    These are named renderer/Brand-Kit tokens, not new pixel thresholds.  The
+    evaluator imports this same contract so it never invents a second set of
+    typography rules for a frozen page.
+    """
+
+    role = _lg12_copy_role(field, index)
+    typography = dict(brand_tokens.get("typography") or {})
+    return {
+        "role": role,
+        "font_token": "body_font",
+        "font_family": str(typography.get("body_font") or ""),
+        "size_token": str(renderer_tokens.get("title_scale") if role == "headline" else "renderer_body"),
+        "weight_token": "renderer_h2" if role == "headline" else "renderer_body",
+        "line_height_token": "renderer_text_1_65",
+        "letter_spacing_token": "normal",
+        "color_token": "accent" if role == "headline" else "text",
+        # The canonical CSS has no role-specific alignment override.  Pin its
+        # explicit default as a token instead of adding a numeric tolerance.
+        "alignment_token": "renderer_text_left",
+    }
+
+
+def _lg12_copy_role(field: str, index: int) -> str:
+    """Return the renderer role, without reading mutable copy artifacts."""
+
+    value = field.lower()
+    if "cta" in value or value in {"action", "action_text"}:
+        return "cta"
+    if "badge" in value or "label" in value:
+        return "badge"
+    if "subtitle" in value or "subheadline" in value or "subcopy" in value:
+        return "subheadline"
+    if "title" in value or "headline" in value or index == 0:
+        return "headline"
+    return "body"
+
+
+def _lg12_layout_evidence(
+    *,
+    rendered_sections: list[dict[str, Any]],
+    renderer_tokens: dict[str, Any],
+    brand_tokens: dict[str, Any],
+    canonical_page_assembly_input: dict[str, Any],
+) -> dict[str, Any]:
+    """Freeze bounded layout facts used by TASK-12.6.
+
+    The evidence intentionally contains renderer tokens, stable IDs, and
+    effective geometry only.  It never carries copy text, HTML, CSS, image
+    bytes, or a mutable editor projection.
+    """
+
+    cursor = 0
+    sections: list[dict[str, Any]] = []
+    colors = dict(brand_tokens.get("color_tokens") or {})
+    planning_refs = dict(canonical_page_assembly_input.get("planning_refs") or {})
+    page_plan_ref = dict(planning_refs.get("page_plan") or {})
+    brand_ref = dict(canonical_page_assembly_input.get("brand_kit_ref") or {})
+    for section in rendered_sections:
+        canvas = dict(section.get("canvas") or {})
+        visible = canvas.get("is_visible", True)
+        height = canvas.get("height_px")
+        elements = [dict(item) for item in list(section.get("canvas_elements") or []) if isinstance(item, dict)]
+        if not isinstance(height, int):
+            height = max([160, *[
+                int(item.get("y") or 0) + int(item.get("height") or 0)
+                for item in elements if not bool(item.get("deleted"))
+            ]])
+        role_tokens = []
+        for index, item in enumerate(list(section.get("text_layer") or [])):
+            if not isinstance(item, dict):
+                continue
+            field = str(item.get("field") or "")
+            role_tokens.append({"field": field, **lg12_renderer_typography_role_tokens(
+                field=field, index=index, renderer_tokens=renderer_tokens, brand_tokens=brand_tokens,
+            )})
+        scene_ref = dict(section.get("scene_ref") or {})
+        sections.append({
+            "section_id": str(section.get("section_id") or ""),
+            "sort_order": int(section.get("sort_order") or 0),
+            "visible": bool(visible),
+            "component_id": str(section.get("component_id") or ""),
+            "layout_token": str(section.get("layout_token") or ""),
+            "bounds": {"x": 0, "y": cursor, "width": LG11_RENDERER_PAGE_WIDTH, "height": int(height)},
+            "spacing_token": str(renderer_tokens.get("renderer_token") or ""),
+            "section_spacing_px": int(renderer_tokens.get("section_spacing") or 0),
+            "padding_token": "renderer_section_padding_x_24",
+            "alignment": {
+                "expected_token": "renderer_text_left",
+                "actual_token": "renderer_text_left",
+            },
+            "typography_roles": role_tokens,
+            "scene": {
+                "scene_id": str(scene_ref.get("scene_id") or ""),
+                "scene_type": str(scene_ref.get("scene_type") or ""),
+                "scene_order": scene_ref.get("scene_order"),
+                "page_plan_ref": {
+                    "id": str(scene_ref.get("page_plan_id") or page_plan_ref.get("id") or page_plan_ref.get("artifact_id") or ""),
+                    "version": scene_ref.get("page_plan_version") or page_plan_ref.get("version") or page_plan_ref.get("artifact_version"),
+                    "hash": str(scene_ref.get("page_plan_hash") or page_plan_ref.get("hash") or page_plan_ref.get("artifact_hash") or ""),
+                },
+            },
+            "elements": [
+                {
+                    "element_id": str(item.get("element_id") or ""), "kind": str(item.get("kind") or ""),
+                    "bounds": {key: item.get(key) for key in ("x", "y", "width", "height")},
+                    "locked": bool(item.get("locked")), "group_id": item.get("group_id"),
+                    "visible": not bool(item.get("deleted")),
+                }
+                for item in elements
+            ],
+        })
+        if visible:
+            cursor += int(height)
+    payload = {
+        "schema_version": LG12_LAYOUT_EVIDENCE_SCHEMA_VERSION,
+        "renderer_version": LG10_CANONICAL_RENDER_SCHEMA_VERSION,
+        # Filled after the renderer body has been assembled.  It is a hash of
+        # the frozen renderer excluding this evidence, avoiding a hash cycle.
+        "renderer_hash": "",
+        "renderer_token": str(renderer_tokens.get("renderer_token") or ""),
+        "renderer_width": LG11_RENDERER_PAGE_WIDTH,
+        "section_spacing_px": int(renderer_tokens.get("section_spacing") or 0),
+        "title_scale": str(renderer_tokens.get("title_scale") or ""),
+        "page_plan_ref": {
+            "id": str(page_plan_ref.get("id") or page_plan_ref.get("artifact_id") or ""),
+            "version": page_plan_ref.get("version") or page_plan_ref.get("artifact_version"),
+            "hash": str(page_plan_ref.get("hash") or page_plan_ref.get("artifact_hash") or ""),
+        },
+        "brand_kit_ref": {
+            "id": str(brand_tokens.get("brand_kit_version_id") or brand_ref.get("brand_kit_version_id") or ""),
+            "version": brand_tokens.get("brand_kit_version"),
+            "hash": str(brand_tokens.get("brand_kit_hash") or brand_ref.get("brand_kit_hash") or ""),
+        },
+        "color_tokens": {key: str(colors.get(key) or "") for key in ("accent", "text", "surface", "muted_surface")},
+        "typography": {"body_font": str(dict(brand_tokens.get("typography") or {}).get("body_font") or "")},
+        # No WCAG-like number is invented here.  A future frozen Brand Kit or
+        # renderer may pin a numeric contrast contract; absent one, the typed
+        # token pair remains traceable but the contrast metric is skipped.
+        "contrast": {
+            "foreground_token": "text",
+            "background_token": "surface",
+            "minimum_ratio": brand_tokens.get("contrast_minimum"),
+        },
+        "sections": sections,
+    }
+    return payload
 
 
 def lg11_effective_brand_geometry(
@@ -279,6 +438,9 @@ def render_lg10_canonical_page_html(
             "sort_order": expected_order,
             "component_id": component_id,
             "layout_token": layout_token,
+            # Bounded PagePlan scene identity only; scene content remains in
+            # its immutable planning artifact.
+            "scene_ref": dict(canonical_section.get("scene_ref") or {}),
             "asset_layer": asset_layer,
             "text_layer": text_layer,
         }
@@ -350,16 +512,28 @@ def render_lg10_canonical_page_html(
         sections="".join(section_html),
     )
     brand_geometry = lg11_effective_brand_geometry(brand_tokens=brand_tokens, rendered_sections=rendered_sections)
-    return {
+    layout_evidence = _lg12_layout_evidence(
+        rendered_sections=rendered_sections,
+        renderer_tokens=direction_tokens,
+        brand_tokens=brand_tokens,
+        canonical_page_assembly_input=canonical_page_assembly_input,
+    )
+    rendering = {
         "schema_version": LG10_CANONICAL_RENDER_SCHEMA_VERSION,
         "design_direction": design_direction,
         "renderer_tokens": direction_tokens,
         "brand_tokens": brand_tokens,
         "brand_geometry": brand_geometry,
+        "lg12_layout_evidence": layout_evidence,
         "sections": rendered_sections,
         "css": css,
         "html": html,
     }
+    renderer_body = {key: value for key, value in rendering.items() if key != "lg12_layout_evidence"}
+    layout_evidence["renderer_hash"] = canonical_hash(renderer_body)
+    layout_evidence["evidence_hash"] = canonical_hash(layout_evidence)
+    rendering["lg12_layout_evidence"] = layout_evidence
+    return rendering
 
 class PageRendererService:
     def __init__(self, upload_dir: str = "uploads"):

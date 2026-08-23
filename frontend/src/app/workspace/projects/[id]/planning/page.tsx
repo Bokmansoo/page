@@ -92,6 +92,7 @@ export default function ProjectPlanningPage() {
   const [graphView, setGraphView] = useState<GraphView | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const graphReviewStage = graphView?.values.review?.pending?.review_stage ?? null;
+  const isQualityReview = graphReviewStage === "quality_review";
 
   const loadAssets = useCallback(async () => {
     const response = await fetch(apiUrl(`/api/v1/projects/${projectId}/assets`), {
@@ -387,7 +388,7 @@ export default function ProjectPlanningPage() {
       {draft && draft.cards.length > 0 ? (
         <PlanningDraftEditor projectId={projectId} initialDraft={draft} graphRunId={graphRunId} graphReviewStage={graphReviewStage} />
       ) : (
-        <div className="mx-auto max-w-4xl space-y-5">{graphRunId ? (graphView?.status !== "failed" && graphView?.values.review?.pending && <div className="rounded-xl border border-violet-200 bg-violet-50 p-5 text-center text-sm font-semibold text-violet-900">LangGraph 판매자 승인을 기다리고 있습니다. 위 승인 요청을 완료하면 이 화면에 스토리보드가 표시됩니다.</div>) : <><ApiReadyGenerationPlanPanel projectId={projectId} /><div className="py-6 text-center font-bold text-slate-400">표시할 스토리보드가 없습니다. 상품 브리프·장면 계획을 먼저 확인한 뒤 스토리보드를 생성하세요.</div></>}</div>
+        <div className="mx-auto max-w-4xl space-y-5">{graphRunId ? (graphView?.status !== "failed" && graphView?.values.review?.pending && <div className="rounded-xl border border-violet-200 bg-violet-50 p-5 text-center text-sm font-semibold text-violet-900">{isQualityReview ? "품질 확인이 필요한 항목이 있습니다. 위에서 다음 단계를 선택해 주세요." : "판매자 확인을 기다리고 있습니다. 위 승인 요청을 완료하면 이 화면에 스토리보드가 표시됩니다."}</div>) : <><ApiReadyGenerationPlanPanel projectId={projectId} /><div className="py-6 text-center font-bold text-slate-400">표시할 스토리보드가 없습니다. 상품 브리프·장면 계획을 먼저 확인한 뒤 스토리보드를 생성하세요.</div></>}</div>
       )}
     </div>
   );

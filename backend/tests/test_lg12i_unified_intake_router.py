@@ -15,12 +15,15 @@ from src.db.models import (
     ImageGenerationOutboxRecord,
 )
 from src.services.product_intake_version_service import (
+    MANUAL_INPUT_ARTIFACT_SCHEMA_VERSION,
     UNIFIED_PRODUCT_INTAKE_SCHEMA_VERSION,
     UnifiedProductIntakeContractError,
     canonical_unified_intake_input_hash,
+    create_manual_input_artifact,
     validate_unified_product_intake_envelope,
 )
 from src.services.prompt_intelligence_service import canonical_hash
+from src.services.url_evidence_collector import OwnedProductURLCapture
 from test_lg5_image_generation_subgraph import _create_run, auth_headers as _lg5_auth_headers
 
 
@@ -91,15 +94,78 @@ def _envelope(mode: str, *, refs: list[dict[str, object]] | None = None, channel
 
 def _project_asset_ref(db_session, project_id: str) -> list[dict[str, object]]:
     from src.db.models import Asset
+    from src.services.image_asset_inspector import inspect_asset
 
     asset = db_session.query(Asset).filter_by(project_id=project_id, usage_status="seller_owned").first()
     assert asset is not None
+    inspection = inspect_asset(asset, db_session)
+    assert inspection.content_hash is not None
     return [{
         "id": asset.id,
         "kind": "asset_ref",
         "version": 1,
-        "hash": _hash(f"asset-ref:{asset.id}"),
+        "hash": inspection.content_hash,
         "rights_status": "seller_owned",
+    }]
+
+
+def _project_manual_artifact_ref(db_session, source_run) -> list[dict[str, object]]:
+    artifact = create_manual_input_artifact(
+        db_session,
+        workspace_id=source_run.workspace_id,
+        project_id=source_run.project_id,
+        created_by="00000000-0000-0000-0000-000000000001",
+        raw_body="LG-12I manual adapter router fixture",
+        source_metadata={
+            "manual_payload_schema_version": MANUAL_INPUT_ARTIFACT_SCHEMA_VERSION,
+            "seller_entered_fields": [
+                {
+                    "field_id": "model",
+                    "classification": "fact_candidate",
+                    "label": "모델명",
+                    "value": "MANUAL-1",
+                },
+                {
+                    "field_id": "tone",
+                    "classification": "creative_direction",
+                    "label": "연출 톤",
+                    "value": "정갈한",
+                },
+            ],
+            "unknown_fact_field_ids": [],
+            "rights_confirmation_state": "unknown",
+        },
+    )
+    db_session.commit()
+    return [{
+        "id": artifact.id,
+        "kind": "manual_payload_artifact",
+        "version": artifact.version,
+        "hash": artifact.content_hash,
+    }]
+
+
+def _project_owned_url_request_ref(client, headers, project_id: str) -> list[dict[str, object]]:
+    source_url = "https://store.example.com/products/fan"
+    created = client.post(
+        f"/api/v1/projects/{project_id}/reference-inputs",
+        headers=headers,
+        json={
+            "input_kind": "url",
+            "source_url": source_url,
+            "source_metadata": {
+                "owned_product_url_capture_request_schema_version": "lg12i-owned-product-url-capture-request-v1",
+                "normalized_url": source_url,
+                "rights_state": "seller_owned",
+                "provenance": "seller_submitted_owned_product_url",
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    row = created.json()
+    return [{
+        "id": row["id"], "kind": "owned_product_url_capture_request", "version": row["version"],
+        "hash": row["content_hash"], "schema_version": "lg12i-owned-product-url-capture-request-v1",
     }]
 
 
@@ -148,13 +214,30 @@ def test_lg12i_production_router_uses_one_path_for_every_input_mode(
         raise AssertionError("Legacy input router must not be called by LG-12I.")
 
     monkeypatch.setattr("src.agents.nodes.input_router.agent.InputRouterAgent.run_delta", legacy_call)
+    monkeypatch.setattr(
+        "src.services.product_intake_version_service.capture_owned_product_url",
+        lambda _url: OwnedProductURLCapture(
+            normalized_url="https://store.example.com/products/fan",
+            final_url="https://store.example.com/products/fan",
+            redirect_chain=("https://store.example.com/products/fan",),
+            captured_at="2026-08-18T00:00:00Z",
+            capture_version="fake", parser_version="fake", source_content_hash=_hash("owned-capture"),
+            title="", description="", image_urls=(), specs=(),
+        ),
+    )
     before_outbox = db_session.query(ImageGenerationOutboxRecord).count()
     before_cost = db_session.query(ImageGenerationCostApprovalRecord).count()
     before_jobs = db_session.query(ImageGenerationJobRecord).count()
 
     routed = []
     for mode in ("owned_product_url", "photo_only", "manual"):
-        refs = _project_asset_ref(db_session, source_run.project_id) if mode == "photo_only" else None
+        refs = (
+            _project_asset_ref(db_session, source_run.project_id)
+            if mode == "photo_only"
+            else _project_manual_artifact_ref(db_session, source_run)
+            if mode == "manual"
+            else _project_owned_url_request_ref(client, auth_headers, source_run.project_id)
+        )
         response = client.post(
             f"/api/v1/graph-runs/projects/{source_run.project_id}/unified-intake",
             headers=auth_headers,
@@ -166,17 +249,18 @@ def test_lg12i_production_router_uses_one_path_for_every_input_mode(
         )
         assert response.status_code == 201, response.text
         state = response.json()
-        assert state["status"] == "completed"
-        assert state["current_stage"] == "intake_adapter_pending"
+        assert state["status"] == "awaiting_review"
+        assert state["current_stage"] == "seller_confirmation"
         intake = state["values"]["intake"]
         assert intake["input_mode"] == mode
-        assert intake["next_action"] == "task_12i_adapter_not_implemented"
+        assert intake["next_action"] == "seller_confirmation"
+        assert intake["product_truth"]["truth_version"]["id"]
         assert intake["requested_generation_mode"] == ("expert" if mode == "manual" else "quick")
         assert intake["target_channels"] == ["coupang", "smartstore"]
         assert intake["run_identity"]["run_id"] == state["run_id"]
         routed.append(intake)
 
-    assert len({item["next_action"] for item in routed}) == 1
+    assert {item["next_action"] for item in routed} == {"seller_confirmation"}
     assert legacy_calls == []
     assert db_session.query(ImageGenerationJobRecord).count() == before_jobs
     assert db_session.query(ImageGenerationOutboxRecord).count() == before_outbox
@@ -297,6 +381,6 @@ def test_lg12i_idempotency_and_rebuild_restore_envelope_projection(
     recovered = client.post(f"/api/v1/graph-runs/{run.id}/resume", headers=auth_headers)
     assert recovered.status_code == 200, recovered.text
     db_session.refresh(run)
-    assert run.status == "completed"
+    assert run.status == "awaiting_review"
     assert run.outputs_json["langgraph_intake"] == expected
     assert recovered.json()["values"]["intake"] == expected

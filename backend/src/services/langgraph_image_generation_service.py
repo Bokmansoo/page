@@ -27,6 +27,10 @@ from src.db.models import (
     ProductProject,
 )
 from src.services.commerce_policy import is_asset_final_output_eligible
+from src.services.product_identity_validator import (
+    ProductIdentityValidationError,
+    build_frozen_image_quality_evidence,
+)
 from src.services.storyboard_image_generation_service import (
     StoryboardImageGenerationError,
     approve_storyboard_job,
@@ -189,7 +193,10 @@ def build_approved_asset_manifest(*, run_id: str, project_id: str, db: Session) 
         )
 
     entries: list[dict[str, Any]] = []
-    for job in required:
+    for job in sorted(
+        required,
+        key=lambda item: (str(item.scene_id or item.section_id), str(item.section_id or ""), str(item.job_id)),
+    ):
         asset = db.query(Asset).filter(
             Asset.id == job.output_asset_id,
             Asset.project_id == project_id,
@@ -203,6 +210,13 @@ def build_approved_asset_manifest(*, run_id: str, project_id: str, db: Session) 
                 "APPROVED_ASSET_MANIFEST_INELIGIBLE",
                 "승인 장면에 최종 출력으로 사용할 수 없는 asset이 포함되어 있습니다.",
             )
+        try:
+            frozen_quality_evidence = build_frozen_image_quality_evidence(asset=asset, job=job)
+        except ProductIdentityValidationError as exc:
+            raise ImageGenerationGateError(
+                "APPROVED_ASSET_MANIFEST_INTEGRITY",
+                "Approved output cannot be frozen because its bounded image evidence is invalid.",
+            ) from exc
         entries.append({
             "scene_id": str(job.scene_id or job.section_id),
             "section_id": job.section_id,
@@ -212,6 +226,9 @@ def build_approved_asset_manifest(*, run_id: str, project_id: str, db: Session) 
             "asset_content_hash": asset.content_hash,
             "provider": job.provider,
             "model": job.model,
+            # TASK-12.4 evaluates this immutable evidence, never mutable Asset
+            # classification fields or a later generation attempt.
+            "lg12_frozen_image_evidence": frozen_quality_evidence,
         })
 
     manifest = {
@@ -706,9 +723,14 @@ def apply_image_review(
         raise ImageGenerationGateError("IMAGE_REVIEW_JOB_REQUIRED", "처리할 장면을 한 개 선택해 주세요.")
     try:
         if decision == "approve" and target is not None:
-            approve_storyboard_job(project, target.job_id, db, identity_confirmed=True)
-            target.approved_at = datetime.datetime.utcnow()
-            db.commit()
+            # A downstream failure can leave an image-review checkpoint behind
+            # after this job was already durably approved. Replaying that exact
+            # checkpoint must rebuild the manifest/finalization input, not try
+            # to approve the same immutable job a second time.
+            if target.status != "approved":
+                approve_storyboard_job(project, target.job_id, db, identity_confirmed=True)
+                target.approved_at = datetime.datetime.utcnow()
+                db.commit()
         elif decision == "reject" and target is not None:
             reject_storyboard_job(project, target.job_id, db)
             target.rejected_at = datetime.datetime.utcnow()

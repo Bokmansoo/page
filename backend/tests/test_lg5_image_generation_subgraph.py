@@ -1360,6 +1360,101 @@ def test_lg9_manifest_rejects_approved_asset_without_valid_sha256_content_hash(
     assert error.value.code == "APPROVED_ASSET_MANIFEST_INELIGIBLE"
 
 
+def test_lg10_manifest_keeps_scene_complete_when_one_seller_asset_is_reused(
+    client, auth_headers, db_session, tmp_path,
+):
+    """One rights-approved seller asset may intentionally cover multiple scenes.
+
+    The immutable manifest still has to retain one distinct entry per required
+    scene job; only the asset identity itself is reusable.
+    """
+
+    from src.services import langgraph_image_generation_service as image_graph
+    from src.services.page_finalization_service import (
+        PageAssemblyInputError,
+        _canonical_hash,
+        _manifest_entries,
+    )
+
+    run = _create_run(client, auth_headers, db_session, tmp_path)
+    asset = db_session.query(Asset).filter(Asset.project_id == run.project_id).first()
+    assert asset is not None
+    asset.content_hash = hashlib.sha256(JPEG).hexdigest()
+    for scene_id in ("representative_product", "detail_closeup"):
+        db_session.add(ImageGenerationJobRecord(
+            project_id=run.project_id,
+            job_id=f"{run.id}-{scene_id}",
+            section_id=scene_id,
+            scene_id=scene_id,
+            role="detail_closeup",
+            prompt="seller-owned fallback",
+            status="approved",
+            output_asset_id=asset.id,
+            required_for_completion=True,
+            usage_metadata={"langgraph_run_id": run.id},
+        ))
+    db_session.commit()
+
+    manifest = image_graph.build_approved_asset_manifest(
+        run_id=run.id, project_id=run.project_id, db=db_session,
+    )
+    assert image_graph.build_approved_asset_manifest(
+        run_id=run.id, project_id=run.project_id, db=db_session,
+    ) == manifest
+    assert {item["job_id"] for item in manifest["assets"]} == {
+        f"{run.id}-representative_product",
+        f"{run.id}-detail_closeup",
+    }
+    assert {item["asset_id"] for item in manifest["assets"]} == {asset.id}
+    assert len(_manifest_entries(run=run, approved_asset_manifest=manifest, db=db_session)) == 2
+
+    incomplete = deepcopy(manifest)
+    incomplete["assets"] = [incomplete["assets"][0]]
+    incomplete_payload = {key: value for key, value in incomplete.items() if key != "manifest_hash"}
+    incomplete["manifest_hash"] = _canonical_hash(incomplete_payload)
+    with pytest.raises(PageAssemblyInputError):
+        _manifest_entries(run=run, approved_asset_manifest=incomplete, db=db_session)
+
+
+def test_lg10_replays_already_approved_review_job_after_downstream_failure(
+    client, auth_headers, db_session, tmp_path,
+):
+    """A stale review checkpoint may replay a job already approved in SQL."""
+
+    from src.services import langgraph_image_generation_service as image_graph
+
+    run = _create_run(client, auth_headers, db_session, tmp_path)
+    asset = db_session.query(Asset).filter(Asset.project_id == run.project_id).first()
+    assert asset is not None
+    asset.content_hash = hashlib.sha256(JPEG).hexdigest()
+    for scene_id in ("representative_product", "detail_closeup"):
+        db_session.add(ImageGenerationJobRecord(
+            project_id=run.project_id,
+            job_id=f"{run.id}-{scene_id}",
+            section_id=scene_id,
+            scene_id=scene_id,
+            role="detail_closeup",
+            prompt="seller-owned fallback",
+            status="approved",
+            output_asset_id=asset.id,
+            required_for_completion=True,
+            usage_metadata={"langgraph_run_id": run.id},
+        ))
+    db_session.commit()
+
+    replay = image_graph.apply_image_review(
+        run_id=run.id,
+        project_id=run.project_id,
+        decision="approve",
+        job_id=f"{run.id}-detail_closeup",
+        db=db_session,
+    )
+
+    assert replay["all_required_scenes_approved"] is True
+    assert replay["next_action"] == "finalize"
+    assert len(replay["approved_asset_manifest"]["assets"]) == 2
+
+
 def test_lg5r_real_provider_failure_dead_letters_one_scene_and_enters_review(
     monkeypatch, client, auth_headers, db_session, lg5_runtime, tmp_path
 ):
