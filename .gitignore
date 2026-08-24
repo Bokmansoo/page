@@ -48,6 +48,8 @@ playwright-report/
 frontend/test-results*/
 frontend/.pw-test-results*/
 frontend/.e2e-*/
+.playwright-cli/
+frontend/.playwright-cli/
 .pytest-tmp*/
 backend/.pytest-tmp*/
 backend/.pytest-temp*/
@@ -88,3 +90,5 @@ frontend/.next.stale*/
 frontend/.next-stale*/
 frontend/.next.stale*/
 backend/.pytest-cache-codex/
+# Added by code-review-graph
+.code-review-graph/
