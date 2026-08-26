@@ -125,10 +125,10 @@ export default function PlanningDraftEditor({ projectId, initialDraft, graphRunI
       if (graphRunId) {
         const stateResponse = await fetch(apiUrl(`/api/v1/graph-runs/${graphRunId}`), { credentials: "include", cache: "no-store" });
         const state = await stateResponse.json().catch(() => null);
-        if (!stateResponse.ok) throw new Error(state?.detail || "LangGraph 승인 상태를 불러오지 못했습니다.");
+        if (!stateResponse.ok) throw new Error(state?.detail || "승인 상태를 불러오지 못했습니다.");
         const pending = state?.values?.review?.pending;
         if (!pending || pending.review_stage !== "planning_review") {
-          throw new Error("현재 실행은 스토리보드 승인 대기 상태가 아닙니다. 상단의 LangGraph 상태를 확인해 주세요.");
+          throw new Error("현재 실행은 스토리보드 승인 대기 상태가 아닙니다. 상단의 진행 상태를 확인해 주세요.");
         }
         const response = await fetch(apiUrl(`/api/v1/graph-runs/${graphRunId}/resume`), {
           method: "POST", headers: defaultHeaders(), credentials: "include",
@@ -139,7 +139,7 @@ export default function PlanningDraftEditor({ projectId, initialDraft, graphRunI
         });
         const next = await response.json().catch(() => null);
         if (!response.ok) throw new Error(next?.detail || "스토리보드 승인을 처리하지 못했습니다.");
-        setMessage({ type: "success", text: "스토리보드를 승인했습니다. 같은 LangGraph 실행이 이미지 생성 대기 상태로 보존되었습니다." });
+        setMessage({ type: "success", text: "스토리보드를 승인했습니다. 이미지 생성 대기 상태로 보존되었습니다." });
         window.setTimeout(() => window.location.reload(), 150);
         return;
       }
@@ -180,8 +180,8 @@ export default function PlanningDraftEditor({ projectId, initialDraft, graphRunI
         <>
         <section className="rounded-xl border border-violet-200 bg-violet-50 p-4 text-sm text-violet-950">
           {graphGenerationPending
-            ? <>스토리보드 승인이 완료되었습니다. 같은 LangGraph 실행이 <b>이미지 생성 대기</b> 상태로 안전하게 보존되어 있으며, LG-5에서 이미지 생성을 재개합니다.</>
-            : <>이 스토리보드는 LangGraph 승인 흐름으로 관리됩니다. LG-4에서는 이미지 생성 버튼을 노출하지 않으며, 스토리보드 승인 후 같은 실행이 <b>이미지 생성 대기</b>로 보존됩니다.</>}
+            ? <>스토리보드 승인이 완료되었습니다. <b>이미지 생성 대기</b> 상태로 안전하게 보존되어 자동으로 이어집니다.</>
+            : <>스토리보드는 승인 흐름으로 관리됩니다. 승인 후 <b>이미지 생성 대기</b> 상태로 보존됩니다.</>}
         </section>
         </>
       ) : <><ApiReadyGenerationPlanPanel projectId={projectId} /><StoryboardImageGenerationPanel projectId={projectId} storyboardStatus={draft.status} /></>}

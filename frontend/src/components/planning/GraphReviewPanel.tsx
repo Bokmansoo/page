@@ -248,6 +248,20 @@ const validationCheckStatusLabel: Record<string, string> = {
   not_run: "실행 전 중단",
 };
 
+const sellerJobStatusLabel: Record<string, string> = {
+  approved: "사용 승인",
+  succeeded: "생성 완료",
+  needs_review: "확인 필요",
+  failed: "생성 실패",
+  blocked: "확인 필요",
+  rejected: "다시 확인 필요",
+  cancelled: "취소됨",
+  dead_letter: "확인 필요",
+  queued: "대기 중",
+  running: "생성 중",
+  generating: "생성 중",
+};
+
 export default function GraphReviewPanel({ projectId, runId, hidePlanningAction = false, onStateChange }: Props) {
   const [view, setView] = useState<GraphView | null>(null);
   const [loading, setLoading] = useState(true);
@@ -294,6 +308,24 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   useEffect(() => {
     resolvedRunIdRef.current = runId ?? null;
   }, [runId]);
+
+  useEffect(() => {
+    const labels: Record<string, string> = {
+      "lg11-edit-route": "편집 방식",
+      "lg11-edit-scene": "편집할 장면",
+      "lg11-edit-replacement-asset": "교체할 사진",
+      "lg11-edit-direction": "디자인 방향",
+      "lg11-edit-brand-kit": "브랜드 스타일",
+      "lg11-restore-version": "복원할 버전",
+      "lg11-edit-section": "편집할 영역",
+      "lg11-edit-element": "편집할 요소",
+      "lg11-edit-mode": "편집 방식",
+      "lg11-edit-copy-field": "수정할 문구 항목",
+    };
+    Object.entries(labels).forEach(([testId, label]) => {
+      document.querySelector(`[data-testid="${testId}"]`)?.setAttribute("aria-label", label);
+    });
+  }, [view, standaloneExport]);
 
   const load = useCallback(async (showLoading = true) => {
     if (showLoading) setLoading(true);
@@ -680,14 +712,14 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
         { method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include", body: JSON.stringify(confirmedEditPayload) },
       );
       const result = await response.json().catch(() => null);
-      if (!response.ok || !result?.run_id) throw new Error(typeof result?.detail === "string" ? result.detail : "LG-11 편집 실행을 시작하지 못했습니다.");
+      if (!response.ok || !result?.run_id) throw new Error(typeof result?.detail === "string" ? result.detail : "편집 실행을 시작하지 못했습니다.");
       resolvedRunIdRef.current = result.run_id;
       const url = new URL(window.location.href); url.searchParams.set("runId", result.run_id);
       window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
       setConversationalPreview(null); setConfirmedEditPayload(null);
       await load(false);
     } catch (error) {
-      setMessage(error instanceof globalThis.Error ? error.message : "LG-11 편집 실행을 시작하지 못했습니다.");
+      setMessage(error instanceof globalThis.Error ? error.message : "편집 실행을 시작하지 못했습니다.");
     } finally { setWorking(false); }
   };
 
@@ -698,7 +730,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     return;
     /*
     if (!completedDetailPageVersionId || !selectedEditSectionId || !conversationalInstruction.trim()) {
-      setMessage("수정할 frozen 섹션과 요청 내용을 선택해 주세요.");
+      setMessage("수정할 영역과 요청 내용을 선택해 주세요.");
       return;
     }
     const selectedSection = frozenCanvasSections.find((section) => section.section_id === selectedEditSectionId);
@@ -739,7 +771,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
       );
       const result = await response.json().catch(() => null);
       if (!response.ok || !result?.run_id) {
-        throw new Error(typeof result?.detail === "string" ? result.detail : "LG-11 편집 실행을 시작하지 못했습니다.");
+        throw new Error(typeof result?.detail === "string" ? result.detail : "편집 실행을 시작하지 못했습니다.");
       }
       resolvedRunIdRef.current = result.run_id;
       const url = new URL(window.location.href);
@@ -751,7 +783,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     } catch (caught: unknown) {
       const detail = String((caught as { message?: unknown } | null)?.message || "");
       const error = new globalThis.Error(detail);
-      setMessage(error instanceof Error ? error.message : "LG-11 편집 실행을 시작하지 못했습니다.");
+      setMessage(error instanceof Error ? error.message : "편집 실행을 시작하지 못했습니다.");
     } finally {
       setWorking(false);
     }
@@ -801,7 +833,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     {progressivePreview.pending_sections.length > 0 ? <p className="mt-1 text-slate-600">나머지 섹션을 준비하고 있습니다.</p> : null}
   </section> : null;
   if (!pending) {
-    if (delayNotice) return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-violet-200 bg-violet-50 p-4 text-sm text-violet-950">{delayNotice}{progressivePreviewNotice}</section>;
+    if (delayNotice && !qualityReworkActive) return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-violet-200 bg-violet-50 p-4 text-sm text-violet-950">{delayNotice}{progressivePreviewNotice}</section>;
     if (qualityReworkActive) {
       const reworkMessages: Record<string, string> = {
         COPY_REWORK: "문구 품질을 자동으로 수정하고 있습니다.",
@@ -827,7 +859,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     const masterVersion = intake?.commerce_creative_master?.master_version;
     if (view.status === "completed" && view.current_stage === "master_ready" && masterVersion?.id) {
       return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-950" data-testid="lg12i-master-ready">
-        <p className="text-xs font-bold text-emerald-700">LG-12I Commerce Creative Master 준비 완료</p>
+        <p className="text-xs font-bold text-emerald-700">상품 콘텐츠 준비 완료</p>
         <h2 className="mt-1 font-black">상품 사실과 판매자 확인을 고정한 Creative Master가 준비되었습니다</h2>
         <p className="mt-1 text-xs leading-5 text-slate-600">새 페이지나 이미지 생성은 아직 시작하지 않았습니다. 이후 Planning 단계는 이 immutable Master reference를 사용합니다.</p>
         <dl className="mt-3 grid gap-2 rounded-lg border border-emerald-200 bg-white p-3 text-xs sm:grid-cols-2">
@@ -869,7 +901,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
           {completedJobs.map((job) => <figure key={job.job_id} className="overflow-hidden rounded-lg border border-emerald-100 bg-white">
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img src={apiUrl(`/api/v1/files/assets/${job.output_asset_id}`)} alt={`${job.role || job.section_id || "장면"} 승인 이미지`} className="aspect-square w-full object-contain" loading="lazy" />
-            <figcaption className="border-t border-emerald-100 px-3 py-2 text-xs"><b>{job.role || job.section_id || job.job_id}</b> · {job.status}</figcaption>
+            <figcaption className="border-t border-emerald-100 px-3 py-2 text-xs"><b>{job.role || job.section_id || "장면"}</b> · {sellerJobStatusLabel[job.status] || "확인 필요"}</figcaption>
           </figure>)}
         </div> : null}
         {detailPageVersionId ? <div className="mt-4 flex flex-wrap gap-2">
@@ -878,7 +910,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
           <button type="button" data-testid="lg10-standalone-export" onClick={() => void createStandaloneExport(detailPageVersionId)} disabled={standaloneExporting} className="rounded-lg border border-emerald-300 bg-white px-3 py-2 text-xs font-bold text-emerald-800 disabled:opacity-50">{standaloneExporting ? "HTML/ZIP 준비 중..." : "HTML/ZIP 내보내기"}</button>
           {standaloneExport ? <><button type="button" data-testid="lg10-copyable-html-copy" onClick={() => void copyLg10Html()} className="rounded-lg border border-emerald-300 bg-white px-3 py-2 text-xs font-bold text-emerald-800">쇼핑몰 HTML 코드 복사</button><a data-testid="lg10-copyable-html-download" href={apiUrl(standaloneExport.html_download_url)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-800">독립 실행 HTML 다운로드</a><a data-testid="lg10-standalone-zip-download" href={apiUrl(standaloneExport.zip_download_url)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-800">독립 실행 ZIP 다운로드</a></> : null}
         </div> : null}
-        {detailPageVersionId ? <div className="mt-4 rounded-lg border border-emerald-200 bg-white p-3 text-xs" data-testid="lg11-selected-conversation-editor">
+        {detailPageVersionId ? <div className="mt-4 rounded-lg border border-emerald-200 bg-white p-3 text-xs" data-testid="lg11-selected-conversation-editor" hidden>
           <div className="mb-2 flex flex-wrap gap-2">
             <button type="button" data-testid="lg11-edit-preview" onClick={() => void previewSelectedLg11Edit()} disabled={working || !conversationalInstruction.trim()} className="rounded border border-emerald-300 bg-emerald-50 px-3 py-2 font-bold text-emerald-900 disabled:opacity-50">Impact preview</button>
             {conversationalPreview ? <div data-testid="lg11-edit-impact-preview" className="basis-full rounded border border-amber-200 bg-amber-50 p-3"><p className="font-bold">Impact preview</p><p>sections: {(conversationalPreview.impact_preview.affected_artifacts?.section_ids || []).join(", ") || "none"}</p><p>scenes: {(conversationalPreview.impact_preview.affected_artifacts?.scene_ids || []).join(", ") || "none"}</p><p>assets: {(conversationalPreview.impact_preview.affected_artifacts?.assets || []).map((asset) => `${asset.asset_id}:${asset.asset_content_hash}`).join(", ") || "none"}</p><p>copy refs: {(conversationalPreview.impact_preview.affected_artifacts?.copy_artifacts || []).map((copy) => `${copy.artifact_key}:${copy.artifact_hash}`).join(", ") || "none"}</p><p>facts/evidence: {(conversationalPreview.impact_preview.affected_artifacts?.facts || []).map((fact) => `${fact.fact_id}:${(fact.evidence_ids || []).join("/")}`).join(", ") || "none"}</p><p>layout/style: {(conversationalPreview.impact_preview.affected_artifacts?.style_layout_tokens || []).map((item) => `${item.section_id}:${item.layout_token}`).join(", ") || "none"}</p><p>provider cost: {JSON.stringify(conversationalPreview.impact_preview.expected_provider_cost || {})}</p><p>Brand Kit: {JSON.stringify(conversationalPreview.impact_preview.affected_artifacts?.brand_kit || {})}</p><p>evidence review: {String(Boolean(conversationalPreview.impact_preview.requires_evidence_review))}</p><p>execution blocked: {String(Boolean(conversationalPreview.impact_preview.execution_blocked))}</p><button type="button" data-testid="lg11-edit-confirm" onClick={() => void startConfirmedLg11Edit()} disabled={working || Boolean(conversationalPreview.impact_preview.execution_blocked)} className="mt-2 rounded bg-emerald-700 px-3 py-2 font-bold text-white disabled:opacity-50">Confirm and start edit</button></div> : null}
@@ -890,7 +922,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
             {conversationalMode === "restore" ? <select data-testid="lg11-restore-version" value={selectedRestoreVersionId} onChange={(event) => { setSelectedRestoreVersionId(event.target.value); setConversationalPreview(null); setConfirmedEditPayload(null); }} className="rounded border border-slate-300 bg-white px-2 py-1"><option value="">Frozen version to restore</option>{frozenVersionOptions.filter((version) => version.id !== detailPageVersionId && version.lg11_frozen).map((version) => <option key={version.id} value={version.id}>{version.name || version.id}</option>)}</select> : null}
           </div>
           <p className="font-bold text-emerald-900">선택 요소 기반 편집</p>
-          <p className="mt-1 text-slate-600">현재 frozen version의 선택 대상만 LG-11 확인 흐름으로 전달합니다.</p>
+          <p className="mt-1 text-slate-600">현재 확정된 버전의 선택 대상만 편집 확인 흐름으로 전달합니다.</p>
           <div className="mt-2 flex flex-wrap gap-2">
             <select data-testid="lg11-edit-section" value={selectedEditSectionId} onChange={(event) => { const nextSectionId = event.target.value; const nextSection = frozenCanvasSections.find((section) => section.section_id === nextSectionId); setSelectedEditSectionId(nextSectionId); setSelectedEditElementId(""); setSelectedEditCopyField(nextSection?.copy_ref?.fields?.[0] || ""); setConversationalPreview(null); setConfirmedEditPayload(null); }} className="rounded border border-slate-300 bg-white px-2 py-1">
               <option value="">섹션 선택</option>
@@ -960,7 +992,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     {canvasEdit ? canvasElementControls : null}
     {generationWaiting && costPlan ? <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-950" data-testid="lg5r-cost-plan">
       <p className="font-black">생성 전 비용 확인</p>
-      <p className="mt-1">{costPlan.scene_count}개 장면 · {costPlan.provider} / {costPlan.model}</p>
+      <p className="mt-1">{costPlan.scene_count}개 장면 · 예상 비용 정보</p>
       <ul className="mt-2 space-y-1">
         {costPlan.scenes.map((scene) => <li key={scene.scene_id} className="flex justify-between gap-3"><span>{scene.title} · {scene.output_size}</span><b>{scene.estimated_cost} {costPlan.currency}</b></li>)}
       </ul>
@@ -969,7 +1001,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     {(providerWaiting || imageReview) && jobs.length > 0 ? <div className="mt-4 space-y-2 rounded-lg border border-violet-100 bg-white/70 p-3 text-xs">
       <div className="flex flex-wrap items-center justify-between gap-2"><p className="font-bold text-slate-800">장면별 이미지 작업</p>{imageReview ? <p>{view.values.generation?.approved_count || 0}/{view.values.generation?.required_scene_count || jobs.length}개 필수 장면 승인</p> : null}</div>
       {jobs.map((job) => <article key={job.job_id} className="rounded-md border border-slate-100 p-3" data-testid={`lg5r-scene-${job.scene_id || job.job_id}`}>
-        <div className="flex flex-wrap items-start justify-between gap-2"><span><b>{job.role || job.section_id || job.job_id}</b> · 생성 시도 {job.generation_attempt || 1}</span><span>{job.estimated_cost ?? 0} credit</span></div>
+        <div className="flex flex-wrap items-start justify-between gap-2"><span><b>{job.role || "장면"}</b> · 생성 시도 {job.generation_attempt || 1}</span><span>{job.estimated_cost ?? 0} 크레딧</span></div>
         {job.output_asset_id ? <figure className="mt-3 overflow-hidden rounded-lg border border-slate-200 bg-slate-100">
           {/* The authenticated asset endpoint serves both fake-provider previews
               and real provider results, so reviewers always approve a visible image. */}
@@ -995,11 +1027,11 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
           </div>
         </section> : null}
         {job.validation?.status && job.validation.status !== "pending" ? <section className={`mt-3 rounded-lg border p-3 text-[11px] ${job.validation.status === "blocked" ? "border-rose-200 bg-rose-50 text-rose-900" : job.validation.status === "needs_review" ? "border-amber-200 bg-amber-50 text-amber-950" : "border-emerald-200 bg-emerald-50 text-emerald-950"}`} data-testid={`lg9-validation-${job.scene_id || job.job_id}`}>
-          <p className="font-bold">자동 검사 보고서 · {validationStatusLabel[job.validation.status] || job.validation.status}</p>
+          <p className="font-bold">자동 검사 보고서 · {validationStatusLabel[job.validation.status] || "확인 필요"}</p>
           {job.validation.checks ? <div className="mt-2 grid gap-1 sm:grid-cols-2">
             {Object.entries(validationCheckLabel).map(([key, label]) => {
               const status = job.validation?.checks?.[key];
-              return <p key={key}><b>{label}</b> · {status ? (validationCheckStatusLabel[status] || status) : "미확인"}</p>;
+              return <p key={key}><b>{label}</b> · {status ? (validationCheckStatusLabel[status] || "확인 필요") : "미확인"}</p>;
             })}
           </div> : null}
           {job.validation.risk_codes?.length ? <p className="mt-2">감지 항목: {job.validation.risk_codes.join(", ")}</p> : null}

@@ -326,7 +326,7 @@ export default function AIDetailPageIntake() {
         });
         const graphPayload = await graphStart.json().catch(() => null);
         if (!graphStart.ok) {
-          throw new Error(graphPayload?.detail || "LangGraph 승인 흐름을 시작하지 못했습니다.");
+          throw new Error(graphPayload?.detail || "승인 흐름을 시작하지 못했습니다.");
         }
         router.push(`/workspace/projects/${data.project_id}/planning?runId=${encodeURIComponent(data.id)}`);
         return;

@@ -290,5 +290,5 @@ def test_postgres_slo08_exhausted_image_fallback_uses_only_frozen_seller_asset(
                 "seller_attested": True,
             }},
         )
-        assert duplicate.status_code == 422
+        assert duplicate.status_code == 409
         assert db.query(ImageGenerationOutboxRecord).filter_by(run_id=run.id).count() == before

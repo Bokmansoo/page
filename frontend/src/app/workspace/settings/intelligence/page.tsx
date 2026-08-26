@@ -85,7 +85,7 @@ export default function IntelligenceSettingsPage() {
   return (
     <main className="mx-auto max-w-6xl space-y-8 px-6 py-10 text-slate-900">
       <header className="flex flex-wrap items-end justify-between gap-4">
-        <div><p className="text-sm font-semibold text-emerald-700">LG-6</p><h1 className="text-3xl font-bold">Prompt Intelligence · Brand Kit</h1>
+        <div><p className="text-sm font-semibold text-emerald-700">지능형 프롬프트 설정</p><h1 className="text-3xl font-bold">Prompt Intelligence · Brand Kit</h1>
           <p className="mt-2 text-sm text-slate-600">활성 팩과 불변 Brand Kit 버전을 관리합니다. 실제 이미지 생성 비용은 발생하지 않습니다.</p></div>
         <a href="/workspace/settings" className="rounded-lg border px-4 py-2 text-sm">기본 설정으로</a>
       </header>

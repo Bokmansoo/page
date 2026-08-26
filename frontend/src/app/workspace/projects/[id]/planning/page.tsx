@@ -282,6 +282,7 @@ export default function ProjectPlanningPage() {
 
   return (
     <div className="min-h-screen bg-slate-50 p-6 text-slate-800 md:p-10">
+      <h1 className="sr-only">상품 상세페이지 생성</h1>
       <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-slate-200 bg-white p-4 text-sm">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>

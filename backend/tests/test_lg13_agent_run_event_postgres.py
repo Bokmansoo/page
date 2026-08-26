@@ -483,6 +483,41 @@ def test_postgres_ops05_lifecycle_identity_and_rebuild_are_durable_and_deduplica
         session.close()
 
 
+def test_postgres_image_review_upload_lifecycle_is_stage_limited(journal_db):
+    """The public image-review upload action remains a bounded journal scalar."""
+
+    session = journal_db()
+    try:
+        run = _run(session)
+        event, inserted, _locked = AgentRunEventJournal.append_review_lifecycle(
+            run,
+            session,
+            event_type="seller_choice_submitted",
+            transition="submitted",
+            stage="image_review",
+            decision="upload",
+        )
+        session.commit()
+
+        assert inserted is True
+        assert event.payload_json["stage"] == "image_review"
+        assert event.payload_json["lifecycle"] == {
+            "transition": "submitted", "checkpoint_id": "", "decision": "upload",
+        }
+        with pytest.raises(ValueError, match="Seller review decision is not allowlisted"):
+            AgentRunEventJournal.append_review_lifecycle(
+                run,
+                session,
+                event_type="seller_choice_submitted",
+                transition="submitted",
+                stage="planning_review",
+                decision="upload",
+            )
+    finally:
+        session.rollback()
+        session.close()
+
+
 def test_postgres_checkpoint_persists_only_the_operational_input_allowlist(journal_db):
     """The real PG checkpoint bytes must not retain raw seller/provider input."""
 

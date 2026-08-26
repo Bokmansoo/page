@@ -215,7 +215,6 @@ def test_lg10_copyable_html_embeds_frozen_assets_and_styles_for_marketplace_past
     assert "assets/" not in html
     assert "https://expired.example" not in html
     assert "javascript:" not in html
-
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as playwright:
@@ -227,6 +226,35 @@ def test_lg10_copyable_html_embeds_frozen_assets_and_styles_for_marketplace_past
         assert image.evaluate("element => element.complete && element.naturalWidth > 0") is True
         assert page.locator(".sf-spec-table").count() == 1
         browser.close()
+
+
+def test_lg10_export_reuses_one_frozen_asset_for_multiple_approved_scenes(db_session, tmp_path):
+    """A seller-approved original may be placed in more than one final scene."""
+    _, _, project, version, first, _ = _seed_lg10_version(db_session, tmp_path)
+    manifest = version.sections_json["lg10"]["canonical_page_assembly_input"]["approved_asset_manifest"]
+    manifest["assets"][1] = {
+        "scene_id": "detail",
+        "asset_id": first.id,
+        "asset_content_hash": first.content_hash,
+    }
+    manifest_body = {key: value for key, value in manifest.items() if key != "manifest_hash"}
+    manifest["manifest_hash"] = hashlib.sha256(
+        json.dumps(manifest_body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    flag_modified(version, "sections_json")
+    db_session.commit()
+
+    copyable = build_lg10_copyable_html(db=db_session, project_id=project.id, version=version)
+    bundle = build_lg10_standalone_export_bundle(
+        db=db_session, project_id=project.id, version=version, output_dir=str(tmp_path / "reused-asset-export"),
+    )
+
+    assert first.id in copyable["html"]
+    assert bundle["bundled_assets"] == [{
+        "asset_id": first.id,
+        "asset_content_hash": first.content_hash,
+        "path": f"assets/{first.id}.png",
+    }]
 
 
 def test_lg10_brand_assets_are_embedded_and_packaged_only_when_frozen_and_approved(db_session, tmp_path):

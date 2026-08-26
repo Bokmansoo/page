@@ -2,6 +2,14 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Keep compact seller actions readable against white text at small sizes. */
+@layer utilities {
+  .bg-emerald-500,
+  .bg-emerald-600 {
+    background-color: rgb(4 120 87) !important;
+  }
+}
+
 :root {
   --background: 224 71% 4%;
   --foreground: 213 31% 91%;

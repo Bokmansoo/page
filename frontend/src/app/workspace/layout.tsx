@@ -31,20 +31,20 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800">
-      <header className="sticky top-0 z-30 flex w-full items-center justify-between border-b border-slate-200 bg-white px-6 py-4">
-        <div className="flex items-center gap-8">
+      <header className="sticky top-0 z-30 flex w-full flex-wrap items-center gap-3 border-b border-slate-200 bg-white px-4 py-4 sm:flex-nowrap sm:px-6">
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-6 gap-y-3 sm:flex-nowrap sm:gap-8">
           <Link href="/workspace" className="flex items-center gap-2.5">
             <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-500 font-bold text-white">S</span>
             <span className="text-lg font-bold text-slate-900">Sellform</span>
           </Link>
-          <nav className="flex gap-6 text-sm font-medium text-slate-600">
+          <nav className="flex flex-wrap gap-x-4 gap-y-2 whitespace-nowrap text-sm font-medium text-slate-600 sm:gap-6">
             <Link href="/workspace" className="hover:text-emerald-700">AI 상세페이지 생성</Link>
             <Link href="/workspace/projects" className="hover:text-emerald-700">작업 목록</Link>
             <Link href="/workspace/exports" className="hover:text-emerald-700">출력 이력</Link>
             <Link href="/account" className="hover:text-emerald-700">계정</Link>
           </nav>
         </div>
-        <div className="flex items-center gap-3 text-xs text-slate-600">
+        <div className="flex basis-full items-center justify-end gap-3 whitespace-nowrap text-xs text-slate-600 sm:ml-auto sm:basis-auto">
           {session ? (
             <>
               <span>{session.workspace.name} · {session.user.name}</span>

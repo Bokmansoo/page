@@ -734,8 +734,12 @@ class AgentRunEventJournal:
                 raise ValueError("AgentRun lifecycle transition is not allowlisted.")
             if not isinstance(lifecycle["checkpoint_id"], str) or len(lifecycle["checkpoint_id"]) > 128:
                 raise ValueError("AgentRun lifecycle checkpoint identity is invalid.")
-            if event_type == "seller_choice_submitted" and lifecycle["decision"] not in {"approve", "reject", "refresh", "fallback", "wait"}:
-                raise ValueError("Seller review decision is not allowlisted.")
+            if event_type == "seller_choice_submitted":
+                allowed_decisions = {"approve", "reject", "refresh", "fallback", "wait"}
+                if payload["stage"] == "image_review":
+                    allowed_decisions.add("upload")
+                if lifecycle["decision"] not in allowed_decisions:
+                    raise ValueError("Seller review decision is not allowlisted.")
         if "identity" in payload:
             identity = payload["identity"]
             if not isinstance(identity, dict) or set(identity) != {

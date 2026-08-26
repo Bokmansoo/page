@@ -478,7 +478,7 @@ def build_lg10_copyable_html(
     brand_assets = _frozen_lg10_brand_assets(rendering)
     asset_ids = [str(item.get("asset_id") or "") for item in entries]
     brand_asset_ids = [str(item.get("asset_id") or "") for item in brand_assets]
-    if not all(asset_ids) or len(set(asset_ids)) != len(asset_ids) or not all(brand_asset_ids):
+    if not all(asset_ids) or not all(brand_asset_ids):
         raise FrozenExportSnapshotError("Approved manifest contains invalid asset identities.")
 
     assets = {
@@ -638,7 +638,7 @@ def build_lg10_standalone_export_bundle(
     brand_assets = _frozen_lg10_brand_assets(rendering)
     asset_ids = [str(item.get("asset_id") or "") for item in entries]
     brand_asset_ids = [str(item.get("asset_id") or "") for item in brand_assets]
-    if not all(asset_ids) or len(set(asset_ids)) != len(asset_ids) or not all(brand_asset_ids):
+    if not all(asset_ids) or not all(brand_asset_ids):
         raise FrozenExportSnapshotError("Approved manifest contains invalid asset identities.")
 
     assets = {
@@ -669,6 +669,8 @@ def build_lg10_standalone_export_bundle(
             or image_sha256(asset.file_path) != expected_hash
         ):
             raise FrozenExportSnapshotError("Approved asset bytes no longer match the frozen DetailPageVersion.")
+        if asset_id in asset_paths:
+            continue
         relative_path = f"assets/{asset.id}{_safe_asset_extension(asset)}"
         shutil.copyfile(asset.file_path, package_root / relative_path)
         asset_paths[asset.id] = relative_path

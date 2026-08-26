@@ -208,17 +208,18 @@ export default function CreativeBriefInputPanel({ projectId, runId }: { projectI
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="font-bold text-slate-900">리뷰·레퍼런스·창작 방향</h2>
-          <p className="mt-1 text-xs text-slate-500">LG-7 입력은 상품 사실과 분리되며, 불변 Product Creative Brief로 컴파일됩니다.</p>
+          <p className="mt-1 text-xs text-slate-600">창작 방향은 상품 사실과 분리되어 안전하게 저장됩니다.</p>
         </div>
-        <div className="flex gap-2" aria-label="진행 방식">
+        <fieldset className="flex gap-2" aria-label="진행 방식">
+          <legend className="sr-only">진행 방식</legend>
           <button type="button" onClick={() => void setMode("quick")} disabled={!runId || busy} className={`rounded-lg border px-3 py-2 ${data?.interaction_mode === "quick" ? "bg-emerald-600 text-white" : "bg-white"}`}>빠른 생성</button>
           <button type="button" onClick={() => void setMode("expert")} disabled={!runId || busy} className={`rounded-lg border px-3 py-2 ${data?.interaction_mode === "expert" ? "bg-violet-600 text-white" : "bg-white"}`}>전문가 검수</button>
-        </div>
+        </fieldset>
       </div>
-      {!runId && <p className="mt-2 text-xs text-amber-700">진행 방식은 LangGraph 실행이 연결된 프로젝트에서 변경할 수 있습니다.</p>}
+      {!runId && <p className="mt-2 text-xs text-amber-700">진행 방식은 생성 실행이 연결된 프로젝트에서 변경할 수 있습니다.</p>}
 
       <div className="mt-4 grid gap-4 md:grid-cols-3">
-        <div className="rounded-lg border p-3">
+        <div className="min-w-0 rounded-lg border p-3">
           <strong>리뷰 전용 입력</strong>
           <textarea aria-label="리뷰 붙여넣기" value={reviewText} onChange={(event) => setReviewText(event.target.value)} className="mt-2 w-full rounded border p-2" rows={4} placeholder="구매 이유, 반복 불만, 자주 쓰는 표현" />
           <label className="mt-2 flex items-center gap-2 text-xs"><input type="checkbox" checked={reviewConsent} onChange={(event) => setReviewConsent(event.target.checked)} />분석 활용 동의를 확인했습니다</label>
@@ -243,7 +244,7 @@ export default function CreativeBriefInputPanel({ projectId, runId }: { projectI
           <p className="mt-2 text-xs text-rose-700">리뷰는 구매 동기·불만·언어 신호 전용이며 제품 사실로 승격되지 않습니다.</p>
         </div>
 
-        <div className="rounded-lg border p-3">
+        <div className="min-w-0 rounded-lg border p-3">
           <strong>레퍼런스 전용 입력</strong>
           <select aria-label="레퍼런스 종류" value={referenceKind} onChange={(event) => { setReferenceKind(event.target.value as ReferenceKind); setReferenceValue(""); setReferenceAssetId(""); }} className="mt-2 w-full rounded border p-2">
             <option value="url">URL</option><option value="image">프로젝트 이미지</option><option value="pdf">프로젝트 PDF</option><option value="text">텍스트 메모</option>
@@ -268,7 +269,7 @@ export default function CreativeBriefInputPanel({ projectId, runId }: { projectI
           <p className="mt-2 text-xs text-amber-700">권리 미확인 자료는 분석 전용입니다. 원문·로고·워터마크·고유 디자인은 복제하지 않습니다.</p>
         </div>
 
-        <div className="rounded-lg border p-3">
+        <div className="min-w-0 rounded-lg border p-3">
           <strong>판매자 창작 방향</strong>
           <input aria-label="타깃 고객" value={target} onChange={(event) => setTarget(event.target.value)} className="mt-2 w-full rounded border p-2" placeholder="예: 출퇴근하는 20~30대" />
           <input aria-label="원하는 분위기" value={mood} onChange={(event) => setMood(event.target.value)} className="mt-2 w-full rounded border p-2" placeholder="깔끔함, 프리미엄" />
@@ -279,7 +280,7 @@ export default function CreativeBriefInputPanel({ projectId, runId }: { projectI
       </div>
 
       <div className="mt-4 grid gap-2 text-xs sm:grid-cols-4">
-        <span>리뷰 {data?.reviews.length ?? 0}개</span><span>레퍼런스 {data?.references.length ?? 0}개</span><span>방향 v{data?.creative_direction?.version ?? 0}</span><span>Brief v{data?.briefs[0]?.version ?? 0}</span>
+        <span>리뷰 {data?.reviews.length ?? 0}개</span><span>레퍼런스 {data?.references.length ?? 0}개</span><span>방향 v{data?.creative_direction?.version ?? 0}</span><span>콘텐츠 버전 v{data?.briefs[0]?.version ?? 0}</span>
       </div>
       {(data?.reviews.length || data?.references.length) ? <div className="mt-3 rounded-lg bg-slate-50 p-3 text-xs text-slate-700">
         <strong>Creative Brief 근거 사용 상태</strong>
@@ -288,7 +289,7 @@ export default function CreativeBriefInputPanel({ projectId, runId }: { projectI
           {data.references.slice(0, 3).map((reference) => <li key={reference.id}>레퍼런스 v{reference.version} · {reference.kind} · {reference.usage_scope === "analysis_only" ? "분석 전용" : "권리 확인 자산"}</li>)}
         </ul>
       </div> : null}
-      {data?.trace && <details className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs" open>
+      {data?.trace && <details hidden className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs" open>
         <summary className="cursor-pointer font-bold text-slate-900">생성 추적 정보</summary>
         <div className="mt-3 grid gap-3 sm:grid-cols-2">
           <div><strong>현재 모드</strong><p>생성: {data.trace.generation_mode ?? "없음"} · 진행: {data.trace.interaction_mode ?? data.interaction_mode}</p></div>
