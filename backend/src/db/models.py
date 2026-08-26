@@ -11,6 +11,7 @@ from sqlalchemy import (
     Float,
     Boolean,
     DDL,
+    CheckConstraint,
     event,
     Index,
     UniqueConstraint,
@@ -1473,6 +1474,7 @@ class ImageGenerationJobRecord(Base):
     outbox_record = relationship(
         "ImageGenerationOutboxRecord", back_populates="image_job", uselist=False, cascade="all, delete-orphan"
     )
+    provider_attempts = relationship("ImageGenerationProviderAttemptRecord", back_populates="image_job")
 
 
 class ImageGenerationCostApprovalRecord(Base):
@@ -1539,6 +1541,60 @@ class ImageGenerationOutboxRecord(Base):
     run = relationship("AgentRun", foreign_keys=[run_id])
 
 
+class ImageGenerationProviderAttemptRecord(Base):
+    """Immutable, provider-neutral accounting fact for one outbound attempt."""
+
+    __tablename__ = "image_generation_provider_attempts"
+    __table_args__ = (
+        UniqueConstraint("semantic_idempotency_key", name="uq_image_provider_attempt_semantic"),
+        UniqueConstraint("image_job_id", "provider_adapter_attempt", name="uq_image_provider_attempt_job_adapter"),
+        CheckConstraint("seller_generation_attempt > 0", name="ck_image_provider_attempt_seller_positive"),
+        CheckConstraint("provider_adapter_attempt > 0", name="ck_image_provider_attempt_adapter_positive"),
+        CheckConstraint("delivery_attempt >= 0", name="ck_image_provider_attempt_delivery_nonnegative"),
+        CheckConstraint(
+            "dispatch_state IN ('NOT_DISPATCHED', 'DISPATCHED')",
+            name="ck_image_provider_attempt_dispatch_state",
+        ),
+        CheckConstraint(
+            "cost_state IN ('NOT_DISPATCHED', 'EXPLICIT_ZERO', 'KNOWN', 'UNKNOWN_AFTER_DISPATCH')",
+            name="ck_image_provider_attempt_cost_state",
+        ),
+        CheckConstraint(
+            "(cost_state = 'UNKNOWN_AFTER_DISPATCH' AND actual_cost IS NULL) OR "
+            "(cost_state <> 'UNKNOWN_AFTER_DISPATCH' AND actual_cost IS NOT NULL AND actual_cost >= 0)",
+            name="ck_image_provider_attempt_actual_cost",
+        ),
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    workspace_id = Column(String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    thread_id = Column(String(36), nullable=False, index=True)
+    image_job_id = Column(String(36), ForeignKey("image_generation_jobs.id", ondelete="CASCADE"), nullable=False, index=True)
+    outbox_id = Column(String(36), ForeignKey("image_generation_outbox.id", ondelete="SET NULL"), nullable=True, index=True)
+    job_id = Column(String(100), nullable=False, index=True)
+    scene_id = Column(String(100), nullable=True, index=True)
+    seller_generation_attempt = Column(Integer, nullable=False)
+    delivery_attempt = Column(Integer, nullable=False, default=0)
+    provider_adapter_attempt = Column(Integer, nullable=False)
+    provider = Column(String(50), nullable=False)
+    model = Column(String(100), nullable=False)
+    semantic_idempotency_key = Column(String(64), nullable=False, index=True)
+    dispatch_state = Column(String(30), nullable=False)
+    cost_state = Column(String(40), nullable=False)
+    estimated_cost_at_dispatch = Column(Float, nullable=True)
+    actual_cost = Column(Float, nullable=True)
+    currency = Column(String(20), nullable=False, default="credit")
+    usage_json = Column(JSON, nullable=False, default=dict)
+    outcome_code = Column(String(100), nullable=False, default="SUCCESS")
+    latency_ms = Column(Integer, nullable=True)
+    started_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+    image_job = relationship("ImageGenerationJobRecord", back_populates="provider_attempts")
+
+
 class AgentRun(Base):
     __tablename__ = "agent_runs"
 
@@ -1560,6 +1616,9 @@ class AgentRun(Base):
     # restart/recovery checks.
     graph_thread_id = Column(String(36), nullable=True, unique=True, index=True)
     graph_checkpoint_id = Column(String(128), nullable=True)
+    # LG-13.1: the mutable run row is a projection of its immutable journal.
+    last_applied_event_sequence = Column(Integer, nullable=False, default=0)
+    event_projection_version = Column(Integer, nullable=False, default=1)
     created_by = Column(String(36), ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
@@ -1569,6 +1628,29 @@ class AgentRun(Base):
     workspace = relationship("Workspace")
     user = relationship("User")
     steps = relationship("AgentRunStep", back_populates="run", cascade="all, delete-orphan")
+    events = relationship("AgentRunEvent", back_populates="run")
+
+
+class AgentRunEvent(Base):
+    __tablename__ = "agent_run_events"
+    __table_args__ = (
+        UniqueConstraint("run_id", "idempotency_key", name="uq_agent_run_event_idempotency"),
+        UniqueConstraint("run_id", "sequence", name="uq_agent_run_event_sequence"),
+        CheckConstraint("sequence > 0", name="ck_agent_run_event_sequence_positive"),
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    sequence = Column(Integer, nullable=False)
+    event_type = Column(String(80), nullable=False)
+    idempotency_key = Column(String(64), nullable=False)
+    payload_json = Column(JSON, nullable=False, default=dict)
+    # LG-13.5 timing samples are issued by PostgreSQL, never by a worker or
+    # browser clock. ``created_at`` remains the legacy operational timestamp.
+    occurred_at = Column(DateTime(timezone=True), nullable=False, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+
+    run = relationship("AgentRun", back_populates="events")
 
 
 class AgentRunStep(Base):
@@ -1601,6 +1683,7 @@ _LG12I_IMMUTABLE_VERSION_MODELS = (
     QualityThresholdProfileVersion,
     QualityAssessmentReportVersion,
     QualityPromotionVersion,
+    AgentRunEvent,
 )
 
 

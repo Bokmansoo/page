@@ -29,6 +29,13 @@ const view = (stage: "generation_pending" | "provider_wait" | "image_review", jo
         review_stage: stage,
         title: stage === "generation_pending" ? "이미지 생성 비용 확인" : stage === "provider_wait" ? "이미지 생성 진행 중" : "생성 이미지 검수",
         description: "같은 LangGraph 실행에서 상태를 복구합니다.",
+        seller_guidance: {
+          cause_ko: stage === "generation_pending" ? "이미지 생성 전에 비용 확인이 필요합니다." : stage === "provider_wait" ? "이미지 생성 결과를 확인하고 있습니다." : "생성 이미지를 확인해야 합니다.",
+          action_ko: stage === "generation_pending" ? "예상 비용을 확인한 뒤 생성을 승인하세요." : stage === "provider_wait" ? "잠시 후 작업 상태를 새로고침하세요." : "장면별로 승인, 거절 또는 다시 생성을 선택하세요.",
+          action_type: stage === "generation_pending" ? "approve_cost" : stage === "provider_wait" ? "refresh_status" : "review",
+          retryable: false,
+          review_required: true,
+        },
         allowed_decisions: stage === "generation_pending" ? ["approve", "defer"] : stage === "provider_wait" ? ["refresh"] : ["approve", "reject", "regenerate", "upload"],
         context: { generation: { cost_plan: costPlan, jobs } },
       },
@@ -42,7 +49,21 @@ const view = (stage: "generation_pending" | "provider_wait" | "image_review", jo
       approved_count: jobs.filter((job) => job.status === "approved").length,
       failed_job_ids: [],
     },
-    execution: { recoverable: false, last_error: null, errors: [] },
+    execution: {
+      recoverable: false,
+      last_error: null,
+      errors: [],
+      delay_context: stage === "provider_wait" ? {
+        current_stage: "first_usable_draft",
+        current_stage_ko: "이미지 생성 결과를 확인하고 있습니다.",
+        delay_cause: "provider_execution",
+        delay_cause_ko: "이미지를 생성하고 있습니다.",
+        eta_status: "estimated",
+        eta_range_seconds: { min: 30, max: 60 },
+        updated_at: "2026-08-26T00:00:00Z",
+        seller_guidance: { cause_ko: "이미지를 생성하고 있습니다.", action_ko: "완료되면 다음 단계가 자동으로 진행됩니다.", action_type: "refresh_status", retryable: false, review_required: false },
+      } : null,
+    },
   },
   next_nodes: [],
 });
@@ -127,7 +148,8 @@ test("LG-9 fake provider restores cost, worker wait and per-scene review across 
   await expect(page.getByTestId("lg5r-cost-plan")).toContainText("2개 장면");
   await expect(page.getByTestId("lg5r-cost-plan")).toContainText("총 예상 비용 2 credit");
   await page.getByRole("button", { name: "비용 승인 후 이미지 생성" }).dblclick();
-  await expect(page.getByText("이미지 생성 진행 중")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "이미지 생성 결과를 확인하고 있습니다." })).toBeVisible();
+  await expect(page.getByTestId("seller-delay-context")).toContainText("예상 남은 시간 30~60초");
   await expect(page.getByTestId("lg5r-scene-hero")).toBeVisible({ timeout: 8_000 });
   await expect(page.getByTestId("lg5r-scene-preview-hero")).toBeVisible();
   await expect(page.getByTestId("lg5r-scene-preview-hero")).toHaveAttribute("src", /\/api\/v1\/files\/assets\/generated-hero$/);
@@ -145,7 +167,7 @@ test("LG-9 fake provider restores cost, worker wait and per-scene review across 
   await expect(page.getByTestId("lg5r-scene-hero")).toBeVisible();
   await page.getByTestId("lg5r-scene-hero").getByRole("button", { name: "이 장면 승인" }).click();
   await expect(page.getByText("1/2개 필수 장면 승인")).toBeVisible();
-  await expect(page.getByTestId("lg5r-scene-usage")).toContainText("needs_review");
+  await expect(page.getByTestId("lg5r-scene-usage").getByRole("button", { name: "이 장면 승인" })).toBeVisible();
 
   await page.getByLabel("job-usage 직접 업로드 사진").selectOption("seller-upload");
   await page.getByTestId("lg5r-scene-usage").getByRole("button", { name: "선택 사진 연결" }).click();
@@ -211,15 +233,15 @@ test("LG-9 fake provider regenerates only the rejected scene through a new cost 
 
   await page.goto(`/workspace/projects/${projectId}/planning?runId=${runId}`);
   await page.getByTestId("lg5r-scene-hero").getByRole("button", { name: "거절" }).click();
-  await expect(page.getByTestId("lg5r-scene-hero")).toContainText("rejected");
+  await expect(page.getByTestId("lg5r-scene-hero").getByRole("button", { name: "이 장면 재생성" })).toBeVisible();
   await page.getByTestId("lg5r-scene-hero").getByRole("button", { name: "이 장면 재생성" }).click();
   await expect(page.getByTestId("lg5r-cost-plan")).toBeVisible();
   await page.getByRole("button", { name: "비용 승인 후 이미지 생성" }).click();
-  await expect(page.getByTestId("lg5r-scene-hero")).toContainText("시도 2", { timeout: 8_000 });
+  await expect(page.getByTestId("lg5r-scene-hero")).toContainText("생성 시도 2", { timeout: 8_000 });
   await expect(page.getByTestId("lg5r-scene-preview-hero")).toHaveAttribute("src", /generated-hero-retry$/);
   await expect(page.getByTestId("lg5r-scene-preview-usage")).toHaveAttribute("src", /generated-usage$/);
   await page.getByTestId("lg5r-scene-hero").getByRole("button", { name: "이 장면 승인" }).click();
-  await expect(page.getByTestId("lg5r-scene-usage")).toContainText("needs_review");
+  await expect(page.getByTestId("lg5r-scene-usage").getByRole("button", { name: "이 장면 승인" })).toBeVisible();
   await page.getByTestId("lg5r-scene-usage").getByRole("button", { name: "이 장면 승인" }).click();
   await expect(page.getByTestId("lg5r-completed-gallery")).toBeVisible();
   expect(state).toMatchObject({
@@ -270,20 +292,21 @@ test("LG-9 provider polling keeps the current review content visible", async ({ 
 
 test("LG-5R renders every actionable provider and quality error separately", async ({ page }) => {
   const failures = [
-    ["API_KEY_MISSING", "API 키가 없습니다"],
-    ["BALANCE_OR_LIMIT", "API 잔액 또는 사용 한도"],
-    ["PROVIDER_TIMEOUT", "제공자 응답 시간이 초과"],
-    ["PROVIDER_SAFETY", "제공자 안전 정책"],
-    ["IDENTITY_MISMATCH", "상품 외형이 기준 사진과 일치하지 않습니다"],
-    ["OCR_CONTAMINATION", "글자·로고·워터마크 오염"],
-    ["RIGHTS_BLOCKED", "이미지 사용 권리"],
+    ["API_KEY_MISSING", "이미지 생성 설정을 확인해야 합니다."],
+    ["BALANCE_OR_LIMIT", "이미지 생성 사용 한도를 확인해야 합니다."],
+    ["PROVIDER_TIMEOUT", "이미지 생성 응답이 늦어 완료하지 못했습니다."],
+    ["PROVIDER_SAFETY", "이미지 요청이 안전 기준으로 처리되지 않았습니다."],
+    ["IDENTITY_MISMATCH", "생성 이미지가 상품 사진과 충분히 일치하지 않습니다."],
+    ["OCR_CONTAMINATION", "생성 이미지에서 확인이 필요한 문구가 감지되었습니다."],
+    ["RIGHTS_BLOCKED", "사용 권한을 확인할 수 없는 이미지가 포함되었습니다."],
   ];
-  const failedJobs = failures.map(([error_code], index) => ({
+  const failedJobs = failures.map(([error_code, userMessage], index) => ({
     job_id: `failed-${index}`,
     scene_id: `failed-scene-${index}`,
     role: "generated_image",
     status: "failed",
     error_code,
+    seller_guidance: { cause_ko: userMessage, action_ko: "안내에 따라 장면을 다시 생성하세요.", action_type: "retry", retryable: true, review_required: false },
     generation_attempt: 1,
     outbox_status: "dead_letter",
     ...(error_code === "IDENTITY_MISMATCH" ? {

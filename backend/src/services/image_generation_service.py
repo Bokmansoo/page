@@ -1,11 +1,16 @@
 import os
 import uuid
 import logging
+import datetime
+import hashlib
+import json
+import time
 from typing import Optional, List, Any
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.attributes import flag_modified
 from src.config import settings
-from src.db.models import ProductProject, Asset, ImageGenerationJobRecord
+from src.db.models import AgentRun, ProductProject, Asset, ImageGenerationJobRecord, ImageGenerationOutboxRecord, ImageGenerationProviderAttemptRecord
 from src.services.image_generation_provider import ImageGenerationRequest, ImageGenerationResult
 from src.services.commerce_content_quality_service import auto_placement_risk_codes
 from src.services.generation_provider_adapter import get_image_generation_adapter
@@ -14,7 +19,30 @@ from src.services.product_identity_validator import ProductIdentityValidator, Pr
 
 logger = logging.getLogger(__name__)
 RETRYABLE_PROVIDER_ERRORS = {"RATE_LIMIT_EXCEEDED", "TIMEOUT"}
+_PERSISTED_PROVIDER_ERROR_CODES = {
+    "API_KEY_MISSING",
+    "BALANCE_OR_LIMIT",
+    "BILLING_HARD_LIMIT_REACHED",
+    "FILE_SAVE_ERROR",
+    "IDENTITY_MISMATCH",
+    "INVALID_REQUEST",
+    "MODERATION_REJECTED",
+    "OCR_CONTAMINATION",
+    "PRE_DISPATCH_FAILURE",
+    "PROVIDER_ERROR",
+    "PROVIDER_OUTCOME_UNKNOWN",
+    "PROVIDER_RESULT_ERROR",
+    "PROVIDER_SAFETY",
+    "PROVIDER_TIMEOUT",
+    "RATE_LIMIT_EXCEEDED",
+    "RIGHTS_BLOCKED",
+    "TIMEOUT",
+    "UNSAFE_GENERATED_CONTENT_DETECTED",
+}
+_SAFE_PROVIDER_FAILURE_ACTION = "이미지 생성 요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요."
 LG9_VALIDATION_SCHEMA_VERSION = "lg9-image-validation-v1"
+_COST_STATES = {"NOT_DISPATCHED", "EXPLICIT_ZERO", "KNOWN", "UNKNOWN_AFTER_DISPATCH"}
+_USAGE_SCALARS = ("input_tokens", "output_tokens", "total_tokens", "input_images", "output_images")
 
 
 def _record_provider_attempt(
@@ -43,15 +71,236 @@ def _record_provider_attempt(
 
 
 def _split_provider_error(error: Exception) -> tuple[str, str]:
-    detail = " ".join(str(error).split())[:500]
-    code = detail.split(":", 1)[0].strip() or "PROVIDER_ERROR"
-    return code, detail
+    """Return only a bounded provider code and seller-safe persisted action."""
+
+    candidate = " ".join(str(error).split()).split(":", 1)[0].strip().upper()
+    code = candidate if candidate in _PERSISTED_PROVIDER_ERROR_CODES else "PROVIDER_ERROR"
+    return code, _SAFE_PROVIDER_FAILURE_ACTION
 
 
 def _is_production_langgraph_job(record: ImageGenerationJobRecord) -> bool:
     """Keep LG-9 reporting on the production LangGraph execution path only."""
 
     return bool((record.usage_metadata or {}).get("langgraph_run_id"))
+
+
+def _cost_hash(value: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+
+
+def _bounded_number(value: Any, *, integer: bool = False) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or value > 1_000_000_000:
+        return None
+    return int(value) if integer else float(value)
+
+
+def normalize_provider_usage(metadata: Any) -> tuple[dict[str, Any], float | None, str]:
+    """Retain only provider-neutral accounting scalars, never a raw response."""
+
+    source = dict(metadata or {}) if isinstance(metadata, dict) else {}
+    usage: dict[str, Any] = {}
+    for name in _USAGE_SCALARS:
+        value = _bounded_number(source.get(name), integer=True)
+        if value is not None:
+            usage[name] = value
+    cost = _bounded_number(source.get("actual_cost", source.get("cost")))
+    if cost is not None:
+        usage["provider_reported_cost"] = cost
+    currency = str(source.get("currency") or "credit").strip().lower()
+    if not currency.isalpha() or len(currency) > 20:
+        currency = "credit"
+    usage["availability"] = "reported" if usage else "missing"
+    return usage, cost, currency
+
+
+def _provider_attempt_context(record: ImageGenerationJobRecord, db: Session) -> tuple[AgentRun, ImageGenerationOutboxRecord | None] | None:
+    run_id = str((record.usage_metadata or {}).get("langgraph_run_id") or "")
+    if not run_id:
+        return None
+    run = db.query(AgentRun).filter(AgentRun.id == run_id).first()
+    outbox = record.outbox_record
+    # Historical unit/legacy callers mark a job as LangGraph-shaped without a
+    # persisted run or outbox. They retain the old per-job behavior; the
+    # production LG-5R worker always has the durable tuple below.
+    if run is None and outbox is None:
+        return None
+    expected_thread = run.graph_thread_id or run.id if run is not None else ""
+    if (
+        run is None
+        or run.project_id != record.project_id
+        or (outbox is not None and (
+            outbox.workspace_id != run.workspace_id
+            or outbox.project_id != run.project_id
+            or outbox.run_id != run.id
+            or outbox.thread_id != expected_thread
+            or outbox.image_job_id != record.id
+            or outbox.job_id != record.job_id
+        ))
+    ):
+        raise ValueError("Provider cost attempt scope does not match the persisted LangGraph work.")
+    return run, outbox
+
+
+def _provider_attempt_key(
+    *, run: AgentRun, record: ImageGenerationJobRecord, outbox: ImageGenerationOutboxRecord | None,
+    provider_adapter_attempt: int, provider: str, model: str,
+) -> str:
+    return _cost_hash({
+        "run_id": run.id,
+        "thread_id": run.graph_thread_id or run.id,
+        "job_id": record.id,
+        "job_key": record.idempotency_key,
+        "seller_generation_attempt": int(record.generation_attempt or 1),
+        "delivery_id": outbox.id if outbox else "",
+        "delivery_attempt": int(outbox.delivery_attempts or 0) if outbox else 0,
+        "provider_adapter_attempt": provider_adapter_attempt,
+        "provider": provider,
+        "model": model,
+    })
+
+
+def _project_provider_costs(run: AgentRun, db: Session) -> dict[str, Any]:
+    rows = db.query(ImageGenerationProviderAttemptRecord).filter(
+        ImageGenerationProviderAttemptRecord.run_id == run.id
+    ).order_by(ImageGenerationProviderAttemptRecord.started_at.asc(), ImageGenerationProviderAttemptRecord.id.asc()).all()
+    known = sum(float(row.actual_cost or 0) for row in rows if row.cost_state != "UNKNOWN_AFTER_DISPATCH")
+    unknown = sum(row.cost_state == "UNKNOWN_AFTER_DISPATCH" for row in rows)
+    by_job: dict[str, float] = {}
+    for row in rows:
+        if row.cost_state != "UNKNOWN_AFTER_DISPATCH":
+            by_job[row.image_job_id] = by_job.get(row.image_job_id, 0.0) + float(row.actual_cost or 0)
+    for job_id, actual_cost in by_job.items():
+        job = db.query(ImageGenerationJobRecord).filter(ImageGenerationJobRecord.id == job_id).one_or_none()
+        if job is not None:
+            job.actual_cost = actual_cost
+            db.add(job)
+    summary = {
+        "known_actual_cost": known,
+        "has_unknown_cost": bool(unknown),
+        "actual_cost_complete": not bool(unknown),
+        "attempt_count": len(rows),
+        "unknown_attempt_count": int(unknown),
+    }
+    return summary
+
+
+def _append_provider_attempt(
+    record: ImageGenerationJobRecord,
+    db: Session,
+    *,
+    provider_adapter_attempt: int,
+    provider: str,
+    model: str,
+    dispatch_state: str,
+    cost_state: str,
+    actual_cost: float | None,
+    currency: str,
+    usage: dict[str, Any],
+    outcome_code: str,
+    started_at: datetime.datetime,
+    completed_at: datetime.datetime,
+    latency_ms: int | None,
+) -> ImageGenerationProviderAttemptRecord | None:
+    if cost_state not in _COST_STATES:
+        raise ValueError("Unsupported provider cost state.")
+    context = _provider_attempt_context(record, db)
+    if context is None:
+        return None
+    run, outbox = context
+    key = _provider_attempt_key(
+        run=run, record=record, outbox=outbox, provider_adapter_attempt=provider_adapter_attempt,
+        provider=provider, model=model,
+    )
+    row = ImageGenerationProviderAttemptRecord(
+        workspace_id=run.workspace_id,
+        project_id=run.project_id,
+        run_id=run.id,
+        thread_id=run.graph_thread_id or run.id,
+        image_job_id=record.id,
+        outbox_id=outbox.id if outbox else None,
+        job_id=record.job_id,
+        scene_id=record.scene_id or record.section_id,
+        seller_generation_attempt=int(record.generation_attempt or 1),
+        delivery_attempt=int(outbox.delivery_attempts or 0) if outbox else 0,
+        provider_adapter_attempt=provider_adapter_attempt,
+        provider=provider[:50],
+        model=model[:100],
+        semantic_idempotency_key=key,
+        dispatch_state=dispatch_state,
+        cost_state=cost_state,
+        estimated_cost_at_dispatch=record.estimated_cost,
+        actual_cost=actual_cost,
+        currency=currency,
+        usage_json=usage,
+        outcome_code=outcome_code[:100],
+        latency_ms=latency_ms,
+        started_at=started_at,
+        completed_at=completed_at,
+    )
+    try:
+        with db.begin_nested():
+            db.add(row)
+            db.flush()
+    except IntegrityError:
+        row = db.query(ImageGenerationProviderAttemptRecord).filter(
+            ImageGenerationProviderAttemptRecord.semantic_idempotency_key == key
+        ).one()
+        return row
+    _project_provider_costs(run, db)
+    from src.services.langgraph_run_service import AgentRunEventJournal
+    AgentRunEventJournal.append_provider_cost_event(run, db, ledger=row)
+    return row
+
+
+def record_unknown_provider_attempt_for_delivery(
+    record: ImageGenerationJobRecord,
+    db: Session,
+    *,
+    outcome_code: str = "PROVIDER_OUTCOME_UNKNOWN",
+) -> ImageGenerationProviderAttemptRecord | None:
+    """Record a conservative immutable cost fact for a paid recovery window."""
+
+    context = _provider_attempt_context(record, db)
+    if context is None:
+        return None
+    _run, outbox = context
+    provider_attempt = max(int(record.attempt_count or 0), int(outbox.delivery_attempts or 0) if outbox else 0, 1)
+    now = datetime.datetime.utcnow()
+    return _append_provider_attempt(
+        record, db,
+        provider_adapter_attempt=provider_attempt,
+        provider=str(record.provider or "unknown"),
+        model=str(record.model or "unknown"),
+        dispatch_state="DISPATCHED",
+        cost_state="UNKNOWN_AFTER_DISPATCH",
+        actual_cost=None,
+        currency="credit",
+        usage={"availability": "missing"},
+        outcome_code=outcome_code,
+        started_at=now,
+        completed_at=now,
+        latency_ms=None,
+    )
+
+
+def reconcile_provider_cost_projection(run_id: str, db: Session) -> bool:
+    """Repair a result/ledger-to-projection crash window without provider work."""
+
+    run = db.query(AgentRun).filter(AgentRun.id == run_id).first()
+    if run is None:
+        return False
+    rows = db.query(ImageGenerationProviderAttemptRecord).filter(
+        ImageGenerationProviderAttemptRecord.run_id == run.id
+    ).order_by(ImageGenerationProviderAttemptRecord.started_at.asc(), ImageGenerationProviderAttemptRecord.id.asc()).all()
+    if not rows:
+        return False
+    _project_provider_costs(run, db)
+    from src.services.langgraph_run_service import AgentRunEventJournal
+    changed = False
+    for row in rows:
+        _event, appended, _locked = AgentRunEventJournal.append_provider_cost_event(run, db, ledger=row)
+        changed = changed or appended
+    return changed
 
 
 def _scene_prompt_rights_status(record: ImageGenerationJobRecord) -> tuple[str, list[dict[str, Any]]]:
@@ -306,11 +555,38 @@ def execute_image_generation(
 
     provider = provider_override
     if not provider:
-        if settings.SELLFORM_IMAGE_GENERATION_MODE == "real":
-            provider = get_image_generation_adapter(record.provider or settings.SELLFORM_IMAGE_PROVIDER, record.model)
-        else:
-            from src.services.image_generation_provider import MockImageGenerationProvider
-            provider = MockImageGenerationProvider()
+        try:
+            if settings.SELLFORM_IMAGE_GENERATION_MODE == "real":
+                provider = get_image_generation_adapter(record.provider or settings.SELLFORM_IMAGE_PROVIDER, record.model)
+            else:
+                from src.services.image_generation_provider import MockImageGenerationProvider
+                provider = MockImageGenerationProvider()
+        except Exception as error:
+            record.attempt_count += 1
+            now = datetime.datetime.utcnow()
+            _append_provider_attempt(
+                record,
+                db,
+                provider_adapter_attempt=record.attempt_count,
+                provider=str(record.provider or settings.SELLFORM_IMAGE_PROVIDER),
+                model=str(record.model or settings.SELLFORM_IMAGE_MODEL),
+                dispatch_state="NOT_DISPATCHED",
+                cost_state="NOT_DISPATCHED",
+                actual_cost=0.0,
+                currency="credit",
+                usage={"availability": "missing"},
+                outcome_code="PRE_DISPATCH_FAILURE",
+                started_at=now,
+                completed_at=now,
+                latency_ms=0,
+            )
+            record.status = "failed"
+            record.error_code = "PRE_DISPATCH_FAILURE"
+            record.warnings = ["이미지 생성 준비를 완료하지 못했습니다."]
+            _record_provider_attempt(record, status="failed", error_code=record.error_code)
+            db.commit()
+            sync_job_to_project_json(project_id, job_id, db)
+            raise
 
     # A real provider request in the durable LangGraph flow can have an
     # unknown paid outcome once dispatched.  Do not silently retry or fail
@@ -326,12 +602,30 @@ def execute_image_generation(
         record.attempt_count += 1
         _record_provider_attempt(record, status="running")
         db.commit()
+        attempt_started_at = datetime.datetime.utcnow()
+        attempt_started_clock = time.monotonic()
         try:
             result = provider.generate(req)
             break
         except Exception as e:
             error_code, error_detail = _split_provider_error(e)
-            logger.error(f"Image generation provider failed: {error_detail}")
+            logger.error("Image generation provider failed: %s", error_code)
+            _append_provider_attempt(
+                record,
+                db,
+                provider_adapter_attempt=record.attempt_count,
+                provider=str(record.provider or settings.SELLFORM_IMAGE_PROVIDER),
+                model=str(record.model or settings.SELLFORM_IMAGE_MODEL),
+                dispatch_state="DISPATCHED",
+                cost_state="UNKNOWN_AFTER_DISPATCH",
+                actual_cost=None,
+                currency="credit",
+                usage={"availability": "missing"},
+                outcome_code=error_code,
+                started_at=attempt_started_at,
+                completed_at=datetime.datetime.utcnow(),
+                latency_ms=int((time.monotonic() - attempt_started_clock) * 1000),
+            )
             _record_provider_attempt(record, status="failed", error_code=error_code)
             if (
                 error_code not in RETRYABLE_PROVIDER_ERRORS
@@ -349,6 +643,46 @@ def execute_image_generation(
 
     if result is None:
         raise RuntimeError("PROVIDER_ERROR")
+
+    result_usage, reported_cost, currency = normalize_provider_usage(result.usage_metadata)
+    if reported_cost is None:
+        cost_state = "UNKNOWN_AFTER_DISPATCH"
+    elif reported_cost == 0:
+        cost_state = "EXPLICIT_ZERO"
+    else:
+        cost_state = "KNOWN"
+    result_code = "SUCCESS" if result.status == "success" else "PROVIDER_RESULT_ERROR"
+    _append_provider_attempt(
+        record,
+        db,
+        provider_adapter_attempt=record.attempt_count,
+        provider=str(result.provider or record.provider or settings.SELLFORM_IMAGE_PROVIDER),
+        model=str(result.model or record.model or settings.SELLFORM_IMAGE_MODEL),
+        dispatch_state="DISPATCHED",
+        cost_state=cost_state,
+        actual_cost=reported_cost,
+        currency=currency,
+        usage=result_usage,
+        outcome_code=result_code,
+        started_at=attempt_started_at,
+        completed_at=datetime.datetime.utcnow(),
+        latency_ms=int((time.monotonic() - attempt_started_clock) * 1000),
+    )
+    if not is_production_langgraph and reported_cost is not None:
+        # Legacy callers have no durable run scope. Preserve their established
+        # per-job projection without making it an LG-13 aggregation authority.
+        record.actual_cost = reported_cost
+    record.usage_metadata = {**dict(record.usage_metadata or {}), "provider_usage": result_usage}
+    if result.status != "success":
+        record.status = "failed"
+        record.provider = result.provider
+        record.model = result.model
+        record.error_code = result_code
+        record.warnings = ["Provider returned a non-success result."]
+        _record_provider_attempt(record, status="failed", error_code=result_code)
+        db.commit()
+        sync_job_to_project_json(project_id, job_id, db)
+        raise RuntimeError(result_code)
 
     # Validate before persisting a generated asset.
     try:
@@ -505,11 +839,6 @@ def execute_image_generation(
             "ocr_source": ocr_source,
             "ocr_text": ocr_text[:500],
         }
-        result_usage = dict(result.usage_metadata or {})
-        reported_cost = result_usage.get("actual_cost", result_usage.get("cost"))
-        if isinstance(reported_cost, (int, float)) and not isinstance(reported_cost, bool):
-            record.actual_cost = float(reported_cost)
-        record.usage_metadata = {**dict(record.usage_metadata or {}), **result_usage}
         _record_provider_attempt(record, status="blocked", error_code=record.error_code)
         db.commit()
         sync_job_to_project_json(project_id, job_id, db)
@@ -522,14 +851,6 @@ def execute_image_generation(
     text_warning = "생성 이미지에서 텍스트가 감지되어 원본·상표·문구 복제 여부를 확인해 주세요." if ocr_text else None
     record.warnings = [*warnings, *([text_warning] if text_warning else [])] or None
     record.error_code = None
-    result_usage = dict(result.usage_metadata or {})
-    reported_cost = result_usage.get("actual_cost", result_usage.get("cost"))
-    if isinstance(reported_cost, (int, float)) and not isinstance(reported_cost, bool):
-        record.actual_cost = float(reported_cost)
-    record.usage_metadata = {
-        **dict(record.usage_metadata or {}),
-        **result_usage,
-    }
     _record_provider_attempt(record, status="needs_review")
     record.seed = (result.usage_metadata or {}).get("seed") if isinstance(result.usage_metadata, dict) else None
     record.validation_result = lg9_validation or {

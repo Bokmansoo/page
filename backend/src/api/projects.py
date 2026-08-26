@@ -48,7 +48,6 @@ class AssetResponseSchema(BaseModel):
     source_type: str
     usage_status: str
     filename: str
-    file_path: str
     mime_type: str
     file_size: int
     intake_order: Optional[int] = None
@@ -65,7 +64,6 @@ class AssetResponseSchema(BaseModel):
     height: Optional[int] = None
     image_format: Optional[str] = None
     quality_warnings: List[str] = Field(default_factory=list)
-    ocr_text: Optional[str] = None
     safe_crop_status: str = "needs_review"
     is_representative: bool = False
     representative_source: str = "auto"
@@ -84,12 +82,10 @@ class AssetResponseSchema(BaseModel):
 class SourceCaptureResponseSchema(BaseModel):
     id: str
     project_id: str
-    url: str
     platform: str
     source_role: str
     collection_status: str
     failure_code: Optional[str] = None
-    error_message: Optional[str] = None
     collected_image_count: int
     collected_spec_count: int
     attempted_at: datetime.datetime
@@ -106,8 +102,6 @@ class ProjectResponseSchema(BaseModel):
     current_step: str
     category: Optional[str]
     category_confirmed: bool
-    raw_input_url: Optional[str]
-    raw_input_text: Optional[str]
     selected_background: Optional[str] = None
     created_at: datetime.datetime
     updated_at: datetime.datetime

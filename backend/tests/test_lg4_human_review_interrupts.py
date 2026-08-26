@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import json
+from types import SimpleNamespace
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
 from src.db.models import AgentRun, AgentRunStep, Asset, FactEvidence, ImageGenerationJobRecord, ProductFact
+
+
+PUBLIC_GRAPH_VALUE_KEYS = {
+    "progress", "review", "execution", "intake", "generation", "rendering", "quality", "canvas", "edit",
+}
 
 
 @pytest.fixture
@@ -89,6 +96,102 @@ def _resume(client, headers, state, *, decision="approve"):
     )
 
 
+def test_lg4_public_graph_state_is_bounded_and_wrong_thread_is_rejected(
+    client, auth_headers, db_session, lg4_runtime,
+):
+    run = _create_run(client, auth_headers, db_session)
+    started = client.post(f"/api/v1/graph-runs/{run.id}/start", headers=auth_headers)
+    assert started.status_code == 200, started.text
+    state = started.json()
+    assert "LG4 approval pillow" not in repr(state["values"])
+    assert set(state["values"]) == PUBLIC_GRAPH_VALUE_KEYS
+    assert state["values"]["review"]["pending"]["seller_guidance"] == {
+        "status": "awaiting_review",
+        "safe_code": None,
+        "cause_ko": "입력 내용을 확인해야 합니다.",
+        "action_ko": "내용을 확인한 뒤 승인하거나 수정 요청하세요.",
+        "action_type": "review",
+        "retryable": False,
+        "review_required": True,
+    }
+    history = client.get(f"/api/v1/graph-runs/{run.id}/history", headers=auth_headers)
+    assert history.status_code == 200
+    assert "LG4 approval pillow" not in repr(history.json())
+    assert all(set(item["values"]) == PUBLIC_GRAPH_VALUE_KEYS for item in history.json())
+
+    wrong_thread = client.post(
+        f"/api/v1/graph-runs/{run.id}/resume",
+        headers=auth_headers,
+        json={"thread_id": "another-thread", "response": {"schema_version": "lg4-v1", "review_stage": "input_review", "decision": "approve"}},
+    )
+    assert wrong_thread.status_code == 409
+
+
+def test_lg4_public_graph_values_keep_only_frontend_refs_and_bounded_fields():
+    from src.services.langgraph_run_service import _browser_checkpoint_values
+
+    raw = "SECRET manual OCR prompt https://signed.example/path?token=private"
+    digest = "a" * 64
+    run = SimpleNamespace(
+        status="awaiting_review",
+        current_stage="seller_confirmation",
+        error_log=[],
+        outputs_json={"langgraph_review": {"pending": {
+            "schema_version": "lg12i-v1",
+            "review_stage": "seller_confirmation",
+            "context": {
+                "product_name": raw,
+                "generation": {"cost_plan": {"cost_plan_hash": digest, "provider_payload": raw}},
+                "seller_confirmation": {
+                    "confirmation_required": True,
+                    "resume_request_hash": digest,
+                    "clarifications": [{"clarification_id": "clarification-1", "field_id": "rated_input", "question": raw}],
+                },
+            },
+            "rejection_reason": raw,
+        }}},
+    )
+    snapshot = SimpleNamespace(values={
+        "intake": {
+            "input_mode": "manual", "requested_generation_mode": "quick", "target_channels": ["smartstore"],
+            "manual_source": {"body": raw},
+            "creative_brief": {"brief_version": {"id": "brief-1", "version": 2, "canonical_hash": digest, "body": raw}},
+        },
+        "generation": {"jobs": [{
+            "job_id": "job-1", "scene_id": "scene-1", "status": "approved", "output_asset_id": "asset-1",
+            "estimated_cost": 0, "prompt": raw,
+            "validation": {"status": "approved", "ocr_text": raw, "provider_payload": raw, "risk_codes": ["SAFE"]},
+        }]},
+        "rendering": {"detail_page_version": {"id": "page-1", "version": 3, "snapshot_hash": digest, "file_path": raw}},
+        "quality": {"quality_bar_verdict": "PASS", "routing_code": "PROMOTE", "raw_error": raw},
+        "canvas": {"canonical_page_assembly_input": {"sections": [{
+            "section_id": "section-1", "body": raw,
+            "canvas_elements": [{"element_id": "element-1", "kind": "image", "asset_id": "asset-1", "text": raw}],
+        }]}},
+        "edit": {"version_restore": {"detail_page_version_id": "page-1", "raw_prompt": raw}},
+    })
+
+    values = _browser_checkpoint_values(run, snapshot)
+
+    assert set(values) == PUBLIC_GRAPH_VALUE_KEYS
+    assert values["intake"]["input_mode"] == "manual"
+    assert values["intake"]["creative_brief"]["brief_version"]["id"] == "brief-1"
+    assert values["generation"]["jobs"] == [{
+        "job_id": "job-1", "scene_id": "scene-1", "status": "approved", "output_asset_id": "asset-1",
+        "estimated_cost": 0, "source_asset_ids": [], "validation": {"status": "approved", "risk_codes": ["SAFE"]},
+    }]
+    assert values["review"]["pending"]["context"]["seller_confirmation"]["clarifications"] == [{
+        "clarification_id": "clarification-1", "field_id": "rated_input",
+    }]
+    assert values["rendering"]["detail_page_version"]["snapshot_hash"] == digest
+    assert values["canvas"]["canonical_page_assembly_input"]["sections"][0]["canvas_elements"] == [{
+        "element_id": "element-1", "kind": "image", "asset_id": "asset-1",
+    }]
+    assert raw not in json.dumps(values)
+    assert "ocr_text" not in json.dumps(values)
+    assert "rejection_reason" not in json.dumps(values)
+
+
 def test_lg4_pauses_before_each_approval_boundary_and_never_dispatches_generation(
     client, auth_headers, db_session, lg4_runtime
 ):
@@ -101,7 +204,7 @@ def test_lg4_pauses_before_each_approval_boundary_and_never_dispatches_generatio
     assert input_wait["current_stage"] == "input_review"
     assert input_wait["values"]["review"]["pending"]["schema_version"] == "lg4-v1"
     assert input_wait["values"]["review"]["pending"]["review_stage"] == "input_review"
-    assert "input_router" not in [event["stage"] for event in input_wait["values"]["events"]]
+    assert "events" not in input_wait["values"]
 
     restored = client.get(f"/api/v1/graph-runs/projects/{run.project_id}/review", headers=auth_headers)
     assert restored.status_code == 200
@@ -118,22 +221,13 @@ def test_lg4_pauses_before_each_approval_boundary_and_never_dispatches_generatio
     assert evidence_wait.status_code == 200, evidence_wait.text
     evidence_wait = evidence_wait.json()
     assert evidence_wait["current_stage"] == "evidence_review"
-    stages = [event["stage"] for event in evidence_wait["values"]["events"]]
-    assert stages[-4:] == ["input_review", "input_router", "source_collection", "product_understanding"] or stages[-5:] == ["input_review", "input_router", "source_collection", "product_understanding", "reference_analysis"]
+    assert evidence_wait["values"]["progress"]["stage"] == "evidence_review"
 
     planning_wait = _resume(client, auth_headers, evidence_wait)
     assert planning_wait.status_code == 200, planning_wait.text
     planning_wait = planning_wait.json()
     assert planning_wait["current_stage"] == "planning_review"
-    assert set(planning_wait["values"]["commerce"]) == {
-        "sales_strategy",
-        "page_planning",
-        "copywriting",
-        "visual_planning",
-        # LG-8 compiles provider-safe visual prompts before this approval
-        # boundary, so the planning artifact now includes this fifth stage.
-        "visual_prompt_compiler",
-    }
+    assert set(planning_wait["values"]) == PUBLIC_GRAPH_VALUE_KEYS
 
     generation_wait = _resume(client, auth_headers, planning_wait)
     assert generation_wait.status_code == 200, generation_wait.text
@@ -165,7 +259,7 @@ def test_lg4_rejection_reinterrupts_without_advancing_or_duplicate_steps(client,
     payload = rejected.json()
     assert payload["current_stage"] == "input_review"
     assert payload["status"] == "awaiting_review"
-    assert "input_router" not in [event["stage"] for event in payload["values"]["events"]]
+    assert "events" not in payload["values"]
     assert db_session.query(AgentRunStep).filter(
         AgentRunStep.run_id == run.id,
         AgentRunStep.stage == "input_review",
@@ -197,8 +291,8 @@ def test_lg4_evidence_approval_stays_interrupted_until_a_safe_asset_exists(
     blocked_state = blocked.json()
     assert blocked_state["status"] == "awaiting_review"
     assert blocked_state["current_stage"] == "evidence_review"
-    assert "권리 보유 사진" in blocked_state["values"]["review"]["pending"]["rejection_reason"]
-    assert "sales_strategy" not in [event["stage"] for event in blocked_state["values"]["events"]]
+    assert "rejection_reason" not in blocked_state["values"]["review"]["pending"]
+    assert "events" not in blocked_state["values"]
 
     asset.source_type = "uploaded"
     asset.usage_status = "seller_owned"
@@ -232,9 +326,18 @@ def test_lg4_failed_state_exposes_an_actionable_recovery_contract(
     assert response.status_code == 200, response.text
     execution = response.json()["values"]["execution"]
     assert execution["recoverable"] is True
-    assert execution["last_error"]["stage"] == "visual_planning"
-    assert execution["last_error"]["code"] == "SAFE_REFERENCE_ASSET_REQUIRED"
-    assert execution["last_error"]["recovery_action"] == "upload_safe_reference_asset_and_retry"
+    assert execution["last_error"]["stage"] == "copywriting"
+    assert execution["last_error"]["code"] == "GRAPH_EXECUTION_FAILED"
+    assert execution["last_error"]["recovery_action"] == "retry_same_run"
+    assert execution["last_error"]["seller_guidance"] == {
+        "status": "failed",
+        "safe_code": "GRAPH_EXECUTION_FAILED",
+        "cause_ko": "작업을 완료하지 못했습니다.",
+        "action_ko": "원인을 확인한 뒤 같은 작업을 다시 시도하세요.",
+        "action_type": "retry",
+        "retryable": True,
+        "review_required": False,
+    }
 
     restored = client.get(f"/api/v1/graph-runs/projects/{run.project_id}/review", headers=auth_headers)
     assert restored.status_code == 200

@@ -27,7 +27,6 @@ class AssetResponseSchema(BaseModel):
     source_type: str
     usage_status: str
     filename: str
-    file_path: str
     mime_type: str
     file_size: int
     intake_order: Optional[int] = None
@@ -44,7 +43,6 @@ class AssetResponseSchema(BaseModel):
     height: Optional[int] = None
     image_format: Optional[str] = None
     quality_warnings: list[str] = []
-    ocr_text: Optional[str] = None
     safe_crop_status: str = "needs_review"
     is_representative: bool = False
     representative_source: str = "auto"

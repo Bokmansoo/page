@@ -2969,7 +2969,7 @@ def test_compiled_graph_changes_rework_route_after_child_reqa(
 
 def test_projection_rebuild_preserves_exhausted_retry_budget(
     client, auth_headers, db_session, tmp_path, monkeypatch, golden_result: dict[str, Any] | None = None,
-    checkpointer: Any | None = None,
+    checkpointer: Any | None = None, verify_public_ledger: bool = True,
 ):
     """B-5: one hero scene has two real attempts, even as its asset ref changes."""
 
@@ -3151,7 +3151,8 @@ def test_projection_rebuild_preserves_exhausted_retry_budget(
     assert recovered.status_code == 200, recovered.text
     assert recovered.json()["values"]["review"]["pending"]["review_stage"] == "quality_review"
     recovered_quality = dict(recovered.json()["values"]["quality"])
-    assert recovered_quality["attempt_ledger"] == ledger
+    if verify_public_ledger:
+        assert recovered_quality["attempt_ledger"] == ledger
     replay = client.post(
         f"/api/v1/graph-runs/{run.id}/resume", headers=auth_headers,
         json={"thread_id": run.id, "mode": "recover"},

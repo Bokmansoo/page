@@ -13,7 +13,7 @@ from src.db.models import (
     Workspace,
     Brand,
 )
-from src.services.generation_status_service import GenerationStatusService
+from src.services.generation_status_service import GenerationStatusService, seller_guidance
 
 
 @pytest.fixture
@@ -72,7 +72,13 @@ def test_generation_status_running_when_agent_run_is_running(db_session, test_wo
         status="running",
         current_stage="image_generation",
         input_snapshot={},
-        outputs_json={},
+        outputs_json={
+            "provider_cost_projection": {
+                "actual_cost_complete": False,
+                "has_unknown_cost": True,
+                "attempt_count": 3,
+            },
+        },
         estimated_cost=0.12,
         actual_cost=0.08,
         created_by=test_user.id,
@@ -97,6 +103,9 @@ def test_generation_status_running_when_agent_run_is_running(db_session, test_wo
     assert status["recommended_action"] == "view_status"
     assert status["cost"]["estimated"] == 0.12
     assert status["cost"]["actual"] == 0.08
+    assert status["cost"]["actual_cost_complete"] is False
+    assert status["cost"]["has_unknown_cost"] is True
+    assert status["cost"]["provider_attempt_count"] == 3
     assert status["cost"]["token_input"] == 1200
     assert status["cost"]["token_output"] == 500
 
@@ -174,8 +183,77 @@ def test_generation_status_failed_when_latest_agent_run_failed(db_session, test_
 
     assert status["state"] == "failed"
     assert status["failed_stage"] == "copywriting"
-    assert status["last_error"] == "LLM provider timeout"
+    assert status["last_error"] == "GRAPH_STEP_FAILED"
+    assert status["steps"][0]["error_message"] == "GRAPH_STEP_FAILED"
     assert status["recommended_action"] == "retry_failed_stage"
+    assert status["seller_guidance"] == {
+        "status": "failed",
+        "safe_code": "GRAPH_STEP_FAILED",
+        "cause_ko": "작업을 완료하지 못했습니다.",
+        "action_ko": "원인을 확인한 뒤 같은 작업을 다시 시도하세요.",
+        "action_type": "retry",
+        "retryable": True,
+        "review_required": False,
+    }
+
+
+def test_generation_status_replaces_unknown_error_text_with_bounded_korean_guidance(
+    db_session, test_workspace, test_user, test_brand,
+):
+    project = ProductProject(
+        workspace_id=test_workspace.id,
+        brand_id=test_brand.id,
+        name="bounded failure",
+        status="draft",
+        current_step="image_generation",
+    )
+    db_session.add(project)
+    db_session.flush()
+    run = AgentRun(
+        id="run-raw-error-code",
+        workspace_id=test_workspace.id,
+        project_id=project.id,
+        mode="real",
+        status="failed",
+        current_stage="image_generation",
+        input_snapshot={},
+        outputs_json={},
+        error_log=[{"code": "PROMPT_SECRET_7F3A", "message": "https://signed.example/private?token=SECRET_TOKEN_9C2"}],
+        created_by=test_user.id,
+    )
+    db_session.add(run)
+    db_session.commit()
+
+    status = GenerationStatusService(db_session).get_project_status(project.id, test_workspace.id)
+
+    assert status["last_error"] == "GRAPH_EXECUTION_FAILED"
+    assert status["seller_guidance"]["safe_code"] == "GRAPH_EXECUTION_FAILED"
+    assert status["seller_guidance"]["cause_ko"] == "작업을 완료하지 못했습니다."
+    assert status["seller_guidance"]["action_ko"] == "원인을 확인한 뒤 같은 작업을 다시 시도하세요."
+    assert "PROMPT_SECRET_7F3A" not in repr(status)
+    assert "SECRET_TOKEN_9C2" not in repr(status)
+
+
+@pytest.mark.parametrize(
+    ("state", "code", "review_stage", "action_type", "retryable", "review_required"),
+    [
+        ("completed", None, None, "view_result", False, False),
+        ("failed", "PROVIDER_TIMEOUT", None, "retry", True, False),
+        ("failed", "PROVIDER_OUTCOME_UNKNOWN", None, "refresh_status", False, False),
+        ("needs_review", None, None, "review", False, True),
+        ("awaiting_review", None, "seller_confirmation", "confirm_details", False, True),
+    ],
+)
+def test_seller_guidance_covers_progress_failure_recovery_and_review(
+    state, code, review_stage, action_type, retryable, review_required,
+):
+    guidance = seller_guidance(state, code=code, review_stage=review_stage)
+
+    assert guidance["action_type"] == action_type
+    assert guidance["retryable"] is retryable
+    assert guidance["review_required"] is review_required
+    assert guidance["cause_ko"] and guidance["action_ko"]
+    assert "provider_wait" not in repr(guidance)
 
 
 def test_generation_status_waiting_when_image_cost_approval_is_required(db_session, test_workspace, test_user, test_brand):

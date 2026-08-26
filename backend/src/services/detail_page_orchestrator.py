@@ -8,6 +8,7 @@ from src.services.page_generator import PageGenerationService
 from src.services.page_asset_policy import get_page_eligible_assets
 from src.services.page_asset_policy import has_hero_auto_assign_blocker
 from src.services.commerce_policy import resolved_asset_usage_status
+from src.services.image_generation_service import _split_provider_error
 from src.services.visual_page_renderer import build_visual_sections
 
 logger = logging.getLogger(__name__)
@@ -647,9 +648,10 @@ class DetailPageOrchestrator:
                 result = execute_image_generation(project.id, job.job_id, db, cost_approved=True)
                 generated_any = generated_any or result.status == "needs_review"
             except Exception as exc:
-                logger.warning("Image generation failed; continuing with original assets: %s", exc)
+                error_code, _action = _split_provider_error(exc)
+                logger.warning("Image generation failed; continuing with original assets: %s", error_code)
                 job.status = "failed"
-                job.error_code = str(exc)
+                job.error_code = error_code
                 sync_job_to_project_json(project.id, job.job_id, db)
                 db.commit()
 

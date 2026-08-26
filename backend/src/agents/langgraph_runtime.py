@@ -32,22 +32,9 @@ LANGGRAPH_GRAPH_RUNTIME: GraphRuntime = "langgraph"
 # persisted graph checkpoint.
 CHECKPOINT_SAFE_INPUT_FIELDS = frozenset(
     {
-        "product_name",
-        "category",
-        "description",
-        "feature_details",
-        "components",
-        "cautions",
-        "product_url",
-        "freeform_input",
         "asset_ids",
-        "reference_urls",
-        "selling_points",
-        "price",
-        "shipping",
         "sales_channel",
         "model_options",
-        "desired_mood",
         "ux_auto_generate",
         "approved_fact_snapshot_id",
         "approved_fact_snapshot_hash",
@@ -198,6 +185,21 @@ def checkpoint_safe_input_snapshot(input_snapshot: dict[str, Any] | None) -> dic
         for key, value in snapshot.items()
         if key in CHECKPOINT_SAFE_INPUT_FIELDS
     }
+
+
+def _trusted_run_input_snapshot(state: SellformGraphState) -> dict[str, Any]:
+    """Resolve raw product input from its scoped domain record, never state."""
+
+    from src.db.models import AgentRun
+    from src.services.langgraph_discovery_service import current_langgraph_session
+
+    db = current_langgraph_session()
+    if db is None:
+        raise RuntimeError("LangGraph node requires the graph database session.")
+    run = db.query(AgentRun).filter_by(
+        id=state["run_id"], workspace_id=state["workspace_id"], project_id=state["project_id"],
+    ).one()
+    return dict(run.input_snapshot or {})
 
 
 def build_lg0_graph_input(
@@ -376,7 +378,7 @@ def _lg2_input_router(state: SellformGraphState) -> dict[str, Any]:
 
     discovery = InputRouterAgent().run_delta(
         run_id=state["run_id"],
-        input_snapshot=state.get("input_snapshot") or {},
+        input_snapshot=_trusted_run_input_snapshot(state),
     )
     return {
         "current_stage": "input_router",
@@ -392,7 +394,7 @@ def _lg2_source_collection(state: SellformGraphState) -> dict[str, Any]:
     discovery = SourceCollectionAgent().run_delta(
         run_id=state["run_id"],
         project_id=state["project_id"],
-        input_snapshot=state.get("input_snapshot") or {},
+        input_snapshot=_trusted_run_input_snapshot(state),
     )
     return {
         "current_stage": "source_collection",
@@ -405,7 +407,7 @@ def _lg2_source_collection(state: SellformGraphState) -> dict[str, Any]:
 def _lg2_product_understanding(state: SellformGraphState) -> dict[str, Any]:
     from src.agents.nodes.product_understanding.agent import ProductUnderstandingAgent
 
-    snapshot = state.get("input_snapshot") or {}
+    snapshot = _trusted_run_input_snapshot(state)
     discovery, snapshot_update = ProductUnderstandingAgent().run_delta(
         run_id=state["run_id"],
         project_id=state["project_id"],
@@ -469,7 +471,7 @@ def _lg6_category_classifier(state: SellformGraphState) -> dict[str, Any]:
     db = current_langgraph_session()
     if db is None:
         raise RuntimeError("LG-6 category classifier requires the graph database session.")
-    snapshot = state.get("input_snapshot") or {}
+    snapshot = _trusted_run_input_snapshot(state)
     text = " ".join(str(snapshot.get(key) or "") for key in (
         "product_name", "category", "description", "feature_details", "components", "freeform_input"))
     classification = classify_category(text, snapshot.get("category"))
@@ -1373,6 +1375,11 @@ def _lg12_quality_route(state: SellformGraphState) -> str:
         return "quality_seller_review"
     if route in {"IMAGE_REWORK", "COPY_REWORK", "VISUAL_REWORK", "PLAN_REWORK"} and target is not None:
         _key, entry = _lg12_quality_attempt_entry(quality, target=target)
+        if str(quality.get("slo08_fallback_attempt_key") or "") == _key:
+            # A seller-selected local fallback has already consumed the one
+            # post-exhaustion choice for this logical target. Its child still
+            # receives normal QA, but it never starts another automatic retry.
+            return "quality_seller_review"
         if int((entry or {}).get("attempt_count") or 0) < _LG12_QUALITY_MAX_AUTOMATIC_ATTEMPTS:
             return "quality_selective_rework"
         return "quality_rework_exhausted"
@@ -1390,14 +1397,17 @@ def _lg12_quality_promotion_ready(state: SellformGraphState) -> dict[str, Any]:
     }
 
 
-def _lg12_quality_review_payload(state: SellformGraphState, *, exhausted: bool = False) -> dict[str, Any]:
+def _lg12_quality_review_payload(
+    state: SellformGraphState, *, exhausted: bool = False, fallback_available: bool = False,
+) -> dict[str, Any]:
     quality = dict(state.get("quality") or {})
     rendering = dict(state.get("rendering") or {})
     current_page = dict(rendering.get("detail_page_version") or {})
     return {
         "schema_version": "lg12i-v1", "review_stage": "quality_review",
         "title": "품질 검토 필요", "description": "고정된 품질 결과에 대해 판매자 확인 또는 허용된 선택 수정이 필요합니다.",
-        "allowed_decisions": ["approve", "reject"],
+        "allowed_decisions": (["fallback", "wait"] if fallback_available else ["wait"])
+        if exhausted else ["approve", "reject"],
         "run_id": str(state.get("run_id") or ""), "thread_id": str(state.get("thread_id") or state.get("run_id") or ""),
         "project_id": str(state.get("project_id") or ""),
         "context": {
@@ -1415,6 +1425,11 @@ def _lg12_quality_review_payload(state: SellformGraphState, *, exhausted: bool =
             "rework_exhausted": exhausted,
             "blocking_reasons": list(quality.get("last_blocking_reasons") or []),
             "rework_targets": list(quality.get("rework_targets") or []),
+            "slo08_choice": {
+                "choice_required": True,
+                "available_actions": ["fallback", "wait"] if fallback_available else ["wait"],
+                "automatic_attempts": _LG12_QUALITY_MAX_AUTOMATIC_ATTEMPTS,
+            } if exhausted else {},
         },
         "rejection_reason": "",
     }
@@ -1437,19 +1452,90 @@ def _lg12_quality_seller_review(state: SellformGraphState) -> dict[str, Any]:
 
 
 def _lg12_quality_rework_exhausted(state: SellformGraphState) -> dict[str, Any]:
-    """Never create a third automatic attempt; pause through the shared review path."""
+    """After the durable max-two budget, accept only seller fallback or wait."""
 
+    from src.db.models import AgentRun, ImageGenerationJobRecord, QualityAssessmentReportVersion
+    from src.services.langgraph_discovery_service import current_langgraph_session
+    from src.services.langgraph_image_generation_service import apply_image_review, prepare_lg11_seller_asset_replacement
     from src.services.langgraph_review_service import validate_resume_payload
+    from src.services.page_finalization_service import build_lg11_scene_version_fork, persist_lg11_scene_version_fork
+    from src.services.prompt_intelligence_service import canonical_hash
 
-    payload = _lg12_quality_review_payload(state, exhausted=True)
-    response = validate_resume_payload(interrupt(payload), "quality_review")
-    quality = dict(state.get("quality") or {})
-    return {
-        "current_stage": "quality_rework_exhausted", "status": "completed",
-        "quality": {**quality, "seller_review_required": True, "rework_exhausted": True, "seller_review_decision": response.decision},
-        "review": {"last_resolved_stage": "quality_review", "last_decision": response.decision},
-        "events": [_lg12_quality_event("quality_rework_exhausted", status="completed")],
-    }
+    db = current_langgraph_session()
+    if db is None:
+        raise RuntimeError("LG-12 exhausted rework requires the graph database session.")
+    run = db.query(AgentRun).filter_by(
+        id=str(state.get("run_id") or ""), project_id=str(state.get("project_id") or ""),
+        workspace_id=str(state.get("workspace_id") or ""),
+    ).one()
+    fallback = _lg12_quality_slo08_fallback_candidate(state=state, run=run, db=db)
+    payload = _lg12_quality_review_payload(state, exhausted=True, fallback_available=fallback is not None)
+    while True:
+        response = validate_resume_payload(interrupt(payload), "quality_review")
+        if response.decision not in set(payload["allowed_decisions"]):
+            raise ValueError("SLO-08 action is not available for this exhausted quality target.")
+        if response.decision == "wait":
+            # Re-interrupt instead of scheduling/polling work. The existing
+            # review projection persists this seller-controlled waiting state.
+            continue
+        if not response.seller_attested:
+            raise ValueError("Seller fallback requires an explicit rights confirmation.")
+        fallback = _lg12_quality_slo08_fallback_candidate(state=state, run=run, db=db)
+        if fallback is None:
+            raise ValueError("The frozen seller fallback is unavailable or stale.")
+        page, scene_id, asset_id = fallback
+        generation = prepare_lg11_seller_asset_replacement(
+            run=run, source_version=page, scene_id=scene_id, asset_id=asset_id,
+            seller_attested=True, db=db,
+        )
+        job = next((row for row in db.query(ImageGenerationJobRecord).filter_by(
+            project_id=run.project_id, scene_id=scene_id, provider="manual_upload", output_asset_id=asset_id,
+        ).all() if str((row.usage_metadata or {}).get("lg11_source_version_id") or "") == str(page.id)), None)
+        if job is None:
+            raise ValueError("Seller fallback did not create an owned manual scene record.")
+        generation = apply_image_review(
+            run_id=run.id, project_id=run.project_id, decision="approve", job_id=job.job_id, db=db,
+        )
+        db.refresh(job)
+        if job.status != "approved":
+            raise ValueError("Seller fallback must pass the existing image approval gate.")
+        quality = dict(state.get("quality") or {})
+        intent = {
+            "target_ids": [scene_id],
+            "intent_hash": canonical_hash({"slo08_fallback": True, "scene_id": scene_id, "asset_id": asset_id}),
+        }
+        child = persist_lg11_scene_version_fork(
+            run=run,
+            scene_version_fork=build_lg11_scene_version_fork(
+                source_version=page, edit_run_id=run.id, intent=intent, job=job, db=db,
+            ),
+            db=db,
+        )
+        report_ref = dict(quality.get("quality_report_ref") or {})
+        report = db.query(QualityAssessmentReportVersion).filter_by(
+            id=str(report_ref.get("id") or ""), workspace_id=run.workspace_id, project_id=run.project_id,
+        ).one_or_none()
+        if report is None:
+            raise ValueError("SLO-08 fallback source QualityAssessmentReport is unavailable.")
+        _lg12_quality_finalize_rework_child_exports(child=child, report=report, db=db)
+        db.commit(); db.refresh(child)
+        child_ref = _lg12_quality_child_ref(child)
+        active_attempt = dict(quality.get("active_attempt") or {})
+        fallback_attempt_key, _entry = _lg12_quality_attempt_entry(quality, target={
+            "target_ref": dict(active_attempt.get("target_ref") or {}),
+            "logical_target_ref": dict(active_attempt.get("logical_target_ref") or {}),
+        })
+        completed = _lg12_quality_complete_attempt(quality, child_ref=child_ref)
+        completed["slo08_fallback_attempt_key"] = fallback_attempt_key
+        completed["seller_fallback_used"] = True
+        return {
+            "current_stage": "quality_rework_child_frozen", "status": "running",
+            "rendering": {**dict(state.get("rendering") or {}), "detail_page_version": {"id": child_ref["id"], "schema_version": child_ref["version"], "snapshot_hash": child_ref["hash"]}},
+            "generation": generation,
+            "quality": completed,
+            "review": {"last_resolved_stage": "quality_review", "last_decision": "fallback"},
+            "events": [_lg12_quality_event("quality_rework_child_frozen")],
+        }
 
 
 def _lg12_quality_selective_rework(state: SellformGraphState) -> dict[str, Any]:
@@ -1614,6 +1700,46 @@ def _lg12_quality_scene_target(*, page: Any, targets: list[dict[str, Any]]) -> s
     if len(scene_ids) != 1:
         raise ValueError("IMAGE_REWORK requires one exact frozen scene/asset target from the Quality Bar.")
     return next(iter(scene_ids))
+
+
+def _lg12_quality_slo08_fallback_candidate(*, state: SellformGraphState, run: Any, db: Any) -> tuple[Any, str, str] | None:
+    """Return only a current, frozen seller-owned photo for the exhausted IMAGE target."""
+
+    from src.db.models import Asset, DetailPageVersion, ImageGenerationJobRecord
+    from src.services.storyboard_image_generation_service import MANUAL_FINAL_SOURCE_TYPES, resolved_asset_usage_status
+
+    quality = dict(state.get("quality") or {})
+    attempt = dict(quality.get("active_attempt") or {})
+    page_ref = dict(quality.get("current_detail_page_ref") or {})
+    page = db.query(DetailPageVersion).filter_by(id=str(page_ref.get("id") or ""), project_id=run.project_id).one_or_none()
+    if page is None or str(dict(page.sections_json or {}).get("snapshot_hash") or "") != str(page_ref.get("hash") or ""):
+        return None
+    logical_target = dict(attempt.get("logical_target_ref") or {})
+    if str(logical_target.get("type") or "") == "scene" and str(logical_target.get("id") or ""):
+        scene_id = str(logical_target["id"])
+    else:
+        try:
+            scene_id = _lg12_quality_scene_target(page=page, targets=list(attempt.get("target_refs") or []))
+        except ValueError:
+            return None
+    canonical = dict(dict(page.sections_json or {}).get("lg10") or {}).get("canonical_page_assembly_input") or {}
+    manifest = dict(canonical.get("approved_asset_manifest") or {})
+    entry = next((dict(item) for item in list(manifest.get("assets") or []) if str(item.get("scene_id") or "") == scene_id), None)
+    if entry is None:
+        return None
+    source_job = db.query(ImageGenerationJobRecord).filter_by(
+        project_id=run.project_id, job_id=str(entry.get("job_id") or ""), status="approved",
+    ).one_or_none()
+    if source_job is None or str(source_job.output_asset_id or "") != str(entry.get("asset_id") or ""):
+        return None
+    for asset_id in list(source_job.source_asset_ids or []):
+        asset = db.query(Asset).filter_by(id=asset_id, project_id=run.project_id).one_or_none()
+        if (
+            asset is not None and asset.source_type in MANUAL_FINAL_SOURCE_TYPES
+            and resolved_asset_usage_status(asset) == "seller_owned"
+        ):
+            return page, scene_id, str(asset_id)
+    return None
 
 
 def _lg12_quality_child_ref(child: Any) -> dict[str, Any]:
@@ -2862,7 +2988,9 @@ def build_lg10_compiled_graph(*, checkpointer: BaseCheckpointSaver[Any]):
     })
     graph.add_edge("quality_promotion_ready", END)
     graph.add_edge("quality_seller_review", END)
-    graph.add_edge("quality_rework_exhausted", END)
+    graph.add_conditional_edges("quality_rework_exhausted", lambda state: (
+        "quality_evaluation" if str(state.get("current_stage") or "") == "quality_rework_child_frozen" else END
+    ), {"quality_evaluation": "quality_evaluation", END: END})
     return graph.compile(checkpointer=checkpointer)
 
 
@@ -4212,7 +4340,9 @@ def build_lg11_compiled_graph(*, checkpointer: BaseCheckpointSaver[Any]):
     ), {"quality_evaluation": "quality_evaluation", "quality_seller_review": "quality_seller_review"})
     graph.add_edge("quality_promotion_ready", END)
     graph.add_edge("quality_seller_review", END)
-    graph.add_edge("quality_rework_exhausted", END)
+    graph.add_conditional_edges("quality_rework_exhausted", lambda state: (
+        "quality_evaluation" if str(state.get("current_stage") or "") == "quality_rework_child_frozen" else END
+    ), {"quality_evaluation": "quality_evaluation", END: END})
     graph.add_edge("reject_edit_run", END)
     return graph.compile(checkpointer=checkpointer)
 

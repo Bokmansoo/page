@@ -21,7 +21,7 @@ ReviewStage = Literal[
     "input_review", "evidence_review", "planning_review", "generation_pending", "provider_wait", "image_review",
     "edit_confirmation", "canvas_edit", "seller_confirmation", "quality_review",
 ]
-ReviewDecision = Literal["approve", "reject", "defer", "refresh", "regenerate", "upload", "apply", "undo", "redo", "commit", "submit"]
+ReviewDecision = Literal["approve", "reject", "defer", "refresh", "regenerate", "upload", "apply", "undo", "redo", "commit", "submit", "fallback", "wait"]
 _UNSAFE_CONFIRMATION_TEXT = re.compile(
     r"<\s*/?\s*(?:script|html|iframe|object|embed)\b|javascript\s*:|data\s*:\s*text/html",
     re.IGNORECASE,
@@ -165,7 +165,7 @@ def validate_resume_payload(value: Any, expected_stage: str) -> GraphReviewResum
         "edit_confirmation": {"approve", "reject"},
         "canvas_edit": {"apply", "undo", "redo", "commit"},
         "seller_confirmation": {"submit", "approve"},
-        "quality_review": {"approve", "reject"},
+        "quality_review": {"approve", "reject", "fallback", "wait"},
     }.get(expected_stage, {"approve", "reject"})
     if payload.decision not in allowed:
         raise ValueError(f"{expected_stage} does not accept the '{payload.decision}' decision.")
@@ -198,6 +198,14 @@ def validate_resume_against_interrupt(value: Any, pending: dict[str, Any]) -> Gr
         )
         if not expected_hash or payload.confirmation_request_hash != expected_hash:
             raise ValueError("Seller confirmation request has changed. Refresh and submit the current questions.")
+    allowed_decisions = pending.get("allowed_decisions")
+    if isinstance(allowed_decisions, list):
+        allowed = {str(item) for item in allowed_decisions}
+        if payload.decision not in allowed:
+            raise ValueError("The seller-review action is no longer available. Refresh and choose again.")
+    slo08_choice = dict((pending.get("context") or {}).get("slo08_choice") or {})
+    if slo08_choice.get("choice_required") and payload.decision == "fallback" and not payload.seller_attested:
+        raise ValueError("Confirm that the existing photo is seller-owned before using it as the fallback.")
     return payload
 
 

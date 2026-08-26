@@ -584,6 +584,18 @@ def dispatch_graph_image_jobs(*, run_id: str, project_id: str, mode: str, db: Se
             )
             db.add(outbox)
             try:
+                db.flush()
+                from src.services.langgraph_run_service import AgentRunEventJournal
+
+                AgentRunEventJournal.append_timing_event(
+                    run,
+                    db,
+                    event_type="delivery_enqueued",
+                    timing={
+                        "outbox": {"id": outbox.id, "version": 1, "hash": str(outbox.idempotency_key)},
+                        "attempt": 0,
+                    },
+                )
                 db.commit()
             except IntegrityError:
                 db.rollback()
@@ -687,7 +699,9 @@ def prepare_lg11_seller_asset_replacement(*, run: AgentRun, source_version: Deta
             source_asset_ids=deepcopy(source.source_asset_ids or []), prompt=source.prompt, negative_prompt=source.negative_prompt, preserve_product_identity=True,
             output_size=source.output_size, cost_tier=source.cost_tier, status="awaiting_approval", provider="manual_upload", model="seller_final_asset",
             input_snapshot=deepcopy(source.input_snapshot or {}), validation_result={"status": "pending"}, estimated_cost=0.0,
-            usage_metadata={"langgraph_run_id": run.id, "lg11_source_version_id": source_version.id, "lg11_source_job_id": source.job_id},
+            usage_metadata={"langgraph_run_id": run.id, "langgraph_thread_id": run.graph_thread_id or run.id,
+                            "langgraph_mode": run.mode, "lg11_source_version_id": source_version.id,
+                            "lg11_source_job_id": source.job_id},
             prompt_version=source.prompt_version, prompt_hash=source.prompt_hash, reference_hash=source.reference_hash, planning_hash=source.planning_hash,
             input_hash=source.input_hash, generation_attempt=int(source.generation_attempt or 1) + 1, idempotency_key=key, required_for_completion=True,
             supersedes_job_id=source.job_id, scene_prompt_version_id=source.scene_prompt_version_id)

@@ -185,8 +185,8 @@ def test_checkpoint_allowlist_excludes_secrets_raw_payloads_and_signed_urls():
         "OPENAI_API_KEY": "secret", "authorization": "Bearer secret",
         "signed_url": "https://example.com/file?signature=secret", "customer_raw": "private",
     })
-    assert safe["product_name"] == "상품" and safe["sales_channel"] == "coupang"
-    assert set(safe) == {"product_name", "sales_channel", "prompt_intelligence_snapshot"}
+    assert safe["sales_channel"] == "coupang"
+    assert set(safe) == {"sales_channel", "prompt_intelligence_snapshot"}
 
 
 def test_operator_api_and_cross_workspace_boundaries(client, db_session):

@@ -3215,7 +3215,7 @@ def approve_planning_draft(
 ):
     import datetime
     from src.db.models import DetailPageVersion, ImageGenerationJobRecord
-    from src.services.image_generation_service import execute_image_generation, sync_job_to_project_json
+    from src.services.image_generation_service import _split_provider_error, execute_image_generation, sync_job_to_project_json
     from src.services.storyboard_image_generation_service import SCENE_ROLES
 
     workspace = auth_ctx["workspace"]
@@ -3497,7 +3497,8 @@ def approve_planning_draft(
                 "status": result.status,
             })
         except Exception as exc:
-            logger.warning("Planning draft image generation failed for %s: %s", job_id, exc)
+            error_code, _action = _split_provider_error(exc)
+            logger.warning("Planning draft image generation failed for %s: %s", job_id, error_code)
 
     run = (
         db.query(AgentRun)

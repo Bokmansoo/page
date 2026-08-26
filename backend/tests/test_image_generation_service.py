@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 from src.db.models import User, Workspace, Brand, ProductProject, Asset, ImageGenerationJobRecord
 from src.services.image_generation_provider import ImageGenerationResult
 from src.services.image_generation_service import (
+    _split_provider_error,
     get_or_create_job_record,
     execute_image_generation,
     sync_job_to_project_json
@@ -274,7 +275,21 @@ def test_execute_image_generation_provider_failure(db_session, db_setup):
     assert record.error_code == "RATE_LIMIT_EXCEEDED"
 
 
-def test_execute_image_generation_persists_provider_failure_detail(db_session, db_setup):
+def test_split_provider_error_rejects_raw_exception_text_from_persisted_code_or_action():
+    markers = (
+        "PROMPT_SECRET_7F3A",
+        "https://signed.example/private?token=SECRET_TOKEN_9C2",
+        "customer@example.com",
+    )
+
+    code, action = _split_provider_error(RuntimeError(" ".join(markers)))
+
+    assert code == "PROVIDER_ERROR"
+    assert action
+    assert all(marker not in action for marker in markers)
+
+
+def test_execute_image_generation_persists_only_safe_provider_failure_detail(db_session, db_setup):
     project = db_setup["project"]
 
     mock_provider = MagicMock()
@@ -295,7 +310,8 @@ def test_execute_image_generation_persists_provider_failure_detail(db_session, d
     assert record.status == "failed"
     assert record.error_code == "INVALID_REQUEST"
     assert record.warnings
-    assert "quality is not supported" in record.warnings[0]
+    assert "quality is not supported" not in record.warnings[0]
+    assert record.warnings[0]
 
 
 def test_execute_retries_one_transient_provider_failure(db_session, db_setup):

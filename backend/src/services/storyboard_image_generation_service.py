@@ -30,7 +30,7 @@ from src.db.models import (
 from src.services.api_ready_generation_service import get_generation_plan, is_safe_generation_reference
 from src.services.channel_export_service import image_sha256
 from src.services.commerce_policy import CONFIRMED_FACT_STATUSES, resolved_asset_usage_status
-from src.services.image_generation_service import execute_image_generation
+from src.services.image_generation_service import _split_provider_error, execute_image_generation
 from src.services.storyboard_service import record_storyboard_revision
 from src.services.visual_prompt_compiler_service import (
     compile_scene_prompt,
@@ -967,7 +967,7 @@ def run_storyboard_job_worker(project_id: str, job_id: str, graph_run_id: str | 
         job.status = "running"
         db.commit()
         execute_image_generation(project.id, job.job_id, db, cost_approved=True)
-    except Exception as exc:  # execute_image_generation persists provider failure details
+    except Exception as exc:  # execute_image_generation persists bounded provider failure state
         try:
             project = db.query(ProductProject).filter(ProductProject.id == project_id).first()
             job = _job_for_project(project, job_id, db) if project else None
@@ -975,9 +975,10 @@ def run_storyboard_job_worker(project_id: str, job_id: str, graph_run_id: str | 
             job = None
         if job is not None:
             if job.status not in FINAL_IMAGE_STATUSES:
+                error_code, action = _split_provider_error(exc)
                 job.status = "failed"
-                job.error_code = "PROVIDER_ERROR"
-                job.warnings = [str(exc)[:500]]
+                job.error_code = error_code
+                job.warnings = [action]
                 db.commit()
     finally:
         db.close()

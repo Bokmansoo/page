@@ -18,6 +18,7 @@ from PIL import Image, ImageDraw
 
 from src.db.models import (
     AgentRun,
+    AgentRunEvent,
     Asset,
     BrandKit,
     BrandKitVersion,
@@ -1127,6 +1128,11 @@ def test_lg5r_worker_reconciles_completed_output_left_pending_before_provider_wa
     assert db_session.query(ImageGenerationJobRecord).filter(
         ImageGenerationJobRecord.id == stale_job.id
     ).one().status == "needs_review"
+    recovery_events = db_session.query(AgentRunEvent).filter(
+        AgentRunEvent.run_id == run.id,
+        AgentRunEvent.event_type == "provider_wait_reconciled",
+    ).all()
+    assert len(recovery_events) == 1
     recovered = client.get(f"/api/v1/graph-runs/{run.id}", headers=auth_headers)
     assert recovered.status_code == 200, recovered.text
     assert recovered.json()["current_stage"] == "image_review"

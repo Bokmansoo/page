@@ -45,10 +45,7 @@ def test_lg0_checkpoint_state_uses_an_allowlist_and_never_persists_provider_secr
     graph.invoke(graph_input, {"configurable": {"thread_id": "lg0-safe-run"}})
     snapshot = graph.get_state({"configurable": {"thread_id": "lg0-safe-run"}})
 
-    assert snapshot.values["input_snapshot"] == {
-        "product_name": "경추 마사지 베개",
-        "asset_ids": ["asset-1"],
-    }
+    assert snapshot.values["input_snapshot"] == {"asset_ids": ["asset-1"]}
     assert "sk-must-not-be-persisted" not in repr(snapshot.values)
     assert "authorization" not in snapshot.values["input_snapshot"]
 
@@ -74,7 +71,7 @@ def test_lg0_graph_enforces_secret_filtering_when_a_caller_bypasses_input_helper
         {"configurable": {"thread_id": "lg0-direct-input-run"}}
     )
 
-    assert snapshot.values["input_snapshot"] == {"product_name": "경추 마사지 베개"}
+    assert snapshot.values["input_snapshot"] == {}
     assert "direct-input-must-not-be-persisted" not in repr(snapshot.values)
 
 
@@ -84,7 +81,7 @@ def test_lg0_checkpoint_input_copy_is_not_mutated_by_callers():
     safe_input = checkpoint_safe_input_snapshot(raw_input)
     raw_input["asset_ids"].append("asset-2")
 
-    assert safe_input == {"product_name": "원본", "asset_ids": ["asset-1"]}
+    assert safe_input == {"asset_ids": ["asset-1"]}
 
 
 def test_lg0_feature_flag_defaults_to_legacy_and_can_be_opted_in(monkeypatch):

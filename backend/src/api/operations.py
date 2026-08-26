@@ -4,7 +4,7 @@ import logging
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from src.api.auth import get_current_user_and_workspace
+from src.api.auth import get_current_user_and_workspace, require_roles
 from src.db.database import get_db
 from src.db.models import (
     ProductProject, ProductFact, Asset, JobStatus, AiJobLog, 
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 @router.get("/stats")
 def get_operations_stats(
     db: Session = Depends(get_db),
-    auth_ctx: dict = Depends(get_current_user_and_workspace)
+    auth_ctx: dict = Depends(require_roles(["owner", "admin"]))
 ):
     workspace = auth_ctx["workspace"]
     

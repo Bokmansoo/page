@@ -16,7 +16,7 @@ from scripts.postgres_test_environment import require_local_postgres_test_url
 from src.agents.langgraph_runtime import open_postgres_checkpointer
 from src.app import app
 from src.db.database import SessionLocal
-from src.db.models import DetailPageVersion, ImageGenerationOutboxRecord, QualityAssessmentReportVersion
+from src.db.models import DetailPageVersion, ImageGenerationJobRecord, ImageGenerationOutboxRecord, QualityAssessmentReportVersion
 from src.services.quality_bar_service import aggregate_quality_bar
 from src.services.quality_promotion_service import promote_current_quality_page
 from test_lg12_fake_quality_gate import _persisted_pass_fixture
@@ -218,3 +218,77 @@ def test_postgres_golden_retry_exhaustion(postgres_runtime, auth_headers, tmp_pa
             "attempts": list(result["attempt_ledger"]),
         },
     ))
+
+
+def test_postgres_slo08_exhausted_image_fallback_uses_only_frozen_seller_asset(
+    postgres_runtime, auth_headers, tmp_path, monkeypatch,
+):
+    """SLO-08: no third provider dispatch after the max-two logical target budget."""
+
+    url, client, db = postgres_runtime
+    result: dict[str, Any] = {}
+    with open_postgres_checkpointer(url) as checkpointer:
+        _run_retry_exhaustion(
+            client, auth_headers, db, tmp_path, monkeypatch,
+            golden_result=result, checkpointer=checkpointer, verify_public_ledger=False,
+        )
+        run = result["run"]
+        db.refresh(run)
+        pending = dict((run.outputs_json or {}).get("langgraph_review") or {}).get("pending") or {}
+        assert pending["review_stage"] == "quality_review"
+        assert pending["allowed_decisions"] == ["fallback", "wait"]
+        before = db.query(ImageGenerationOutboxRecord).filter_by(run_id=run.id).count()
+        public = client.get(f"/api/v1/graph-runs/{run.id}", headers=auth_headers)
+        assert public.status_code == 200, public.text
+        public_pending = public.json()["values"]["review"]["pending"]
+        assert public_pending["seller_choice"] == {
+            "choice_required": True, "available_actions": ["fallback", "wait"], "automatic_attempts": 2,
+        }
+        assert not set(dict(public_pending.get("context") or {})) & {
+            "quality_bar_ref", "quality_report_ref", "current_page_ref", "routing_code", "slo08_choice",
+        }
+        status = client.get(f"/api/v1/operations/projects/{run.project_id}/generation-status", headers=auth_headers)
+        assert status.status_code == 200, status.text
+        assert status.json()["seller_choice"] == public_pending["seller_choice"]
+        unattested = client.post(
+            f"/api/v1/graph-runs/{run.id}/resume", headers=auth_headers,
+            json={"thread_id": run.id, "mode": "respond", "response": {
+                "schema_version": "lg12i-v1", "review_stage": "quality_review", "decision": "fallback",
+            }},
+        )
+        assert unattested.status_code == 409
+        waiting = client.post(
+            f"/api/v1/graph-runs/{run.id}/resume", headers=auth_headers,
+            json={"thread_id": run.id, "mode": "respond", "response": {
+                "schema_version": "lg12i-v1", "review_stage": "quality_review", "decision": "wait",
+            }},
+        )
+        assert waiting.status_code == 200, waiting.text
+        assert waiting.json()["values"]["review"]["pending"]["seller_choice"] == public_pending["seller_choice"]
+        assert db.query(ImageGenerationOutboxRecord).filter_by(run_id=run.id).count() == before == 2
+        fallback = client.post(
+            f"/api/v1/graph-runs/{run.id}/resume", headers=auth_headers,
+            json={"thread_id": run.id, "mode": "respond", "response": {
+                "schema_version": "lg12i-v1", "review_stage": "quality_review", "decision": "fallback",
+                "seller_attested": True,
+            }},
+        )
+        assert fallback.status_code == 200, fallback.text
+        db.refresh(run)
+        quality = dict((run.outputs_json or {}).get("langgraph_quality") or {})
+        assert quality["slo08_fallback_attempt_key"]
+        assert quality["rework_attempt_count"] == 2
+        assert db.query(ImageGenerationOutboxRecord).filter_by(run_id=run.id).count() == before == 2
+        manual = db.query(ImageGenerationJobRecord).filter_by(
+            project_id=run.project_id, provider="manual_upload", status="approved",
+        ).one()
+        assert manual.output_asset_id in manual.source_asset_ids
+        duplicate = client.post(
+            f"/api/v1/graph-runs/{run.id}/resume", headers=auth_headers,
+            json={"thread_id": run.id, "mode": "respond", "response": {
+                "schema_version": "lg12i-v1", "review_stage": "quality_review", "decision": "fallback",
+                "seller_attested": True,
+            }},
+        )
+        assert duplicate.status_code == 422
+        assert db.query(ImageGenerationOutboxRecord).filter_by(run_id=run.id).count() == before

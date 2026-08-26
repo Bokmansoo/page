@@ -3,6 +3,26 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { apiUrl } from "@/lib/api";
 
+type SellerGuidance = {
+  cause_ko: string;
+  action_ko: string;
+  action_type: string;
+  retryable: boolean;
+  review_required: boolean;
+};
+
+type DelayContext = {
+  current_stage: string;
+  current_stage_ko: string;
+  current_scene_id?: string;
+  delay_cause: string;
+  delay_cause_ko: string;
+  eta_status: "estimated" | "overdue" | "insufficient_sample" | "paused_for_review";
+  eta_range_seconds?: { min: number; max: number } | null;
+  updated_at: string;
+  seller_guidance: SellerGuidance;
+};
+
 export type GraphView = {
   run_id: string;
   thread_id: string;
@@ -20,6 +40,7 @@ export type GraphView = {
         status: string;
         output_asset_id?: string | null;
         error_code?: string | null;
+        seller_guidance?: SellerGuidance;
         warnings?: string[];
         source_asset_ids?: string[];
         validation?: {
@@ -93,6 +114,15 @@ export type GraphView = {
       recoverable?: boolean;
       last_error?: GraphExecutionError | null;
       errors?: GraphExecutionError[];
+      delay_context?: DelayContext | null;
+      progress_preview?: {
+        completed_sections: Array<{ section_id: string; summary?: string }>;
+        pending_sections: Array<{ section_id: string }>;
+        completed_count: number;
+        total_sections: number;
+        progress_percent: number;
+        current_section?: string | null;
+      } | null;
     };
   };
   next_nodes: string[];
@@ -105,6 +135,7 @@ type GraphExecutionError = {
   user_message?: string;
   recovery_action?: string;
   recoverable?: boolean;
+  seller_guidance?: SellerGuidance;
 };
 
 type ReviewRequest = {
@@ -113,7 +144,8 @@ type ReviewRequest = {
   title: string;
   description: string;
   allowed_decisions: string[];
-  rejection_reason?: string;
+  seller_guidance?: SellerGuidance;
+  seller_choice?: { choice_required: boolean; available_actions: Array<"fallback" | "wait">; automatic_attempts: number };
 };
 
 type UploadAsset = {
@@ -249,6 +281,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   const [conversationalPreview, setConversationalPreview] = useState<EditIntentPreview | null>(null);
   const [confirmedEditPayload, setConfirmedEditPayload] = useState<Record<string, unknown> | null>(null);
   const [autoRefreshingGeneration, setAutoRefreshingGeneration] = useState(false);
+  const [slo08Attested, setSlo08Attested] = useState(false);
   const inFlightRef = useRef(false);
   const copyableHtmlRef = useRef<HTMLTextAreaElement | null>(null);
   const resolvedRunIdRef = useRef<string | null>(runId ?? null);
@@ -432,8 +465,8 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   }, [view?.current_stage, autoRefreshingGeneration, load]);
 
   const resume = async (
-    decision: "approve" | "reject" | "defer" | "refresh" | "regenerate" | "upload" | "apply" | "undo" | "redo" | "commit",
-    options: { jobId?: string; assetId?: string; canvasOperation?: Record<string, unknown> } = {},
+    decision: "approve" | "reject" | "defer" | "refresh" | "regenerate" | "upload" | "apply" | "undo" | "redo" | "commit" | "fallback" | "wait",
+    options: { jobId?: string; assetId?: string; canvasOperation?: Record<string, unknown>; sellerAttested?: boolean } = {},
   ) => {
     if (!view || inFlightRef.current) return;
     const pending = view.values.review?.pending;
@@ -458,6 +491,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
               : {}),
             ...(options.jobId ? { job_id: options.jobId } : {}),
             ...(decision === "upload" ? { asset_id: options.assetId, seller_attested: true } : {}),
+            ...(decision === "fallback" ? { seller_attested: options.sellerAttested === true } : {}),
             ...(options.canvasOperation ? { canvas_operation: options.canvasOperation } : {}),
           },
         }),
@@ -730,11 +764,11 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     && ["quality_selective_rework", "quality_copy_rework", "quality_image_rework", "quality_visual_rework"].includes(view?.current_stage || "");
   if (view?.status === "failed" && !qualityReworkActive) {
     const failure = view.values.execution?.last_error;
+    const guidance = failure?.seller_guidance;
     return <section role="alert" className="mx-auto mb-5 max-w-4xl rounded-xl border border-rose-300 bg-rose-50 p-5 text-sm text-rose-950">
-      <p className="text-xs font-bold text-rose-700">작업 실행 복구 필요 · {failure?.stage || view.current_stage}</p>
-      <h2 className="mt-1 font-black">다음 단계로 진행하지 못했습니다</h2>
-      <p className="mt-2 leading-6">{failure?.user_message || "실행 중 오류가 발생했습니다. 원인을 해결한 뒤 같은 실행을 다시 시도해 주세요."}</p>
-      {failure?.code ? <p className="mt-2 text-xs text-rose-700">오류 코드: {failure.code}</p> : null}
+      <p className="text-xs font-bold text-rose-700">작업 확인 필요</p>
+      <h2 className="mt-1 font-black">{guidance?.cause_ko || "다음 단계로 진행하지 못했습니다"}</h2>
+      <p className="mt-2 leading-6">{guidance?.action_ko || "원인을 해결한 뒤 같은 작업을 다시 시도해 주세요."}</p>
       <div className="mt-4 flex flex-wrap gap-2">
         <button type="button" onClick={() => void load()} disabled={working} className="rounded-lg border border-rose-300 bg-white px-3 py-2 text-xs font-bold text-rose-800 disabled:opacity-50">상태 새로고침</button>
         <button type="button" onClick={() => void retryFailedRun()} disabled={working || failure?.recoverable === false} className="rounded-lg bg-rose-700 px-3 py-2 text-xs font-bold text-white disabled:opacity-50">{working ? "재개 중..." : "원인 해결 후 같은 실행 재시도"}</button>
@@ -752,7 +786,22 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   }
   const pending = view?.values.review?.pending;
   if (!view) return null;
+  const delayContext = view.values.execution?.delay_context;
+  const etaText = delayContext?.eta_status === "estimated" && delayContext.eta_range_seconds
+    ? `예상 남은 시간 ${delayContext.eta_range_seconds.min}~${delayContext.eta_range_seconds.max}초`
+    : delayContext?.eta_status === "paused_for_review" ? "확인 전까지 예상 시간은 멈춥니다."
+    : delayContext?.eta_status === "overdue" ? "예상 시간보다 오래 걸리고 있어 상태를 계속 확인합니다."
+    : "예상 시간을 계산할 표본이 아직 충분하지 않습니다.";
+  const delayNotice = delayContext ? <div className="mt-3 rounded-lg border border-violet-200 bg-white px-3 py-2 text-xs text-violet-950" data-testid="seller-delay-context"><p className="font-bold">{delayContext.current_stage_ko}</p><p className="mt-1">{delayContext.delay_cause_ko} {delayContext.seller_guidance.action_ko}</p><p className="mt-1 text-slate-600">{etaText}</p></div> : null;
+  const progressivePreview = view.values.execution?.progress_preview;
+  const progressivePreviewNotice = progressivePreview && progressivePreview.total_sections > 0 ? <section className="mt-3 rounded-lg border border-emerald-200 bg-white p-3 text-xs text-emerald-950" data-testid="seller-progressive-preview">
+    <p className="font-bold">상세페이지 준비 상태</p>
+    <p className="mt-1">완료된 섹션 {progressivePreview.completed_count}/{progressivePreview.total_sections} · {progressivePreview.progress_percent}%</p>
+    {progressivePreview.completed_count > 0 ? <ul className="mt-2 space-y-1 text-slate-600">{progressivePreview.completed_sections.map((section, index) => <li key={section.section_id}>완료된 섹션 {index + 1}{section.summary ? ` · ${section.summary}` : ""}</li>)}</ul> : null}
+    {progressivePreview.pending_sections.length > 0 ? <p className="mt-1 text-slate-600">나머지 섹션을 준비하고 있습니다.</p> : null}
+  </section> : null;
   if (!pending) {
+    if (delayNotice) return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-violet-200 bg-violet-50 p-4 text-sm text-violet-950">{delayNotice}{progressivePreviewNotice}</section>;
     if (qualityReworkActive) {
       const reworkMessages: Record<string, string> = {
         COPY_REWORK: "문구 품질을 자동으로 수정하고 있습니다.",
@@ -764,6 +813,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
       return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-amber-200 bg-amber-50 p-5 text-sm text-amber-950" data-testid="lg12-quality-rework">
         <p className="text-xs font-bold text-amber-700">최종 품질 검토</p>
         <h2 className="mt-1 font-black">{reworkMessage}</h2>
+        {progressivePreviewNotice}
         <dl className="mt-3 grid gap-2 rounded-lg border border-amber-200 bg-white p-3 text-xs sm:grid-cols-3">
           <div><dt className="font-bold text-slate-700">현재 품질 상태</dt><dd>수정이 필요합니다</dd></div>
           <div><dt className="font-bold text-slate-700">자동 수정</dt><dd>진행 중</dd></div>
@@ -869,6 +919,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   const providerWaiting = pending.review_stage === "provider_wait";
   const imageReview = pending.review_stage === "image_review";
   const canvasEdit = pending.review_stage === "canvas_edit";
+  const slo08Choice = pending.seller_choice?.choice_required === true;
   const canvasSections = view.values.canvas?.canonical_page_assembly_input?.sections || [];
   const canvasFinalSpecIndex = canvasSections.findIndex((section) => section.section_id === "specs" || section.section_id.endsWith("_specs"));
   const canvasAddPosition = canvasFinalSpecIndex >= 0 ? canvasFinalSpecIndex : canvasSections.length;
@@ -894,23 +945,16 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   </div>;
   const jobs = view.values.generation?.jobs || [];
   const costPlan = view.values.generation?.cost_plan;
-  const errorLabel = (code?: string | null) => ({
-    API_KEY_MISSING: "API 키가 없습니다. 키를 설정한 뒤 같은 실행을 재개하세요.",
-    BALANCE_OR_LIMIT: "API 잔액 또는 사용 한도를 확인하세요.",
-    PROVIDER_TIMEOUT: "제공자 응답 시간이 초과됐습니다. 이 장면만 다시 시도할 수 있습니다.",
-    PROVIDER_SAFETY: "제공자 안전 정책에 의해 차단됐습니다. 장면 요청을 수정하세요.",
-    IDENTITY_MISMATCH: "상품 외형이 기준 사진과 일치하지 않습니다.",
-    OCR_CONTAMINATION: "글자·로고·워터마크 오염이 감지됐습니다.",
-    RIGHTS_BLOCKED: "이미지 사용 권리를 확인해야 합니다.",
-  }[code || ""] || code || "");
   return <section
     className="mx-auto mb-5 max-w-4xl rounded-xl border border-violet-200 bg-violet-50 p-4 text-sm text-violet-950"
     data-testid={`graph-review-${pending.review_stage}`}
   >
     {recoveryNotice ? <p role="status" className="mb-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-900">{recoveryNotice}</p> : null}
+    {delayNotice}
+    {progressivePreviewNotice}
     <div className="flex flex-wrap items-start justify-between gap-3">
-      <div><p className="text-xs font-bold text-violet-700">{pending.review_stage === "quality_review" ? "판매자 확인 대기" : `승인 대기 · ${pending.review_stage}`}</p><h2 className="mt-1 font-black">{pending.title}</h2><p className="mt-1 leading-5 text-slate-700">{pending.description}</p>{pending.rejection_reason ? <p className="mt-2 text-xs text-rose-700">최근 반려 사유: {pending.rejection_reason}</p> : null}</div>
-      {generationWaiting ? <div className="flex gap-2"><button type="button" onClick={() => void resume("defer")} disabled={working} className="rounded-lg border border-violet-300 bg-white px-3 py-2 text-xs font-bold text-violet-800 disabled:opacity-50">대기 상태 저장</button><button type="button" onClick={() => void resume("approve")} disabled={working} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-50">{working ? "확인 중..." : "비용 승인 후 이미지 생성"}</button></div> : providerWaiting ? <button type="button" onClick={() => void resume("refresh")} disabled={working} className="rounded-lg border border-violet-300 bg-white px-3 py-2 text-xs font-bold text-violet-800 disabled:opacity-50">{working ? "확인 중..." : "작업 상태 새로고침"}</button> : imageReview ? <p className="rounded-lg bg-white px-3 py-2 text-xs font-bold text-violet-800">아래 장면별로 승인·거절·재생성·직접 업로드를 선택하세요.</p> : canvasEdit ? <div className="flex flex-wrap gap-2"><button type="button" onClick={() => void resume("undo", { canvasOperation: canvasOperation("undo") })} disabled={working} className="rounded-lg border px-3 py-2 text-xs font-bold">실행 취소</button><button type="button" onClick={() => void resume("redo", { canvasOperation: canvasOperation("redo") })} disabled={working} className="rounded-lg border px-3 py-2 text-xs font-bold">다시 실행</button><button type="button" onClick={() => void resume("commit", { canvasOperation: canvasOperation("commit") })} disabled={working} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white">변경 저장</button></div> : <div className="flex gap-2"><button type="button" onClick={() => void resume("reject")} disabled={working} className="rounded-lg border border-rose-300 bg-white px-3 py-2 text-xs font-bold text-rose-700 disabled:opacity-50">수정 후 재검토</button><button type="button" onClick={() => void resume("approve")} disabled={working} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-50">{working ? "승인 중..." : "확인·다음 단계"}</button></div>}
+      <div><p className="text-xs font-bold text-violet-700">확인 필요</p><h2 className="mt-1 font-black">{pending.seller_guidance?.cause_ko || pending.title}</h2><p className="mt-1 leading-5 text-slate-700">{pending.seller_guidance?.action_ko || pending.description}</p></div>
+      {slo08Choice ? <div className="flex flex-wrap gap-2" data-testid="seller-slo08-choice">{pending.seller_choice?.available_actions.includes("fallback") ? <><label className="flex items-center gap-1 text-xs"><input type="checkbox" checked={slo08Attested} onChange={(event) => setSlo08Attested(event.target.checked)} /> 이 사진의 사용 권한을 확인했습니다</label><button type="button" data-testid="seller-slo08-fallback" onClick={() => void resume("fallback", { sellerAttested: slo08Attested })} disabled={working || !slo08Attested} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-50">기존 사진으로 계속하기</button></> : null}<button type="button" data-testid="seller-slo08-wait" onClick={() => void resume("wait")} disabled={working} className="rounded-lg border border-violet-300 bg-white px-3 py-2 text-xs font-bold text-violet-800 disabled:opacity-50">대기 상태로 유지</button></div> : generationWaiting ? <div className="flex gap-2"><button type="button" onClick={() => void resume("defer")} disabled={working} className="rounded-lg border border-violet-300 bg-white px-3 py-2 text-xs font-bold text-violet-800 disabled:opacity-50">대기 상태 저장</button><button type="button" onClick={() => void resume("approve")} disabled={working} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-50">{working ? "확인 중..." : "비용 승인 후 이미지 생성"}</button></div> : providerWaiting ? <button type="button" onClick={() => void resume("refresh")} disabled={working} className="rounded-lg border border-violet-300 bg-white px-3 py-2 text-xs font-bold text-violet-800 disabled:opacity-50">{working ? "확인 중..." : "작업 상태 새로고침"}</button> : imageReview ? <p className="rounded-lg bg-white px-3 py-2 text-xs font-bold text-violet-800">아래 장면별로 승인·거절·재생성·직접 업로드를 선택하세요.</p> : canvasEdit ? <div className="flex flex-wrap gap-2"><button type="button" onClick={() => void resume("undo", { canvasOperation: canvasOperation("undo") })} disabled={working} className="rounded-lg border px-3 py-2 text-xs font-bold">실행 취소</button><button type="button" onClick={() => void resume("redo", { canvasOperation: canvasOperation("redo") })} disabled={working} className="rounded-lg border px-3 py-2 text-xs font-bold">다시 실행</button><button type="button" onClick={() => void resume("commit", { canvasOperation: canvasOperation("commit") })} disabled={working} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white">변경 저장</button></div> : <div className="flex gap-2"><button type="button" onClick={() => void resume("reject")} disabled={working} className="rounded-lg border border-rose-300 bg-white px-3 py-2 text-xs font-bold text-rose-700 disabled:opacity-50">수정 후 재검토</button><button type="button" onClick={() => void resume("approve")} disabled={working} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-50">{working ? "승인 중..." : "확인·다음 단계"}</button></div>}
     </div>
     {canvasEdit ? <div className="mt-4 space-y-2 rounded-lg border border-violet-100 bg-white p-3 text-xs" data-testid="lg11-canvas-draft"><p className="font-bold">섹션 구조 초안 · revision {view.values.canvas?.revision || 0}</p>{canvasSections.map((section, index) => <div key={section.section_id} className="flex flex-wrap items-center justify-between gap-2 border-t pt-2"><span>{index + 1}. {section.section_id}</span><span className="flex flex-wrap gap-1"><button type="button" disabled={working || index === 0} onClick={() => void resume("apply", { canvasOperation: canvasOperation("reorder", section.section_id, { position: index - 1 }) })} className="rounded border px-2 py-1">위로</button><button type="button" disabled={working || index === canvasSections.length - 1} onClick={() => void resume("apply", { canvasOperation: canvasOperation("reorder", section.section_id, { position: index + 1 }) })} className="rounded border px-2 py-1">아래로</button><button type="button" disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("duplicate", section.section_id, { position: index + 1 }) })} className="rounded border px-2 py-1">복제</button><button type="button" disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("set_visibility", section.section_id, { is_visible: section.canvas?.is_visible === false }) })} className="rounded border px-2 py-1">{section.canvas?.is_visible === false ? "표시" : "숨김"}</button><input aria-label={`${section.section_id} 높이`} type="number" min="160" max="2400" value={canvasHeights[section.section_id] ?? String(section.canvas?.height_px || 160)} onChange={(event) => setCanvasHeights((current) => ({ ...current, [section.section_id]: event.target.value }))} className="w-16 rounded border px-1 py-1"/><button type="button" disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("set_height", section.section_id, { height_px: Number(canvasHeights[section.section_id] ?? section.canvas?.height_px ?? 160) }) })} className="rounded border px-2 py-1">높이 적용</button><button type="button" disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("remove", section.section_id) })} className="rounded border border-rose-300 px-2 py-1 text-rose-700">삭제</button></span></div>)}<button type="button" disabled={working} onClick={() => void resume("apply", { canvasOperation: canvasOperation("add", undefined, { position: canvasAddPosition === 0 && canvasSections.length ? canvasSections.length : canvasAddPosition }) })} className="rounded border border-violet-300 px-2 py-1 font-bold text-violet-800">섹션 추가</button></div> : null}
     {canvasEdit ? canvasElementControls : null}
@@ -925,7 +969,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     {(providerWaiting || imageReview) && jobs.length > 0 ? <div className="mt-4 space-y-2 rounded-lg border border-violet-100 bg-white/70 p-3 text-xs">
       <div className="flex flex-wrap items-center justify-between gap-2"><p className="font-bold text-slate-800">장면별 이미지 작업</p>{imageReview ? <p>{view.values.generation?.approved_count || 0}/{view.values.generation?.required_scene_count || jobs.length}개 필수 장면 승인</p> : null}</div>
       {jobs.map((job) => <article key={job.job_id} className="rounded-md border border-slate-100 p-3" data-testid={`lg5r-scene-${job.scene_id || job.job_id}`}>
-        <div className="flex flex-wrap items-start justify-between gap-2"><span><b>{job.role || job.section_id || job.job_id}</b> · {job.status} · 시도 {job.generation_attempt || 1}{job.outbox_status ? ` · worker ${job.outbox_status}` : ""}</span><span>{job.estimated_cost ?? 0} credit</span></div>
+        <div className="flex flex-wrap items-start justify-between gap-2"><span><b>{job.role || job.section_id || job.job_id}</b> · 생성 시도 {job.generation_attempt || 1}</span><span>{job.estimated_cost ?? 0} credit</span></div>
         {job.output_asset_id ? <figure className="mt-3 overflow-hidden rounded-lg border border-slate-200 bg-slate-100">
           {/* The authenticated asset endpoint serves both fake-provider previews
               and real provider results, so reviewers always approve a visible image. */}
@@ -962,7 +1006,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
           {job.validation.ocr_text ? <p className="mt-2">감지 문구: {job.validation.ocr_text}</p> : null}
           {job.validation.warnings?.length ? <p className="mt-2">검사 메모: {job.validation.warnings.join(" · ")}</p> : null}
         </section> : null}
-        {job.error_code ? <p className="mt-2 text-rose-700">{errorLabel(job.error_code)}</p> : null}
+        {job.seller_guidance ? <p className="mt-2 text-rose-700">{job.seller_guidance.cause_ko} {job.seller_guidance.action_ko}</p> : null}
         {imageReview ? <div className="mt-3 flex flex-wrap gap-2">
           {job.status === "needs_review" ? <><button type="button" onClick={() => void resume("approve", { jobId: job.job_id })} disabled={working} className="rounded bg-emerald-600 px-2 py-1 font-bold text-white disabled:opacity-50">이 장면 승인</button><button type="button" onClick={() => void resume("reject", { jobId: job.job_id })} disabled={working} className="rounded border border-rose-300 px-2 py-1 font-bold text-rose-700 disabled:opacity-50">거절</button></> : null}
           {["failed", "blocked", "rejected", "cancelled", "dead_letter", "needs_review"].includes(job.status) ? <button type="button" onClick={() => void resume("regenerate", { jobId: job.job_id })} disabled={working} className="rounded border border-amber-300 px-2 py-1 font-bold text-amber-800 disabled:opacity-50">이 장면 재생성</button> : null}

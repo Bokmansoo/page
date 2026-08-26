@@ -20,6 +20,7 @@ from src.agents.langgraph_runtime import (
     _lg12_quality_image_rework_route,
     _lg12_quality_logical_target_ref,
     _lg12_quality_node_family,
+    _lg12_quality_review_payload,
     _lg12_quality_rework_action,
     _lg12_quality_selective_rework_route,
     _lg12_quality_summary,
@@ -397,6 +398,18 @@ def test_seller_quality_review_reuses_the_existing_versioned_resume_contract():
         "schema_version": "lg12i-v1", "review_stage": "quality_review", "decision": "approve",
     }, "quality_review")
     assert payload.review_stage == "quality_review"
+
+
+def test_exhausted_quality_without_a_frozen_seller_asset_offers_wait_only():
+    payload = _lg12_quality_review_payload({
+        "run_id": "run-1", "thread_id": "run-1", "project_id": "project-1",
+        "rendering": {"detail_page_version": {"id": "page-1", "schema_version": "lg10-detail-page-version-v1", "snapshot_hash": "a" * 64}},
+        "quality": {"rework_attempt_count": 2},
+    }, exhausted=True, fallback_available=False)
+    assert payload["allowed_decisions"] == ["wait"]
+    assert payload["context"]["slo08_choice"] == {
+        "choice_required": True, "available_actions": ["wait"], "automatic_attempts": 2,
+    }
 
 
 def test_quality_projection_stores_only_bounded_route_and_reference_state(client, db_session, auth_headers, tmp_path):
