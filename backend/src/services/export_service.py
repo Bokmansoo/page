@@ -756,6 +756,7 @@ def build_lg10_standalone_export_bundle(
         "warnings": sorted(set(warnings)),
         "detail_page_version_id": version.id,
         "approved_asset_manifest": manifest,
+        "bundled_assets": bundled_assets,
     }
 
 
