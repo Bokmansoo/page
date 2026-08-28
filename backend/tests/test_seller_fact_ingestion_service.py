@@ -10,9 +10,9 @@ def test_extracts_direct_numeric_seller_specs_without_losing_korean_units():
     specs = extract_confirmed_seller_specs(["260g, 10분, 800mAh"])
 
     assert specs == [
-        ("이 상품의 무게는 260g입니다.", "260g"),
-        ("이 상품의 시간 정보는 10분입니다.", "10분"),
-        ("이 상품의 배터리 용량은 800mAh입니다.", "800mAh"),
+        ("판매자 제공 사양: 무게는 260g입니다.", "260g"),
+        ("판매자 제공 사양: 사용 시간은 10분입니다.", "10분"),
+        ("판매자 제공 사양: 배터리 용량은 800mAh입니다.", "800mAh"),
     ]
 
 
