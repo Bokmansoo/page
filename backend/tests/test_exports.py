@@ -41,13 +41,22 @@ def test_setup(db_session):
     db_session.add(page)
     db_session.flush()
 
+    fact = ProductFact(
+        project_id=project.id,
+        fact_text="사과 99.9% 원재료 및 실온 보관",
+        source_text="판매자 제공 정보",
+        verification_status="confirmed",
+    )
+    db_session.add(fact)
+
     db_session.commit()
     return {
         "user": user,
         "workspace": workspace,
         "brand": brand,
         "project": project,
-        "page": page
+        "page": page,
+        "fact": fact,
     }
 
 # Mock Authentication context
@@ -100,6 +109,7 @@ def test_legacy_final_version_keeps_readiness_gate(mock_dep, client, db_session,
 def test_compliance_and_export_blocker(mock_dep, client, db_session, test_setup):
     page = test_setup["page"]
     project = test_setup["project"]
+    fact_id = test_setup["fact"].id
 
     # 1. Blocker 규제 이슈를 위반하는 섹션 생성
     # Food 카테고리에서 "암 예방" 과 같은 의약품 오인 광고 표현
@@ -109,10 +119,25 @@ def test_compliance_and_export_blocker(mock_dep, client, db_session, test_setup)
         title="항암 효과가 있는 사과즙",
         body_copy="이 사과즙은 암 예방과 만병통치약 효능을 가집니다.",
         sort_order=1,
-        is_visible=True
+        is_visible=True,
+        associated_fact_ids=[fact_id],
+        visual_kind="html_graphic",
+        visual_payload={"layout_variant": "image_text"},
     )
     db_session.add(sec1)
+    db_session.add(PageSection(
+        page_id=page.id,
+        section_type="specifications",
+        title="제품 정보",
+        body_copy="원재료 및 보관방법을 확인해 주세요.",
+        sort_order=2,
+        is_visible=True,
+        associated_fact_ids=[fact_id],
+        visual_kind="html_graphic",
+        visual_payload={"layout_variant": "image_text"},
+    ))
     db_session.commit()
+    db_session.expire(page, ["sections"])
 
     # 2. Compliance API 호출 및 차단 여부 검증
     # mock auth dependency override
@@ -134,8 +159,8 @@ def test_compliance_and_export_blocker(mock_dep, client, db_session, test_setup)
         f"/api/v1/projects/{project.id}/page/export",
         json={"preset_name": "coupang"}
     )
-    assert res_export.status_code == 400
-    assert "Blocker compliance issues" in res_export.json()["detail"]["message"]
+    assert res_export.status_code == 400, res_export.text
+    assert "Page is not ready for export" in res_export.json()["detail"]["message"], res_export.text
 
 
 @pytest.mark.parametrize(
@@ -159,6 +184,7 @@ def test_compliance_warning_and_successful_export(
 ):
     page = test_setup["page"]
     project = test_setup["project"]
+    fact_id = test_setup["fact"].id
 
     # 1. Blocker는 없고 Warning(이미지 누락)만 있는 섹션 생성
     # Food 카테고리 정상 문구이나 features 타입에 이미지 미설정
@@ -168,10 +194,26 @@ def test_compliance_warning_and_successful_export(
         title="국내산 유기농 사과 사용",
         body_copy="매일 아침 엄선된 사과만을 착즙합니다. 원재료: 사과 99.9%. 알레르기 정보: 본 제품은 메밀을 사용한 제품과 같은 시설에서 제조되었습니다. 보관방법: 실온 보관.",
         sort_order=1,
-        is_visible=True
+        is_visible=True,
+        associated_fact_ids=[fact_id],
+        visual_kind="html_graphic",
+        visual_payload={"layout_variant": "image_text"},
     )
     db_session.add(sec1)
+    final_spec = PageSection(
+        page_id=page.id,
+        section_type="specifications",
+        title="제품 정보",
+        body_copy="원재료 및 보관방법을 확인해 주세요.",
+        sort_order=2,
+        is_visible=True,
+        associated_fact_ids=[fact_id],
+        visual_kind="html_graphic",
+        visual_payload={"layout_variant": "image_text"},
+    )
+    db_session.add(final_spec)
     db_session.commit()
+    db_session.expire(page, ["sections"])
 
     # DetailPageVersion 추가
     from src.db.models import DetailPageVersion
@@ -180,12 +222,14 @@ def test_compliance_warning_and_successful_export(
         name="최종본",
         style_key="modern",
         sections_json=[
-            {"key": "features", "title": sec1.title, "body": sec1.body_copy}
+            {"key": "features", "title": sec1.title, "body": sec1.body_copy},
+            {"key": "specifications", "title": final_spec.title, "body": final_spec.body_copy},
         ],
         is_final=True
     )
     db_session.add(version)
     db_session.commit()
+    db_session.expire(page, ["sections"])
 
     # 2. Compliance API 호출 검증
     from src.api.auth import get_current_user_and_workspace
@@ -222,7 +266,7 @@ def test_compliance_warning_and_successful_export(
             f"/api/v1/projects/{project.id}/page/export",
             json={"preset_name": "coupang", "output_format": output_format}
         )
-        assert res_export.status_code == 202
+        assert res_export.status_code == 202, res_export.text
         job_data = res_export.json()
         assert job_data["status"] == "pending"
         job_id = job_data["id"]
@@ -274,6 +318,7 @@ def test_failed_export_job_keeps_actionable_playwright_error_without_outputs(
 
     project = test_setup["project"]
     page = test_setup["page"]
+    fact_id = test_setup["fact"].id
     section = PageSection(
         page_id=page.id,
         section_type="features",
@@ -284,20 +329,37 @@ def test_failed_export_job_keeps_actionable_playwright_error_without_outputs(
         ),
         sort_order=1,
         is_visible=True,
+        associated_fact_ids=[fact_id],
+        visual_kind="html_graphic",
+        visual_payload={"layout_variant": "image_text"},
     )
     db_session.add(section)
+    final_spec = PageSection(
+        page_id=page.id,
+        section_type="specifications",
+        title="제품 정보",
+        body_copy="원재료 및 보관방법을 확인해 주세요.",
+        sort_order=2,
+        is_visible=True,
+        associated_fact_ids=[fact_id],
+        visual_kind="html_graphic",
+        visual_payload={"layout_variant": "image_text"},
+    )
+    db_session.add(final_spec)
     db_session.flush()
     version = DetailPageVersion(
         project_id=project.id,
         name="최종본",
         style_key="modern",
         sections_json=[
-            {"key": "features", "title": section.title, "body": section.body_copy}
+            {"key": "features", "title": section.title, "body": section.body_copy},
+            {"key": "specifications", "title": final_spec.title, "body": final_spec.body_copy},
         ],
         is_final=True,
     )
     db_session.add(version)
     db_session.commit()
+    db_session.expire(page, ["sections"])
     client.app.dependency_overrides[get_current_user_and_workspace] = mock_auth
 
     with patch("src.api.exports.SessionLocal", testing_session_local), patch(
@@ -314,7 +376,7 @@ def test_failed_export_job_keeps_actionable_playwright_error_without_outputs(
             },
         )
 
-    assert response.status_code == 202
+    assert response.status_code == 202, response.text
     job_id = response.json()["id"]
     job_response = client.get(
         f"/api/v1/projects/{project.id}/page/export/jobs/{job_id}"
