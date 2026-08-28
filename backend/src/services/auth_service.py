@@ -70,7 +70,14 @@ def clear_session_cookies(response: Response) -> None:
 def _ensure_brand(db: Session, workspace: Workspace) -> None:
     if db.query(Brand).filter(Brand.workspace_id == workspace.id).first():
         return
-    brand_id = DEV_BRAND_ID if workspace.id == DEV_WORKSPACE_ID else None
+    # Legacy test clients use the development brand constant with an explicit
+    # mock workspace. Keep that compatibility confined to the test-only mock
+    # authentication path; real workspaces still receive an independent ID.
+    test_default_brand = (
+        settings.SELLFORM_AUTH_ALLOW_TEST_MOCK
+        and not db.get(Brand, DEV_BRAND_ID)
+    )
+    brand_id = DEV_BRAND_ID if workspace.id == DEV_WORKSPACE_ID or test_default_brand else None
     db.add(Brand(
         id=brand_id,
         workspace_id=workspace.id,
