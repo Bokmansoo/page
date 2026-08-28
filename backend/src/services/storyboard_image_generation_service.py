@@ -550,7 +550,9 @@ def build_storyboard_generation_contracts(
     contracts: list[dict[str, Any]] = []
     for card in _cards(project):
         scene_type = str(card.get("type") or "")
-        if scene_type not in SCENE_ROLES or card.get("image_requirement") == "seller_upload_required":
+        if scene_type not in SCENE_ROLES or card.get("image_requirement") in {
+            "seller_upload_required", "not_required", "derived_graphic",
+        }:
             continue
         source_assets = _source_assets(project, card, db)
         facts = _confirmed_facts(project, card, db)
@@ -855,7 +857,9 @@ def start_storyboard_job(
     db: Session,
     *,
     allow_mock_provider: bool = False,
+    commit_changes: bool = True,
 ) -> dict[str, Any]:
+    persist = db.commit if commit_changes else db.flush
     job = _job_for_project(project, job_id, db)
     frozen_lg11_source = bool((job.usage_metadata or {}).get("lg11_source_version_id"))
     cards_by_id = {card.get("id"): card for card in _cards(project)}
@@ -870,7 +874,7 @@ def start_storyboard_job(
         return _job_payload(job, card)
     if not cost_approved:
         job.status = "awaiting_approval"
-        db.commit()
+        persist()
         return _job_payload(job, card)
 
     if frozen_lg11_source:
@@ -896,7 +900,7 @@ def start_storyboard_job(
         job.status = "blocked"
         job.error_code = "FROZEN_REFERENCE_UNAVAILABLE"
         job.warnings = ["The frozen LG-11 source references are no longer available for regeneration."]
-        db.commit()
+        persist()
         return _job_payload(job, card)
 
     confirmed_facts = [] if frozen_lg11_source else _confirmed_facts(project, card, db)
@@ -904,20 +908,20 @@ def start_storyboard_job(
         job.status = "blocked"
         job.error_code = "POWER_FACT_REQUIRED"
         job.warnings = ["충전·전원 장면은 판매자가 확인한 충전, 전원 또는 배터리 사실이 있어야 생성할 수 있습니다."]
-        db.commit()
+        persist()
         return _job_payload(job, card)
     identity_ready, identity_warnings = _reference_assessment(sources)
     if not frozen_lg11_source and not identity_ready:
         job.status = "blocked"
         job.error_code = "IDENTITY_REFERENCE_INSUFFICIENT"
         job.warnings = identity_warnings
-        db.commit()
+        persist()
         return _job_payload(job, card)
     if any(not asset.file_path or not os.path.isfile(asset.file_path) for asset in sources):
         job.status = "blocked"
         job.error_code = "REFERENCE_FILE_UNAVAILABLE"
         job.warnings = ["생성 전에 로컬에서 확인 가능한 상품 기준 사진이 필요합니다."]
-        db.commit()
+        persist()
         return _job_payload(job, card)
     if not allow_mock_provider and not storyboard_image_generation_is_available():
         job.status = "blocked"
@@ -926,7 +930,7 @@ def start_storyboard_job(
             "AI image generation is not configured. Mock placeholders are never saved as final commercial images.",
             "Add an image provider API key and enable real image generation, then retry this reviewed scene.",
         ]
-        db.commit()
+        persist()
         return _job_payload(job, card)
 
     job.status = "queued"
@@ -941,7 +945,7 @@ def start_storyboard_job(
     })
     usage_metadata["attempt_history"] = attempt_history
     job.usage_metadata = usage_metadata
-    db.commit()
+    persist()
     payload = _job_payload(job, card)
     payload["dispatch_required"] = True
     return payload

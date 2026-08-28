@@ -283,6 +283,11 @@ def test_postgres_slo08_exhausted_image_fallback_uses_only_frozen_seller_asset(
             project_id=run.project_id, provider="manual_upload", status="approved",
         ).one()
         assert manual.output_asset_id in manual.source_asset_ids
+        stable_counts = {
+            "pages": db.query(DetailPageVersion).filter_by(project_id=run.project_id).count(),
+            "jobs": db.query(ImageGenerationJobRecord).filter_by(project_id=run.project_id).count(),
+            "outbox": db.query(ImageGenerationOutboxRecord).filter_by(run_id=run.id).count(),
+        }
         duplicate = client.post(
             f"/api/v1/graph-runs/{run.id}/resume", headers=auth_headers,
             json={"thread_id": run.id, "mode": "respond", "response": {
@@ -290,5 +295,10 @@ def test_postgres_slo08_exhausted_image_fallback_uses_only_frozen_seller_asset(
                 "seller_attested": True,
             }},
         )
-        assert duplicate.status_code == 409
-        assert db.query(ImageGenerationOutboxRecord).filter_by(run_id=run.id).count() == before
+        assert duplicate.status_code == 200, duplicate.text
+        assert duplicate.json()["values"]["quality"]["rework_attempt_count"] == 2
+        assert {
+            "pages": db.query(DetailPageVersion).filter_by(project_id=run.project_id).count(),
+            "jobs": db.query(ImageGenerationJobRecord).filter_by(project_id=run.project_id).count(),
+            "outbox": db.query(ImageGenerationOutboxRecord).filter_by(run_id=run.id).count(),
+        } == stable_counts

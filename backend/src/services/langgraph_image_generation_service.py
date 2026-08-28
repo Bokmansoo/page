@@ -23,10 +23,11 @@ from src.db.models import (
     ImageGenerationCostApprovalRecord,
     ImageGenerationJobRecord,
     ImageGenerationOutboxRecord,
+    FactSnapshot,
     ProductFact,
     ProductProject,
 )
-from src.services.commerce_policy import is_asset_final_output_eligible
+from src.services.commerce_policy import is_asset_final_output_eligible, resolved_asset_usage_status
 from src.services.product_identity_validator import (
     ProductIdentityValidationError,
     build_frozen_image_quality_evidence,
@@ -83,7 +84,19 @@ def approve_graph_storyboard(*, project_id: str, db: Session) -> dict[str, Any]:
     project.planning_draft = draft
     assets = db.query(Asset).filter(Asset.project_id == project_id).all()
     facts = db.query(ProductFact).filter(ProductFact.project_id == project_id).all()
-    approved = approve_storyboard(project, assets, facts, db, user_id=None)
+    snapshot = db.query(FactSnapshot).filter_by(
+        id=draft.get("fact_snapshot_id"),
+        project_id=project_id,
+        snapshot_hash=draft.get("fact_snapshot_hash"),
+    ).one_or_none()
+    if snapshot is None:
+        raise ImageGenerationGateError(
+            "APPROVED_FACT_SNAPSHOT_MISMATCH",
+            "스토리보드의 승인 사실 기준을 확인할 수 없습니다.",
+        )
+    approved = approve_storyboard(
+        project, assets, facts, db, user_id=None, frozen_fact_snapshot=snapshot,
+    )
     db.add(project)
     db.commit()
     return approved
@@ -224,6 +237,7 @@ def build_approved_asset_manifest(*, run_id: str, project_id: str, db: Session) 
             "generation_attempt": int(job.generation_attempt or 1),
             "asset_id": asset.id,
             "asset_content_hash": asset.content_hash,
+            "rights_status": resolved_asset_usage_status(asset),
             "provider": job.provider,
             "model": job.model,
             # TASK-12.4 evaluates this immutable evidence, never mutable Asset
@@ -552,7 +566,12 @@ def dispatch_graph_image_jobs(*, run_id: str, project_id: str, mode: str, db: Se
 
     _provider_gate(mode)
     project = _project(project_id, db)
-    run = _run(run_id, project_id, db)
+    run = db.query(AgentRun).filter(
+        AgentRun.id == run_id,
+        AgentRun.project_id == project_id,
+    ).with_for_update().one_or_none()
+    if run is None:
+        raise ImageGenerationGateError("GRAPH_RUN_NOT_FOUND", "Image generation run was not found.")
     rows = _owned_jobs(project_id, run_id, db)
     if not rows:
         raise ImageGenerationGateError("IMAGE_JOB_MISSING", "준비된 이미지 생성 작업을 찾을 수 없습니다.")
@@ -562,7 +581,14 @@ def dispatch_graph_image_jobs(*, run_id: str, project_id: str, mode: str, db: Se
         if job.status == "blocked":
             continue
         try:
-            started = start_storyboard_job(project, job.job_id, True, db, allow_mock_provider=(mode == "mock"))
+            started = start_storyboard_job(
+                project,
+                job.job_id,
+                True,
+                db,
+                allow_mock_provider=(mode == "mock"),
+                commit_changes=False,
+            )
         except StoryboardImageGenerationError as error:
             raise ImageGenerationGateError("IMAGE_JOB_DISPATCH_FAILED", str(error)) from error
         if not started.get("dispatch_required"):
@@ -583,22 +609,19 @@ def dispatch_graph_image_jobs(*, run_id: str, project_id: str, mode: str, db: Se
                 status="queued",
             )
             db.add(outbox)
-            try:
-                db.flush()
-                from src.services.langgraph_run_service import AgentRunEventJournal
+            db.flush()
+            from src.services.langgraph_run_service import AgentRunEventJournal
 
-                AgentRunEventJournal.append_timing_event(
-                    run,
-                    db,
-                    event_type="delivery_enqueued",
-                    timing={
-                        "outbox": {"id": outbox.id, "version": 1, "hash": str(outbox.idempotency_key)},
-                        "attempt": 0,
-                    },
-                )
-                db.commit()
-            except IntegrityError:
-                db.rollback()
+            AgentRunEventJournal.append_timing_event(
+                run,
+                db,
+                event_type="delivery_enqueued",
+                timing={
+                    "outbox": {"id": outbox.id, "version": 1, "hash": str(outbox.idempotency_key)},
+                    "attempt": 0,
+                },
+            )
+    db.commit()
     return _summary(_owned_jobs(project_id, run_id, db))
 
 

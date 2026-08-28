@@ -257,7 +257,7 @@ def test_lg12i_production_router_uses_one_path_for_every_input_mode(
         assert intake["product_truth"]["truth_version"]["id"]
         assert intake["requested_generation_mode"] == ("expert" if mode == "manual" else "quick")
         assert intake["target_channels"] == ["coupang", "smartstore"]
-        assert intake["run_identity"]["run_id"] == state["run_id"]
+        assert state["run_id"] == state["thread_id"]
         routed.append(intake)
 
     assert {item["next_action"] for item in routed} == {"seller_confirmation"}
@@ -372,15 +372,16 @@ def test_lg12i_idempotency_and_rebuild_restore_envelope_projection(
     assert smartstore.json()["run_id"] != coupang.json()["run_id"]
 
     run = db_session.query(AgentRun).filter_by(id=first.json()["run_id"]).one()
-    expected = deepcopy(run.outputs_json["langgraph_intake"])
+    expected_public = deepcopy(first.json()["values"]["intake"])
+    expected_projection = deepcopy(run.outputs_json["langgraph_intake"])
     run.outputs_json = {key: value for key, value in run.outputs_json.items() if key != "langgraph_intake"}
     run.status = "running"
     db_session.add(run)
     db_session.commit()
 
-    recovered = client.post(f"/api/v1/graph-runs/{run.id}/resume", headers=auth_headers)
+    recovered = client.get(f"/api/v1/graph-runs/{run.id}", headers=auth_headers)
     assert recovered.status_code == 200, recovered.text
     db_session.refresh(run)
     assert run.status == "awaiting_review"
-    assert run.outputs_json["langgraph_intake"] == expected
-    assert recovered.json()["values"]["intake"] == expected
+    assert run.outputs_json["langgraph_intake"] == expected_projection
+    assert recovered.json()["values"]["intake"] == expected_public

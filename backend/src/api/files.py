@@ -1,3 +1,4 @@
+import hashlib
 import os
 import re
 import uuid
@@ -120,7 +121,8 @@ async def upload_file(
         filename=filename,
         file_path=file_path,
         mime_type=file.content_type or "application/octet-stream",
-        file_size=file_size
+        file_size=file_size,
+        content_hash=hashlib.sha256(content).hexdigest(),
     )
     db.add(asset)
     db.flush()

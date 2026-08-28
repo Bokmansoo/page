@@ -83,6 +83,8 @@ def _bounded_lg9_validation_summary(value: Any) -> dict[str, Any]:
         "quality_warnings": sorted({str(item).upper() for item in list(result.get("warnings") or []) if isinstance(item, str)}),
         "risk_codes": sorted({str(item).lower() for item in list(result.get("risk_codes") or []) if isinstance(item, str)}),
         "safe_crop_status": str(crop.get("safe_crop_status") or "").strip().lower(),
+        "seller_identity_confirmed": result.get("seller_identity_confirmed") is True,
+        "manual_upload_confirmed": result.get("manual_upload_confirmed") is True,
     }
 
 

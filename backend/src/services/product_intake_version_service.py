@@ -1885,6 +1885,11 @@ def adapt_photo_only_input_to_source_snapshot(
     )
     if snapshot is None:
         rights_states = [item["reference"]["rights_status"] for item in resolved]
+        confirmation_state = (
+            "unconfirmed" if "unconfirmed" in rights_states
+            else "rights_confirmed" if "rights_confirmed" in rights_states
+            else "seller_owned"
+        )
         snapshot = create_product_source_snapshot_version(
             db, workspace_id=run.workspace_id, project_id=run.project_id,
             creator_run_id=run.id, created_by=actor_id, input_mode="photo_only",
@@ -1897,7 +1902,7 @@ def adapt_photo_only_input_to_source_snapshot(
             },
             rights={
                 "source_asset_rights": rights_states,
-                "confirmation_state": "unconfirmed" if "unconfirmed" in rights_states else "pending",
+                "confirmation_state": confirmation_state,
                 "final_use_status": "not_approved",
             },
             source_fidelity={
@@ -3799,10 +3804,27 @@ def apply_seller_confirmation_cycle(
     supplied_answer_bundle_hash = resume_answer_bundle_hash or expected_answer_bundle_hash
     if _require_hash(supplied_answer_bundle_hash, "confirmation.resume_answer_bundle_hash") != expected_answer_bundle_hash:
         raise SellerConfirmationContractError("Seller confirmation answer bundle does not match the submitted response.")
-    confirmed: list[dict[str, Any]] = []
-    rejected: list[dict[str, Any]] = []
-    unknown: list[dict[str, Any]] = []
-    rights_decisions: list[dict[str, Any]] = []
+    decision_base = latest
+    if latest is not None and latest.confirmation_cycle == cycle:
+        decision_base = (
+            _linked_row(
+                db,
+                SellerConfirmationVersion,
+                project_id=locked_run.project_id,
+                reference={
+                    "id": latest.parent_version_id,
+                    "version": latest.parent_version,
+                    "hash": latest.parent_version_hash,
+                },
+                label="confirmation.parent",
+            )
+            if latest.parent_version_id is not None
+            else None
+        )
+    confirmed = [dict(item) for item in decision_base.confirmed_fact_refs_json or []] if decision_base else []
+    rejected = [dict(item) for item in decision_base.rejected_fact_refs_json or []] if decision_base else []
+    unknown = [dict(item) for item in decision_base.unknown_fact_refs_json or []] if decision_base else []
+    rights_decisions = [dict(item) for item in decision_base.rights_confirmations_json or []] if decision_base else []
     recorded_answers: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
     for question in current:
@@ -4071,8 +4093,40 @@ def create_commerce_creative_master_version(
     )
     if list(confirmation.unresolved_refs_json or []):
         raise IntakeVersionContractError("Commerce Creative Master cannot be created while seller confirmation is unresolved.")
-    if list(truth.prohibited_inference_refs_json or []):
-        raise IntakeVersionContractError("Commerce Creative Master cannot promote a Truth containing prohibited inferences.")
+    prohibited_refs = {
+        (item["id"], item["version"], item["hash"])
+        for item in _reference_list(
+            truth.prohibited_inference_refs_json,
+            "truth.prohibited_inference_refs",
+        )
+    }
+    rejected_refs: set[tuple[str, int, str]] = set()
+    confirmation_cursor: SellerConfirmationVersion | None = confirmation
+    seen_confirmation_ids: set[str] = set()
+    while confirmation_cursor is not None:
+        if str(confirmation_cursor.id) in seen_confirmation_ids:
+            raise IntakeVersionContractError("Seller confirmation lineage contains a cycle.")
+        seen_confirmation_ids.add(str(confirmation_cursor.id))
+        rejected_refs.update(
+            (item["id"], item["version"], item["hash"])
+            for item in _fact_state_reference_list(
+                confirmation_cursor.rejected_fact_refs_json,
+                "confirmation.rejected_fact_refs",
+            )
+        )
+        if confirmation_cursor.parent_version_id is None:
+            confirmation_cursor = None
+            continue
+        confirmation_cursor = db.query(SellerConfirmationVersion).filter_by(
+            id=confirmation_cursor.parent_version_id,
+            project_id=project_id,
+            workspace_id=workspace_id,
+            creator_run_id=creator_run_id,
+        ).one_or_none()
+        if confirmation_cursor is None:
+            raise IntakeVersionContractError("Seller confirmation parent is missing from the same intake lineage.")
+    if prohibited_refs - rejected_refs:
+        raise IntakeVersionContractError("Commerce Creative Master cannot promote unresolved prohibited inferences.")
     fact_ref = _reference(approved_fact_snapshot_ref, "master.approved_fact_snapshot")
     fact_snapshot = db.query(FactSnapshot).filter_by(id=fact_ref["id"], project_id=project_id).first()
     if fact_snapshot is None or fact_ref["version"] != 1 or fact_snapshot.snapshot_hash != fact_ref["hash"]:

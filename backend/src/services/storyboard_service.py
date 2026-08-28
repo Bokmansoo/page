@@ -13,7 +13,7 @@ from typing import Any, Iterable
 
 from sqlalchemy.orm import Session
 
-from src.db.models import Asset, ProductFact, ProductProject
+from src.db.models import Asset, FactSnapshot, ProductFact, ProductProject
 from src.services.commerce_policy import (
     CONFIRMED_FACT_STATUSES,
     is_asset_final_output_eligible,
@@ -151,6 +151,8 @@ def _normalize_order(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _variant_cards(project: ProductProject, base_cards: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
     cards = [_clone_card(card) for card in base_cards]
+    if cards and all(card.get("rendering_template") == "langgraph_commerce_planning" for card in cards):
+        return _normalize_order(cards)
     specs = [card for card in cards if card.get("type") in FINAL_SPEC_TYPES]
     content = [card for card in cards if card.get("type") not in FINAL_SPEC_TYPES]
     source_ids = [fact_id for card in content for fact_id in card.get("source_fact_ids") or []]
@@ -181,7 +183,7 @@ def _decorate_cards(project: ProductProject, cards: list[dict[str, Any]], assets
         candidate_assets = matching or fallback
         card["candidate_asset_ids"] = [asset.id for asset in candidate_assets[:3]]
         card["image_asset_id"] = None
-        card["rendering_template"] = _rendering_template(card_type)
+        card.setdefault("rendering_template", _rendering_template(card_type))
         card["facts_stale"] = False
         card["missing_reasons"] = []
         scene = _scene_request(project, card_type, str(card.get("title") or ""))
@@ -254,12 +256,29 @@ def record_storyboard_revision(draft: dict[str, Any], action: str) -> dict[str, 
 
 
 def generate_storyboard(project: ProductProject, facts: list[ProductFact], assets: list[Asset], db: Session, user_id: str | None) -> dict[str, Any]:
-    base = PlanningDraftService.generate_draft(project, facts, db)
+    current_cards = list((project.planning_draft or {}).get("cards") or [])
+    canonical_graph_draft = bool(current_cards) and all(
+        card.get("rendering_template") == "langgraph_commerce_planning" for card in current_cards
+    )
+    if canonical_graph_draft:
+        base = project.planning_draft or {}
+    else:
+        base = PlanningDraftService.generate_draft(project, facts, db)
     base_cards = _normalize_order([_clone_card(card) for card in base.get("cards") or []])
     candidates = _recommended_candidates(project, base_cards, assets)
     selected = "balanced_sales" if _eligible_assets(assets) else "safe_information"
     selected_cards = next(candidate["cards"] for candidate in candidates if candidate["key"] == selected)
-    snapshot = approved_fact_snapshot(db, project.id, user_id, purpose="storyboard")
+    snapshot = (
+        db.query(FactSnapshot).filter_by(
+            id=base.get("fact_snapshot_id"),
+            project_id=project.id,
+            snapshot_hash=base.get("fact_snapshot_hash"),
+        ).one_or_none()
+        if canonical_graph_draft
+        else approved_fact_snapshot(db, project.id, user_id, purpose="storyboard")
+    )
+    if snapshot is None:
+        raise StoryboardValidationError("Canonical storyboard fact snapshot does not match persisted authority.")
     return {
         "cards": selected_cards,
         "storyboard_version": STORYBOARD_VERSION,
@@ -354,11 +373,23 @@ def validate_storyboard(draft: dict[str, Any], assets: list[Asset], confirmed_fa
         assigned_assets.add(asset_id)
 
 
-def approve_storyboard(project: ProductProject, assets: list[Asset], facts: list[ProductFact], db: Session, user_id: str | None) -> dict[str, Any]:
+def approve_storyboard(
+    project: ProductProject,
+    assets: list[Asset],
+    facts: list[ProductFact],
+    db: Session,
+    user_id: str | None,
+    *,
+    frozen_fact_snapshot: FactSnapshot | None = None,
+) -> dict[str, Any]:
     draft = deepcopy(project.planning_draft or {})
-    confirmed_ids = {fact.id for fact in facts if fact.verification_status in CONFIRMED_FACT_STATUSES and not fact.needs_review}
+    confirmed_ids = (
+        {str(item["id"]) for item in frozen_fact_snapshot.facts_json or [] if item.get("id")}
+        if frozen_fact_snapshot is not None
+        else {fact.id for fact in facts if fact.verification_status in CONFIRMED_FACT_STATUSES and not fact.needs_review}
+    )
     validate_storyboard(draft, assets, confirmed_ids)
-    snapshot = approved_fact_snapshot(db, project.id, user_id, purpose="storyboard_approval")
+    snapshot = frozen_fact_snapshot or approved_fact_snapshot(db, project.id, user_id, purpose="storyboard_approval")
     draft["fact_snapshot_id"] = snapshot.id
     draft["fact_snapshot_hash"] = snapshot.snapshot_hash
     draft["status"] = "approved"

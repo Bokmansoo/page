@@ -437,6 +437,9 @@ def build_canonical_page_assembly_input(
     } != {asset["asset_id"] for asset in approved_assets}:
         raise PageAssemblyInputError("LG-10 approved assets must map to a stable planned section.")
 
+    for section in sections:
+        _lg11_canvas_normalize_section_elements(section)
+
     if approved_asset_manifest is not None:
         page_asset_manifest = deepcopy(approved_asset_manifest)
         completion_basis = "approved_required_scenes"

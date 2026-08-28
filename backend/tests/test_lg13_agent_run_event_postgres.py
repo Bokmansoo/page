@@ -283,6 +283,105 @@ def test_postgres_seller_guidance_rebuild_is_deterministic_for_provider_outcome_
         session.close()
 
 
+def test_postgres_public_intake_projection_is_mode_scoped_and_bounded(journal_db):
+    """LG-14 exposes source/truth status without checkpoint source bodies."""
+
+    from src.services.langgraph_run_service import _browser_checkpoint_values
+
+    digest = "a" * 64
+    markers = {
+        "RAW_MANUAL_SECRET_MARKER",
+        "RAW_OCR_SECRET_MARKER",
+        "RAW_URL_SECRET_MARKER",
+        "RAW_PROVIDER_SECRET_MARKER",
+    }
+    sources = {
+        "manual": {
+            "manual_source": {
+                "schema_version": "lg12i-manual-source-candidates-v1",
+                "source_snapshot": {"id": "manual-source", "version": 1, "hash": digest},
+                "manual_artifact_ref": {"id": "manual-artifact", "version": 1, "hash": digest},
+                "fact_candidates": [{"value": "RAW_MANUAL_SECRET_MARKER"}],
+                "unknown_candidates": [{}],
+                "conflict_candidates": [],
+                "creative_directions": [{"value": "RAW_PROVIDER_SECRET_MARKER"}],
+                "rights": {"confirmation_state": "confirmed", "final_use_status": "not_approved"},
+            },
+        },
+        "photo_only": {
+            "photo_source": {
+                "schema_version": "lg12i-photo-source-candidates-v1",
+                "source_snapshot": {"id": "photo-source", "version": 1, "hash": digest},
+                "photo_observation_artifact_ref": {"id": "photo-observation", "version": 1, "hash": digest},
+                "source_asset_refs": [{"id": "photo-asset", "version": 1, "hash": digest}],
+                "observations": [{"observed_value": "RAW_OCR_SECRET_MARKER"}],
+                "unknown_candidates": [{}],
+                "conflict_candidates": [],
+                "prohibited_inference_fields": ["private_claim"],
+                "observation_status": "ready",
+                "rights": {"confirmation_state": "pending", "final_use_status": "not_approved"},
+            },
+        },
+        "owned_product_url": {
+            "owned_url_source": {
+                "schema_version": "lg12i-owned-url-source-candidates-v1",
+                "source_snapshot": {"id": "url-source", "version": 1, "hash": digest},
+                "capture_request_ref": {"id": "url-request", "version": 1, "hash": digest},
+                "capture_artifact_ref": {"id": "url-capture", "version": 1, "hash": digest},
+                "final_url": "https://owned.example/private?token=RAW_URL_SECRET_MARKER",
+                "image_asset_refs": [{"id": "observed-image", "version": 1, "hash": digest}],
+                "rights": {"confirmation_state": "seller_owned", "final_use_status": "not_approved"},
+            },
+        },
+    }
+    truth = {
+        "schema_version": "lg12i-product-truth-normalization-v1",
+        "truth_version": {"id": "truth-version", "version": 1, "hash": digest},
+        "fact_candidates": [{"value": "RAW_PROVIDER_SECRET_MARKER"}],
+        "unknown_facts": [{}],
+        "conflict_facts": [],
+        "prohibited_inferences": [{}],
+        "observation_risks": [],
+        "requires_review": True,
+    }
+    session = journal_db()
+    try:
+        run = _run(session)
+        for mode, mode_source in sources.items():
+            intake = {
+                "input_mode": mode,
+                "requested_generation_mode": "quick",
+                "target_channels": ["smartstore"],
+                "product_truth": truth,
+                **sources["manual"],
+                **sources["photo_only"],
+                **sources["owned_product_url"],
+                **mode_source,
+            }
+            public = _browser_checkpoint_values(run, SimpleNamespace(values={"intake": intake}))["intake"]
+            expected_source = {
+                "manual": "manual_source",
+                "photo_only": "photo_observation",
+                "owned_product_url": "owned_url_source",
+            }[mode]
+            assert expected_source in public
+            assert not ({"manual_source", "photo_observation", "owned_url_source"} - {expected_source}) & public.keys()
+            assert public["product_truth"] == {
+                "schema_version": "lg12i-product-truth-normalization-v1",
+                "truth_version": {"id": "truth-version", "version": 1, "hash": digest},
+                "requires_review": True,
+                "fact_count": 1,
+                "unknown_count": 1,
+                "conflict_count": 0,
+                "prohibited_inference_count": 1,
+                "observation_risk_count": 0,
+            }
+            serialized = json.dumps(public, sort_keys=True)
+            assert not any(marker in serialized for marker in markers)
+    finally:
+        session.close()
+
+
 _SLO_STAGE = {
     "main_execution_started": ("input_router", "running"),
     "product_understanding_completed": ("product_understanding", "completed"),
@@ -483,8 +582,9 @@ def test_postgres_ops05_lifecycle_identity_and_rebuild_are_durable_and_deduplica
         session.close()
 
 
-def test_postgres_image_review_upload_lifecycle_is_stage_limited(journal_db):
-    """The public image-review upload action remains a bounded journal scalar."""
+@pytest.mark.parametrize("decision", ["regenerate", "upload"])
+def test_postgres_image_review_action_lifecycle_is_stage_limited(journal_db, decision):
+    """Public image-review actions remain bounded journal scalars."""
 
     session = journal_db()
     try:
@@ -495,14 +595,14 @@ def test_postgres_image_review_upload_lifecycle_is_stage_limited(journal_db):
             event_type="seller_choice_submitted",
             transition="submitted",
             stage="image_review",
-            decision="upload",
+            decision=decision,
         )
         session.commit()
 
         assert inserted is True
         assert event.payload_json["stage"] == "image_review"
         assert event.payload_json["lifecycle"] == {
-            "transition": "submitted", "checkpoint_id": "", "decision": "upload",
+            "transition": "submitted", "checkpoint_id": "", "decision": decision,
         }
         with pytest.raises(ValueError, match="Seller review decision is not allowlisted"):
             AgentRunEventJournal.append_review_lifecycle(
@@ -511,8 +611,32 @@ def test_postgres_image_review_upload_lifecycle_is_stage_limited(journal_db):
                 event_type="seller_choice_submitted",
                 transition="submitted",
                 stage="planning_review",
-                decision="upload",
+                decision=decision,
             )
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_postgres_seller_confirmation_submit_lifecycle_is_allowlisted(journal_db):
+    """The real seller-confirmation submit action is accepted by the journal."""
+
+    session = journal_db()
+    try:
+        run = _run(session)
+        event, inserted, _locked = AgentRunEventJournal.append_review_lifecycle(
+            run,
+            session,
+            event_type="seller_choice_submitted",
+            transition="submitted",
+            stage="seller_confirmation",
+            decision="submit",
+        )
+        session.commit()
+
+        assert inserted is True
+        assert event.payload_json["stage"] == "seller_confirmation"
+        assert event.payload_json["lifecycle"]["decision"] == "submit"
     finally:
         session.rollback()
         session.close()

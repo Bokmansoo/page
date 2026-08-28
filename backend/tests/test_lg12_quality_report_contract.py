@@ -20,6 +20,7 @@ from src.services.langgraph_run_service import LangGraphRunService
 from src.services.product_intake_version_service import canonical_version_hash
 from src.services.prompt_intelligence_service import canonical_hash
 from src.services.quality_assessment_service import (
+    _frozen_asset_manifest,
     create_quality_assessment_report, create_quality_threshold_profile,
     quality_report_durable_projection, validate_quality_assessment_report_version,
 )
@@ -56,6 +57,28 @@ def _frozen_page(db, run, *, project_id=None):
     )
     db.add(page); db.flush()
     return page, manifest["manifest_hash"]
+
+
+def test_information_only_page_manifest_is_the_frozen_qa_asset_boundary():
+    body = {"run_id": "run-1", "project_id": "project-1", "source": "information_only", "assets": []}
+    manifest = {**body, "manifest_hash": canonical_hash(body)}
+
+    assert _frozen_asset_manifest({
+        "approved_asset_manifest": None,
+        "page_asset_manifest": manifest,
+        "image_generation_contract": {
+            "required_scene_count": 0,
+            "completion_basis": "no_required_image_scenes",
+        },
+    }) == manifest
+    assert _frozen_asset_manifest({
+        "approved_asset_manifest": None,
+        "page_asset_manifest": manifest,
+        "image_generation_contract": {
+            "required_scene_count": 1,
+            "completion_basis": "approved_required_scenes",
+        },
+    }) == {}
 
 
 def _profile_payload(profile_id: str, *, version: int = 1, parent=None, channels=None, overall=85):

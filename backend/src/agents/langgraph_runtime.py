@@ -720,6 +720,10 @@ def _lg5_event(stage: str, *, node_status: str = "completed") -> dict[str, Any]:
     return _lg2_event(stage, node_status=node_status)
 
 
+def _lg5_provider_mode(state: SellformGraphState) -> str:
+    return "mock" if state.get("mode") == "mock" or settings.SELLFORM_IMAGE_GENERATION_MODE.strip().lower() == "mock" else "real"
+
+
 def _lg5_generation_pending(state: SellformGraphState) -> dict[str, Any]:
     """Cost/provider gate. A defer or unavailable provider never dispatches."""
 
@@ -771,7 +775,7 @@ def _lg5_generation_pending(state: SellformGraphState) -> dict[str, Any]:
             "current_stage": "generation_pending", "status": "running", "generation": generation,
             "events": [_lg5_event("generation_pending", node_status="deferred")],
         }
-    if state.get("mode") != "mock" and not storyboard_image_generation_is_available():
+    if _lg5_provider_mode(state) != "mock" and not storyboard_image_generation_is_available():
         generation.update({"cost_approved": False, "next_action": "cost_approval", "error_code": "API_KEY_MISSING"})
         return {
             "current_stage": "generation_pending", "status": "running", "generation": generation,
@@ -818,7 +822,7 @@ def _lg5_prepare_image_jobs(state: SellformGraphState) -> dict[str, Any]:
     if db is None:
         raise RuntimeError("LG-5 image preparation requires the graph database session.")
     generation = prepare_graph_image_jobs(
-        run_id=state["run_id"], project_id=state["project_id"], mode=state.get("mode") or "mock", db=db,
+        run_id=state["run_id"], project_id=state["project_id"], mode=_lg5_provider_mode(state), db=db,
         cost_plan_hash=str((state.get("generation") or {}).get("cost_plan_hash") or ""),
         scene_attempts=dict((state.get("generation") or {}).get("scene_attempts") or {}),
     )
@@ -833,7 +837,7 @@ def _lg5_dispatch_image_jobs(state: SellformGraphState) -> dict[str, Any]:
     if db is None:
         raise RuntimeError("LG-5 image dispatch requires the graph database session.")
     generation = dispatch_graph_image_jobs(
-        run_id=state["run_id"], project_id=state["project_id"], mode=state.get("mode") or "mock", db=db,
+        run_id=state["run_id"], project_id=state["project_id"], mode=_lg5_provider_mode(state), db=db,
     )
     return {"current_stage": "dispatch_image_jobs", "status": "running", "generation": generation, "events": [_lg5_event("dispatch_image_jobs")]}
 
@@ -972,7 +976,7 @@ def _lg10_page_assembly(state: SellformGraphState) -> dict[str, Any]:
 def _lg10_canonical_renderer(state: SellformGraphState) -> dict[str, Any]:
     """Build the deterministic LG-10 text/asset layer artifact from frozen state."""
 
-    from src.db.models import AgentRun
+    from src.db.models import AgentRun, CommerceCreativeMasterVersion
     from src.services.langgraph_discovery_service import current_langgraph_session
     from src.services.page_finalization_service import (
         build_canonical_page_rendering_artifact,
@@ -1000,6 +1004,16 @@ def _lg10_canonical_renderer(state: SellformGraphState) -> dict[str, Any]:
         rendering=rendering,
         db=db,
     )
+    master = (
+        db.query(CommerceCreativeMasterVersion)
+        .filter_by(workspace_id=run.workspace_id, project_id=run.project_id, creator_run_id=run.id)
+        .order_by(CommerceCreativeMasterVersion.version.desc())
+        .first()
+    )
+    if master is not None:
+        _lg12_quality_finalize_frozen_page_exports(
+            page=version, channels=list(master.target_channels or []), db=db,
+        )
     rendering = {
         **rendering,
         "detail_page_version": {
@@ -1517,7 +1531,7 @@ def _lg12_quality_rework_exhausted(state: SellformGraphState) -> dict[str, Any]:
         ).one_or_none()
         if report is None:
             raise ValueError("SLO-08 fallback source QualityAssessmentReport is unavailable.")
-        _lg12_quality_finalize_rework_child_exports(child=child, report=report, db=db)
+        _lg12_quality_finalize_frozen_page_exports(page=child, channels=list(report.target_channels_json or []), db=db)
         db.commit(); db.refresh(child)
         child_ref = _lg12_quality_child_ref(child)
         active_attempt = dict(quality.get("active_attempt") or {})
@@ -1819,13 +1833,13 @@ def _lg12_quality_copy_change(*, page: Any, target_ref: dict[str, Any]) -> tuple
     return section_id, field, changed
 
 
-def _lg12_quality_finalize_rework_child_exports(*, child: Any, report: Any, db: Any) -> None:
-    """Freeze deterministic channel packages for one already-frozen rework child.
+def _lg12_quality_finalize_frozen_page_exports(*, page: Any, channels: list[str], db: Any) -> None:
+    """Freeze deterministic channel packages for one already-frozen page.
 
-    TASK-11.3's copy fork has a new renderer hash and DetailPage identity, so
-    it cannot reuse the parent's channel-parity artifacts.  This invokes the
-    existing frozen standalone-export finalizer only; it neither renders AI
-    images nor queues an export/provider job.
+    The initial renderer and every rework child have their own renderer hash
+    and DetailPage identity.  This invokes the existing frozen standalone
+    export finalizer only; it neither renders AI images nor queues an export
+    or provider job.
     """
 
     from src.db.models import ExportArtifact
@@ -1835,30 +1849,30 @@ def _lg12_quality_finalize_rework_child_exports(*, child: Any, report: Any, db: 
         write_lg12_frozen_export_parity_evidence,
     )
 
-    channels = sorted({
+    frozen_channels = sorted({
         str(channel)
-        for channel in list(report.target_channels_json or [])
+        for channel in channels
         if str(channel) in supported_channel_keys()
     })
-    if not channels:
-        raise ValueError("Quality rework child has no supported frozen target channel.")
-    for channel in channels:
+    if not frozen_channels:
+        raise ValueError("Frozen page has no supported target channel.")
+    for channel in frozen_channels:
         artifact_type = f"lg10_standalone_package:{channel}"
         artifact = db.query(ExportArtifact).filter_by(
-            project_id=child.project_id, version_id=child.id, artifact_type=artifact_type,
+            project_id=page.project_id, version_id=page.id, artifact_type=artifact_type,
         ).one_or_none()
         if artifact is None:
             bundle = build_lg10_standalone_export_bundle(
-                db=db, project_id=child.project_id, version=child, channel=channel,
+                db=db, project_id=page.project_id, version=page, channel=channel,
             )
             artifact = ExportArtifact(
-                project_id=child.project_id, version_id=child.id,
+                project_id=page.project_id, version_id=page.id,
                 artifact_type=artifact_type, file_path=str(bundle["zip_path"]),
             )
             db.add(artifact)
             db.flush()
         write_lg12_frozen_export_parity_evidence(
-            version=child, artifact=artifact, channel=channel,
+            version=page, artifact=artifact, channel=channel,
         )
 
 
@@ -1921,7 +1935,7 @@ def _lg12_quality_copy_rework(state: SellformGraphState) -> dict[str, Any]:
         ).one_or_none()
         if report is None:
             raise ValueError("COPY_REWORK source QualityAssessmentReport is unavailable.")
-        _lg12_quality_finalize_rework_child_exports(child=child, report=report, db=db)
+        _lg12_quality_finalize_frozen_page_exports(page=child, channels=list(report.target_channels_json or []), db=db)
         db.commit(); db.refresh(child)
     except (EditIntentValidationError, ValueError):
         return {
@@ -2100,7 +2114,7 @@ def _lg12_quality_visual_rework(state: SellformGraphState) -> dict[str, Any]:
         ).one_or_none()
         if report is None:
             raise ValueError("VISUAL_REWORK source QualityAssessmentReport is unavailable.")
-        _lg12_quality_finalize_rework_child_exports(child=child, report=report, db=db)
+        _lg12_quality_finalize_frozen_page_exports(page=child, channels=list(report.target_channels_json or []), db=db)
         db.commit(); db.refresh(child)
     except (EditIntentValidationError, ValueError):
         return {
@@ -2179,7 +2193,7 @@ def _lg12_quality_style_rework(state: SellformGraphState) -> dict[str, Any]:
         ).one_or_none()
         if report is None:
             raise ValueError("STYLE_REWORK source QualityAssessmentReport is unavailable.")
-        _lg12_quality_finalize_rework_child_exports(child=child, report=report, db=db)
+        _lg12_quality_finalize_frozen_page_exports(page=child, channels=list(report.target_channels_json or []), db=db)
         db.commit(); db.refresh(child)
     except (EditIntentValidationError, ValueError):
         return _lg12_quality_seller_review_update(quality, "quality_style_rework")
@@ -2343,7 +2357,7 @@ def _lg12_quality_plan_rework(state: SellformGraphState) -> dict[str, Any]:
         ).one_or_none()
         if report is None:
             raise ValueError("PLAN_REWORK source QualityAssessmentReport is unavailable.")
-        _lg12_quality_finalize_rework_child_exports(child=child, report=report, db=db)
+        _lg12_quality_finalize_frozen_page_exports(page=child, channels=list(report.target_channels_json or []), db=db)
         db.commit(); db.refresh(child)
     except (EditIntentValidationError, ValueError) as exc:
         failed = _lg12_quality_seller_review_update(quality, "quality_plan_rework")
@@ -2528,7 +2542,7 @@ def _lg12_quality_image_review(state: SellformGraphState) -> dict[str, Any]:
     ).one_or_none()
     if report is None:
         raise ValueError("IMAGE_REWORK source QualityAssessmentReport is unavailable.")
-    _lg12_quality_finalize_rework_child_exports(child=child, report=report, db=db)
+    _lg12_quality_finalize_frozen_page_exports(page=child, channels=list(report.target_channels_json or []), db=db)
     db.commit(); db.refresh(child)
     child_ref = _lg12_quality_child_ref(child)
     completed_quality = _lg12_quality_complete_attempt(quality, child_ref=child_ref)
@@ -2883,7 +2897,7 @@ def build_lg8_compiled_graph(*, checkpointer: BaseCheckpointSaver[Any]):
     return graph.compile(checkpointer=checkpointer)
 
 
-def build_lg10_compiled_graph(*, checkpointer: BaseCheckpointSaver[Any]):
+def build_lg10_compiled_graph(*, checkpointer: BaseCheckpointSaver[Any], entry_node: str | None = None):
     """LG-10 runs constrained Page Assembly after every required image approval."""
 
     graph = StateGraph(SellformGraphState)
@@ -2918,7 +2932,7 @@ def build_lg10_compiled_graph(*, checkpointer: BaseCheckpointSaver[Any]):
         ("quality_rework_exhausted", _lg12_quality_rework_exhausted),
     ):
         graph.add_node(name, node)
-    graph.add_edge(START, "bootstrap_run"); graph.add_edge("bootstrap_run", "input_review")
+    graph.add_edge(START, entry_node or "bootstrap_run"); graph.add_edge("bootstrap_run", "input_review")
     graph.add_edge("input_review", "input_router"); graph.add_edge("input_router", "source_collection")
     graph.add_edge("source_collection", "product_understanding")
     graph.add_conditional_edges("product_understanding", _lg2_has_reference_url, {

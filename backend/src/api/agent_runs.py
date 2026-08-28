@@ -15,6 +15,7 @@ from src.services.generation_status_service import GenerationStatusService
 from src.services.seller_fact_ingestion_service import persist_confirmed_seller_specs
 from src.agents.langgraph_runtime import configured_graph_runtime
 from src.services.brand_kit_service import snapshot_project_brand_kit
+from src.config import settings
 
 
 router = APIRouter(prefix="/agent-runs", tags=["agent-runs"])
@@ -749,6 +750,11 @@ def run_mock(
     db: Session = Depends(get_db),
     auth_ctx: dict = Depends(get_current_user_and_workspace),
 ):
+    if settings.SELLFORM_GRAPH_RUNTIME == "langgraph":
+        raise HTTPException(
+            status_code=410,
+            detail={"code": "legacy_generation_writer_disabled", "message": "Use the unified graph-run intake."},
+        )
     from src.services.agent_run_service import (
         AgentRunService,
         AssetUnderstandingNotReady,
@@ -812,6 +818,11 @@ def run_real(
     db: Session = Depends(get_db),
     auth_ctx: dict = Depends(get_current_user_and_workspace),
 ):
+    if settings.SELLFORM_GRAPH_RUNTIME == "langgraph":
+        raise HTTPException(
+            status_code=410,
+            detail={"code": "legacy_generation_writer_disabled", "message": "Use the unified graph-run intake."},
+        )
     from src.services.agent_run_service import (
         AgentRunService,
         AssetUnderstandingNotReady,

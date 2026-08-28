@@ -520,6 +520,19 @@ def test_prohibited_identity_state_is_not_an_expected_identity(client, db_sessio
     assert states == {"color": {"prohibited"}}
 
 
+def test_prohibited_material_grade_is_not_visual_identity_state(client, db_session, auth_headers, tmp_path):
+    run, source, truth, confirmation = _identity_state_target(
+        db_session, client, auth_headers, tmp_path,
+        field_id="material_grade", state="prohibited_inference", build_master=False,
+    )
+    expected, gaps, states = _expected_product_identity(
+        db_session, run=run, source=source, truth=truth, confirmation=confirmation,
+    )
+    assert expected == {}
+    assert not gaps
+    assert states == {}
+
+
 def test_nonidentity_unknown_does_not_make_visual_identity_unevaluable(client, db_session, auth_headers, tmp_path):
     run, source, truth, confirmation = _identity_state_target(
         db_session, client, auth_headers, tmp_path,
@@ -565,6 +578,39 @@ def test_identity_evidence_needs_review_never_auto_passes(client, db_session, au
     result = _evaluate(db_session, run, master, page, digest, profile)
     assert result["domain"]["status"] == "needs_review"
     assert "product_identity_needs_review" in {item["code"] for item in result["domain"]["findings"]}
+
+
+def test_seller_confirmed_manual_asset_uses_frozen_review_evidence(client, db_session, auth_headers, tmp_path):
+    run, master, page, _digest, profile, asset = _setup(
+        db_session, client, auth_headers, tmp_path, identity_status="needs_review",
+    )
+    job = ImageGenerationJobRecord(
+        project_id=run.project_id,
+        job_id="lg12-seller-confirmed-manual",
+        section_id="hero",
+        role="product",
+        prompt="existing seller-owned image",
+        provider="manual_upload",
+        status="approved",
+        output_asset_id=asset.id,
+        validation_result={
+            "status": "needs_review",
+            "seller_identity_confirmed": True,
+            "manual_upload_confirmed": True,
+        },
+    )
+    db_session.add(job)
+    db_session.commit()
+    digest = _freeze_image_evidence(page, asset, job=job)
+    frozen = next(iter(page.sections_json["lg10"]["canonical_page_assembly_input"]["approved_asset_manifest"]["assets"]))
+    validation = frozen["lg12_frozen_image_evidence"]["generation"]["validation"]
+    assert validation["seller_identity_confirmed"] is True
+    assert validation["manual_upload_confirmed"] is True
+    db_session.commit()
+
+    codes = {item["code"] for item in _evaluate(db_session, run, master, page, digest, profile)["domain"]["findings"]}
+    assert "product_identity_needs_review" not in codes
+    assert "identity_metadata_not_evaluable" not in codes
 
 
 def test_lg9_review_identity_is_recorded_but_never_overrides_needs_review(client, db_session, auth_headers, tmp_path):

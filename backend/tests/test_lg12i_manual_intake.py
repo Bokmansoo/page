@@ -176,20 +176,19 @@ def test_manual_adapter_creates_structured_source_snapshot_without_raw_graph_bod
     manual = intake["manual_source"]
     assert manual["manual_artifact_ref"]["id"] == artifact.id
     assert manual["rights"] == {
-        "provenance": "seller_entered",
         "confirmation_state": "unconfirmed",
         "final_use_status": "not_approved",
     }
-    assert [item["field_id"] for item in manual["fact_candidates"]] == ["battery_capacity"]
-    assert manual["fact_candidates"][0]["approval_status"] == "candidate_not_approved"
-    assert [item["field_id"] for item in manual["creative_directions"]] == ["visual_tone"]
-    assert manual["creative_directions"][0]["fact_promotion_status"] == "prohibited"
+    assert manual["fact_count"] == 1
+    assert manual["creative_direction_count"] == 1
     assert "판매자 직접 입력 원문" not in repr(intake)
     snapshot = db_session.query(ProductSourceSnapshotVersion).filter_by(
         id=manual["source_snapshot"]["id"]
     ).one()
     assert snapshot.input_mode == "manual"
-    assert snapshot.source_refs_json == [manual["manual_artifact_ref"]]
+    assert {
+        key: snapshot.source_refs_json[0][key] for key in ("id", "version", "hash")
+    } == manual["manual_artifact_ref"]
     assert snapshot.provenance_json["source"] == "seller_entered"
     assert snapshot.source_fidelity_json["fact_candidate_count"] == 1
     assert db_session.query(ImageGenerationJobRecord).count() == before["jobs"]
@@ -229,13 +228,9 @@ def test_manual_empty_and_missing_optional_facts_are_preserved_as_unknown_candid
     )
     assert response.status_code == 201, response.text
     manual = response.json()["values"]["intake"]["manual_source"]
-    assert manual["fact_candidates"] == []
-    assert [item["field_id"] for item in manual["creative_directions"]] == ["visual_tone"]
-    unknown = {item["field_id"]: item for item in manual["unknown_candidates"]}
-    assert unknown["material"]["observed_value"] is None
-    assert unknown["material"]["observation_state"] == "unknown"
-    assert unknown["certification"]["observed_value"] is None
-    assert all(item["approval_status"] == "not_approved" for item in unknown.values())
+    assert manual["fact_count"] == 0
+    assert manual["creative_direction_count"] == 1
+    assert manual["unknown_count"] == 2
     snapshot = db_session.query(ProductSourceSnapshotVersion).filter_by(
         id=manual["source_snapshot"]["id"]
     ).one()
@@ -263,14 +258,8 @@ def test_manual_conflict_observations_are_preserved_without_fact_promotion(
     assert first.status_code == repeated.status_code == 201
     manual = first.json()["values"]["intake"]["manual_source"]
     assert repeated.json()["values"]["intake"]["manual_source"]["source_snapshot"] == manual["source_snapshot"]
-    assert "material" not in {item["field_id"] for item in manual["fact_candidates"]}
-    conflict = manual["conflict_candidates"]
-    assert len(conflict) == 1
-    assert conflict[0]["field_id"] == "material"
-    assert conflict[0]["observation_state"] == "conflict"
-    assert conflict[0]["approval_status"] == "not_approved"
-    assert [item["observed_value"] for item in conflict[0]["observations"]] == ["aluminum", "stainless"]
-    assert all(item["provenance"] == "seller_entered" for item in conflict[0]["observations"])
+    assert manual["fact_count"] == 1
+    assert manual["conflict_count"] == 1
 
     changed = _create_artifact(
         db_session,
@@ -400,9 +389,8 @@ def test_manual_adapter_projection_rebuild_restores_identity_without_url_photo_o
     run.status = "running"
     db_session.add(run)
     db_session.commit()
-    recovered = client.post(f"/api/v1/graph-runs/{run.id}/resume", headers=auth_headers)
+    recovered = client.get(f"/api/v1/graph-runs/{run.id}", headers=auth_headers)
     assert recovered.status_code == 200, recovered.text
     db_session.refresh(run)
     assert run.outputs_json["langgraph_intake"] == expected
-    assert recovered.json()["values"]["intake"]["manual_source"] == expected["manual_source"]
-    assert recovered.json()["values"]["intake"]["product_truth"] == expected["product_truth"]
+    assert recovered.json()["values"]["intake"] == state["values"]["intake"]

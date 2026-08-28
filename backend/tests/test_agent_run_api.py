@@ -124,6 +124,26 @@ def test_run_mock_generation_returns_page_assembly(client, auth_headers):
     assert data["outputs"]["page_assembly"]["sections"]
 
 
+def test_legacy_generation_writers_are_closed_when_langgraph_is_authoritative(
+    client, auth_headers, monkeypatch
+):
+    from src.config import settings
+
+    created = client.post(
+        "/api/agent-runs",
+        headers=auth_headers,
+        json={"product_name": "legacy writer probe"},
+    ).json()
+    monkeypatch.setattr(settings, "SELLFORM_GRAPH_RUNTIME", "langgraph")
+
+    mock_response = client.post(f"/api/agent-runs/{created['id']}/run-mock", headers=auth_headers)
+    real_response = client.post(f"/api/agent-runs/{created['id']}/run", headers=auth_headers)
+
+    assert mock_response.status_code == 410
+    assert real_response.status_code == 410
+    assert mock_response.json()["detail"]["code"] == "legacy_generation_writer_disabled"
+
+
 def test_run_mock_rejects_other_workspace_agent_run(client, auth_headers):
     created = client.post(
         "/api/agent-runs",

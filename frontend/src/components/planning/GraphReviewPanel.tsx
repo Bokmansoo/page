@@ -104,6 +104,29 @@ export type GraphView = {
       commerce_creative_master?: {
         master_version?: { id?: string; version?: number; canonical_hash?: string };
       };
+      product_truth?: {
+        requires_review?: boolean;
+        fact_count?: number;
+        unknown_count?: number;
+        conflict_count?: number;
+        prohibited_inference_count?: number;
+      };
+      manual_source?: {
+        fact_count?: number;
+        unknown_count?: number;
+        conflict_count?: number;
+        creative_direction_count?: number;
+      };
+      photo_observation?: {
+        observation_status?: string;
+        source_asset_count?: number;
+        observation_count?: number;
+        unknown_count?: number;
+        conflict_count?: number;
+        prohibited_inference_count?: number;
+      };
+      owned_url_source?: { image_asset_count?: number };
+      owned_url_capture?: { capture_status?: string; recoverable?: boolean };
     };
     canvas?: {
       canonical_page_assembly_input?: { sections?: Array<{ section_id: string; canvas?: { is_visible?: boolean; height_px?: number | null }; canvas_elements?: Array<{ element_id: string; kind: string; x: number; y: number; width: number; height: number; z_index: number; locked: boolean; group_id?: string | null; deleted?: boolean; asset_id?: string; asset_content_hash?: string }> }> };
@@ -161,6 +184,13 @@ type StandaloneExport = {
   copyable_html: string;
   html_download_url: string;
   zip_download_url: string;
+};
+
+type ImageExportJob = {
+  id: string;
+  status: string;
+  error_message?: string | null;
+  output_images?: string[] | null;
 };
 
 type FrozenCanvasElement = {
@@ -272,7 +302,9 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   const [uploadAssets, setUploadAssets] = useState<UploadAsset[]>([]);
   const [uploadByJob, setUploadByJob] = useState<Record<string, string>>({});
   const [standaloneExport, setStandaloneExport] = useState<StandaloneExport | null>(null);
+  const [standaloneExportChannel, setStandaloneExportChannel] = useState<"smartstore" | "coupang">("smartstore");
   const [standaloneExporting, setStandaloneExporting] = useState(false);
+  const [imageExporting, setImageExporting] = useState<string | null>(null);
   const [canvasHeights, setCanvasHeights] = useState<Record<string, string>>({});
   const [selectedCanvasElements, setSelectedCanvasElements] = useState<string[]>([]);
   const [canvasAssetReplacements, setCanvasAssetReplacements] = useState<Record<string, string>>({});
@@ -605,11 +637,62 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
       if (!response.ok) {
         throw new Error(typeof payload?.detail === "string" ? payload.detail : "HTML/ZIP 내보내기를 준비하지 못했습니다.");
       }
+      setStandaloneExportChannel(channel);
       setStandaloneExport(payload as StandaloneExport);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "HTML/ZIP 내보내기를 준비하지 못했습니다.");
     } finally {
       setStandaloneExporting(false);
+    }
+  };
+
+  const createImageExport = async (
+    detailPageVersionId: string,
+    channel: "smartstore" | "coupang",
+    format: "png" | "jpg",
+  ) => {
+    const exportKey = `${channel}:${format}`;
+    setImageExporting(exportKey);
+    setMessage(null);
+    try {
+      const response = await fetch(apiUrl(`/api/v1/projects/${projectId}/page/export`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          preset_name: channel,
+          output_format: format,
+          export_target: "local_download",
+          use_commerce_cut: true,
+          final_version_id: detailPageVersionId,
+        }),
+      });
+      const payload = await response.json().catch(() => null) as ImageExportJob | null;
+      if (!response.ok || !payload) throw new Error("이미지 내보내기를 시작하지 못했습니다.");
+      let job = payload;
+      for (let attempt = 0; attempt < 120 && !["completed", "failed"].includes(job.status); attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
+        const statusResponse = await fetch(
+          apiUrl(`/api/v1/projects/${projectId}/page/export/jobs/${job.id}`),
+          { credentials: "include", cache: "no-store" },
+        );
+        if (!statusResponse.ok) throw new Error("이미지 내보내기 상태를 확인하지 못했습니다.");
+        job = await statusResponse.json() as ImageExportJob;
+      }
+      const downloadUrl = job.output_images?.[0];
+      if (job.status !== "completed" || !downloadUrl) {
+        throw new Error(job.error_message || "이미지 내보내기를 완료하지 못했습니다.");
+      }
+      const link = document.createElement("a");
+      link.href = apiUrl(downloadUrl);
+      link.download = "";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "이미지 내보내기를 완료하지 못했습니다.");
+    } finally {
+      setImageExporting(null);
     }
   };
 
@@ -818,6 +901,26 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
   }
   const pending = view?.values.review?.pending;
   if (!view) return null;
+  const intake = view.values.intake;
+  const inputMode = intake?.input_mode || intake?.envelope?.input_mode;
+  const truth = intake?.product_truth;
+  const sourceSummary = inputMode === "manual" && intake?.manual_source
+    ? `직접 입력 자료 · 사실 후보 ${intake.manual_source.fact_count || 0}개 · 확인 필요 ${intake.manual_source.unknown_count || 0}개`
+    : inputMode === "photo_only" && intake?.photo_observation
+      ? `상품 사진 ${intake.photo_observation.source_asset_count || 0}개 · 관찰 ${intake.photo_observation.observation_count || 0}개 · ${intake.photo_observation.observation_status === "recovery" ? "다른 입력 방식 필요" : "관찰 완료"}`
+      : inputMode === "owned_product_url" && intake?.owned_url_source
+        ? `내 상품 URL 캡처 완료 · 참고 이미지 ${intake.owned_url_source.image_asset_count || 0}개`
+        : inputMode === "owned_product_url" && intake?.owned_url_capture
+          ? "내 상품 URL을 가져오지 못해 다른 입력 방식을 선택할 수 있습니다"
+          : null;
+  const intakeSummary = sourceSummary || truth ? <dl
+    className="mb-3 grid gap-2 rounded-lg border border-violet-100 bg-white p-3 text-xs sm:grid-cols-2"
+    data-testid="lg14-intake-summary"
+    data-input-mode={inputMode || "unknown"}
+  >
+    <div><dt className="font-bold text-slate-700">상품 입력 자료</dt><dd>{sourceSummary || "입력 자료 확인 중"}</dd></div>
+    <div><dt className="font-bold text-slate-700">상품 정보 근거</dt><dd>{truth ? `근거 ${truth.fact_count || 0}개 · 미확인 ${truth.unknown_count || 0}개 · 충돌 ${truth.conflict_count || 0}개 · 금지 추론 ${truth.prohibited_inference_count || 0}개` : "상품 정보를 정리하고 있습니다"}</dd></div>
+  </dl> : null;
   const delayContext = view.values.execution?.delay_context;
   const etaText = delayContext?.eta_status === "estimated" && delayContext.eta_range_seconds
     ? `예상 남은 시간 ${delayContext.eta_range_seconds.min}~${delayContext.eta_range_seconds.max}초`
@@ -854,11 +957,11 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
         <p className="mt-3 text-xs leading-5">자동 수정 결과를 기다려 주세요. 추가 확인이 필요하면 알려드리겠습니다.</p>
       </section>;
     }
-    const intake = view.values.intake;
     const briefVersion = intake?.creative_brief?.brief_version;
     const masterVersion = intake?.commerce_creative_master?.master_version;
     if (view.status === "completed" && view.current_stage === "master_ready" && masterVersion?.id) {
       return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-950" data-testid="lg12i-master-ready">
+        {intakeSummary}
         <p className="text-xs font-bold text-emerald-700">상품 콘텐츠 준비 완료</p>
         <h2 className="mt-1 font-black">상품 사실과 판매자 확인을 고정한 Creative Master가 준비되었습니다</h2>
         <p className="mt-1 text-xs leading-5 text-slate-600">새 페이지나 이미지 생성은 아직 시작하지 않았습니다. 이후 Planning 단계는 이 immutable Master reference를 사용합니다.</p>
@@ -885,8 +988,16 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
           <div><dt className="font-bold text-slate-700">품질 상태</dt><dd>{qualityStatus?.quality_verdict === "PASS" ? "품질 검토 통과" : "상태 확인 중"}</dd></div>
           <div><dt className="font-bold text-slate-700">자동 수정</dt><dd>{qualityStatus?.attempt_summary?.automatic_rework_count || 0}회</dd></div>
         </dl>
-        {!promoted ? <button type="button" data-testid="lg12-promote-page" onClick={() => void promoteQualityPage()} disabled={working || qualityStatus?.status === "needs_attention"} className="mt-4 rounded-lg bg-emerald-700 px-3 py-2 text-xs font-bold text-white disabled:opacity-50">{working ? "처리 중..." : "최종 사용 가능 상태로 전환"}</button> : <div className="mt-4 flex flex-wrap gap-2">{channels.filter(([, ready]) => ready).map(([channel]) => <a key={channel} data-testid={`lg12-export-ready-${channel}`} href={`/workspace/projects/${projectId}/render?version_id=${encodeURIComponent(detailPageVersionId)}&channel=${channel}`} className="rounded-lg bg-emerald-700 px-3 py-2 text-xs font-bold text-white">{channel === "smartstore" ? "SmartStore 미리보기" : "Coupang 미리보기"}</a>)}{qualityStatus?.export_readiness?.smartstore ? <button type="button" data-testid="lg12-smartstore-standalone-export" onClick={() => void createStandaloneExport(detailPageVersionId, "smartstore")} disabled={standaloneExporting} className="rounded-lg border border-emerald-300 bg-white px-3 py-2 text-xs font-bold text-emerald-800 disabled:opacity-50">{standaloneExporting ? "SmartStore HTML/ZIP 준비 중..." : "SmartStore HTML/ZIP 내보내기"}</button> : null}</div>}
-        {standaloneExport ? <div className="mt-3 flex flex-wrap gap-2" data-testid="lg12-smartstore-export-downloads"><a data-testid="lg12-smartstore-html-download" href={apiUrl(standaloneExport.html_download_url)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-800">SmartStore HTML 다운로드</a><a data-testid="lg12-smartstore-zip-download" href={apiUrl(standaloneExport.zip_download_url)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-800">SmartStore ZIP 다운로드</a></div> : null}
+        {!promoted ? <button type="button" data-testid="lg12-promote-page" onClick={() => void promoteQualityPage()} disabled={working || qualityStatus?.status === "needs_attention"} className="mt-4 rounded-lg bg-emerald-700 px-3 py-2 text-xs font-bold text-white disabled:opacity-50">{working ? "처리 중..." : "최종 사용 가능 상태로 전환"}</button> : <div className="mt-4 flex flex-wrap gap-2">{channels.filter(([, ready]) => ready).flatMap(([channel]) => {
+          const exportChannel = channel as "smartstore" | "coupang";
+          const channelLabel = channel === "smartstore" ? "SmartStore" : "Coupang";
+          return [
+            <a key={`${channel}-preview`} data-testid={`lg12-export-ready-${channel}`} href={`/workspace/projects/${projectId}/render?version_id=${encodeURIComponent(detailPageVersionId)}&channel=${channel}`} className="rounded-lg bg-emerald-700 px-3 py-2 text-xs font-bold text-white">{channelLabel} 미리보기</a>,
+            <button key={`${channel}-standalone`} type="button" data-testid={`lg12-${channel}-standalone-export`} onClick={() => void createStandaloneExport(detailPageVersionId, exportChannel)} disabled={standaloneExporting} className="rounded-lg border border-emerald-300 bg-white px-3 py-2 text-xs font-bold text-emerald-800 disabled:opacity-50">{standaloneExporting ? `${channelLabel} HTML/ZIP 준비 중...` : `${channelLabel} HTML/ZIP 내보내기`}</button>,
+            ...(["png", "jpg"] as const).map((format) => <button key={`${channel}-${format}`} type="button" data-testid={`lg12-${channel}-${format}-download`} onClick={() => void createImageExport(detailPageVersionId, exportChannel, format)} disabled={imageExporting !== null} className="rounded-lg border border-emerald-300 bg-white px-3 py-2 text-xs font-bold text-emerald-800 disabled:opacity-50">{imageExporting === `${channel}:${format}` ? `${format.toUpperCase()} 준비 중...` : `${channelLabel} ${format.toUpperCase()} 다운로드`}</button>),
+          ];
+        })}</div>}
+        {standaloneExport ? <div className="mt-3 flex flex-wrap gap-2" data-testid={`lg12-${standaloneExportChannel}-export-downloads`}><a data-testid={`lg12-${standaloneExportChannel}-html-download`} href={apiUrl(standaloneExport.html_download_url)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-800">{standaloneExportChannel === "smartstore" ? "SmartStore" : "Coupang"} HTML 다운로드</a><a data-testid={`lg12-${standaloneExportChannel}-zip-download`} href={apiUrl(standaloneExport.zip_download_url)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-800">{standaloneExportChannel === "smartstore" ? "SmartStore" : "Coupang"} ZIP 다운로드</a></div> : null}
         {qualityStatus?.review_required ? <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">확인이 필요한 항목이 있습니다. 기존 검토 단계에서 필요한 정보를 확인해 주세요.</p> : null}
         {qualityStatus?.message ? <p role="status" className="mt-3 text-xs text-slate-700">{qualityStatus.message}</p> : null}
         {message ? <p role="status" className="mt-3 text-xs font-semibold text-emerald-800">{message}</p> : null}
@@ -945,7 +1056,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     return null;
   }
   if (hidePlanningAction && pending.review_stage === "planning_review") {
-    return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">스토리보드가 승인 대기 중입니다. 아래의 <b>스토리보드 승인</b> 버튼은 동일한 작업 실행을 재개합니다.</section>;
+    return <section className="mx-auto mb-5 max-w-4xl rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">{intakeSummary}스토리보드가 승인 대기 중입니다. 아래의 <b>스토리보드 승인</b> 버튼은 동일한 작업 실행을 재개합니다.</section>;
   }
   const generationWaiting = pending.review_stage === "generation_pending";
   const providerWaiting = pending.review_stage === "provider_wait";
@@ -982,6 +1093,7 @@ export default function GraphReviewPanel({ projectId, runId, hidePlanningAction 
     data-testid={`graph-review-${pending.review_stage}`}
   >
     {recoveryNotice ? <p role="status" className="mb-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-900">{recoveryNotice}</p> : null}
+    {intakeSummary}
     {delayNotice}
     {progressivePreviewNotice}
     <div className="flex flex-wrap items-start justify-between gap-3">

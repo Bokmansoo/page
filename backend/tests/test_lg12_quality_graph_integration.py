@@ -3152,7 +3152,9 @@ def test_projection_rebuild_preserves_exhausted_retry_budget(
     assert recovered.json()["values"]["review"]["pending"]["review_stage"] == "quality_review"
     recovered_quality = dict(recovered.json()["values"]["quality"])
     if verify_public_ledger:
-        assert recovered_quality["attempt_ledger"] == ledger
+        assert "attempt_ledger" not in recovered_quality
+        db_session.refresh(run)
+        assert dict((run.outputs_json or {}).get("langgraph_quality") or {})["attempt_ledger"] == ledger
     replay = client.post(
         f"/api/v1/graph-runs/{run.id}/resume", headers=auth_headers,
         json={"thread_id": run.id, "mode": "recover"},

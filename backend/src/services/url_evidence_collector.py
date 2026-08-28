@@ -14,6 +14,8 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
+from src.config import settings
+
 
 class UnsafeSourceURLError(ValueError):
     pass
@@ -156,6 +158,15 @@ def _resolve_host(host: str) -> list[str]:
     )
 
 
+def _local_fixture_host_allowed(hostname: str) -> bool:
+    return bool(
+        settings.APP_ENV == "test"
+        and settings.SELLFORM_ALLOW_TEST_DATABASE
+        and settings.SELLFORM_ALLOW_LOCAL_URL_FIXTURE
+        and (hostname == "localhost" or hostname.endswith(".localhost") or hostname in {"127.0.0.1", "::1"})
+    )
+
+
 def normalize_public_http_url(url: str) -> str:
     """Return the stable URL identity used before any remote capture.
 
@@ -173,7 +184,7 @@ def normalize_public_http_url(url: str) -> str:
     if parsed.username or parsed.password:
         raise UnsafeSourceURLError("Product URLs must not contain credentials.")
     hostname = parsed.hostname.lower().rstrip(".")
-    if hostname == "localhost" or hostname.endswith(".localhost"):
+    if (hostname == "localhost" or hostname.endswith(".localhost")) and not _local_fixture_host_allowed(hostname):
         raise UnsafeSourceURLError("Local URLs are not allowed.")
     if hostname in {"metadata", "metadata.google.internal", "metadata.internal"}:
         raise UnsafeSourceURLError("Metadata source URLs are not allowed.")
@@ -181,7 +192,7 @@ def normalize_public_http_url(url: str) -> str:
         literal = ipaddress.ip_address(hostname)
     except ValueError:
         literal = None
-    if literal is not None and not literal.is_global:
+    if literal is not None and not literal.is_global and not (literal.is_loopback and _local_fixture_host_allowed(hostname)):
         raise UnsafeSourceURLError("Private or reserved source addresses are not allowed.")
     try:
         port = parsed.port
@@ -219,7 +230,7 @@ def resolve_validated_public_url_target(
             ip = ipaddress.ip_address(address)
         except ValueError as exc:
             raise UnsafeSourceURLError("The source host returned an invalid address.") from exc
-        if not ip.is_global:
+        if not ip.is_global and not (ip.is_loopback and _local_fixture_host_allowed(parsed.hostname)):
             raise UnsafeSourceURLError("Private or reserved source addresses are not allowed.")
         parsed_ips.append(ip)
     parsed_ips.sort(key=lambda value: (value.version, int(value)))

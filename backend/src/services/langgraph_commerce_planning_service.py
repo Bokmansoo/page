@@ -311,15 +311,25 @@ def _input_contract(run: AgentRun, db: Session) -> tuple[dict[str, Any], list[di
         brief["creative_brief"] = deepcopy(creative.brief_json)
         brief["creative_brief_version"] = creative.version
         brief["creative_brief_hash"] = creative.output_hash
-    # Re-validate the actual LG-2 artifacts so the graph cannot silently fall
-    # back to handwritten output.  Their raw content is deliberately not
-    # handed to Sales Strategy or Copywriting: only the approved FactSnapshot
-    # may supply factual/marketing input to those nodes.
-    discovery_outputs = read_legacy_discovery_outputs(run, db)
-    discovery = {
-        stage: {"artifact_hash": _canonical_hash(output), "schema_version": "lg2-v1"}
-        for stage, output in discovery_outputs.items()
-    }
+    # LG-12I's immutable Master is the canonical handoff source.  It does not
+    # create the legacy LG-2 output bundle, so planning carries only a bounded
+    # contract fingerprint instead of fabricating discovery records.
+    if run.mode == "lg12i_intake" and (run.input_snapshot or {}).get("canonical_handoff"):
+        handoff_hash = _canonical_hash((run.input_snapshot or {}).get("canonical_handoff"))
+        discovery = {
+            stage: {"artifact_hash": handoff_hash, "schema_version": "lg12i-v1"}
+            for stage in ("input_router", "source_collection", "product_understanding", "reference_analysis")
+        }
+    else:
+        # Re-validate the actual LG-2 artifacts so the graph cannot silently
+        # fall back to handwritten output.  Their raw content is deliberately
+        # not handed to Sales Strategy or Copywriting: only the approved
+        # FactSnapshot may supply factual/marketing input to those nodes.
+        discovery_outputs = read_legacy_discovery_outputs(run, db)
+        discovery = {
+            stage: {"artifact_hash": _canonical_hash(output), "schema_version": "lg2-v1"}
+            for stage, output in discovery_outputs.items()
+        }
     return brief, facts, discovery
 
 
@@ -555,12 +565,21 @@ def _scene_generation_mode(scene: dict[str, Any]) -> str:
     return "html_information_fallback"
 
 
-def _frozen_scene_plan(plan: dict[str, Any], facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _frozen_scene_plan(
+    plan: dict[str, Any],
+    facts: list[dict[str, Any]],
+    *,
+    allow_generated_without_reference: bool = False,
+    page_sections: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Project UX-2E scenes into a deterministic, validated LG-3 contract."""
 
     allowed_fact_ids = {str(item["id"]) for item in facts}
     fallback_asset_ids = [str(item["id"]) for item in (plan.get("product_brief") or {}).get("safe_reference_assets") or [] if item.get("id")]
-    if not fallback_asset_ids:
+    if not fallback_asset_ids and not allow_generated_without_reference and any(
+        str(scene.get("rendering_strategy") or "") != "html_information_fallback"
+        for scene in (plan.get("scenes") or [])
+    ):
         raise ValueError("LG-3 Visual Planning requires at least one safe seller-owned reference asset.")
 
     contracts: list[dict[str, Any]] = []
@@ -576,17 +595,50 @@ def _frozen_scene_plan(plan: dict[str, Any], facts: list[dict[str, Any]]) -> lis
         # first approved reference; later seller changes become explicit LG-4
         # inputs and produce a new graph run.
         reference_asset_ids = fallback_asset_ids[:1]
+        information_only = not fallback_asset_ids and allow_generated_without_reference
         contracts.append({
             "id": str(scene.get("id") or "scene"),
             "scene_type": str(scene.get("scene_type") or "feature_closeup"),
             "objective": str(scene.get("objective") or "구매 정보 안내"),
             "source_fact_ids": source_fact_ids,
             "reference_asset_ids": reference_asset_ids,
-            "generation_mode": _scene_generation_mode(scene),
+            "generation_mode": "html_information_fallback" if information_only else _scene_generation_mode(scene),
             "requested_output": str(scene.get("requested_output") or "html_graphic"),
-            "rendering_strategy": str(scene.get("rendering_strategy") or "html_information_fallback"),
-            "mock_status": str(scene.get("mock_status") or "information_fallback"),
+            "rendering_strategy": (
+                "html_information_fallback"
+                if information_only
+                else str(scene.get("rendering_strategy") or "html_information_fallback")
+            ),
+            "mock_status": (
+                "information_fallback"
+                if information_only
+                else str(scene.get("mock_status") or "information_fallback")
+            ),
         })
+    if page_sections:
+        by_section_id = {str(scene["id"]): scene for scene in contracts}
+        contracts = [
+            by_section_id.get(str(section["id"])) or {
+                "id": str(section["id"]),
+                "scene_type": (
+                    "hero_product" if section["id"] == "hero"
+                    else "usage_scene" if section["id"] == "usage_guide"
+                    else "spec_graphic" if section["id"] in {"details_components", "product_information"}
+                    else "feature_closeup"
+                ),
+                "objective": str(section.get("purpose") or section.get("name") or "구매 정보 안내"),
+                "source_fact_ids": [
+                    str(item) for item in section.get("source_fact_ids") or []
+                    if str(item) in allowed_fact_ids
+                ] or sorted(allowed_fact_ids),
+                "reference_asset_ids": [],
+                "generation_mode": "html_information_fallback",
+                "requested_output": "html_graphic",
+                "rendering_strategy": "html_information_fallback",
+                "mock_status": "information_fallback",
+            }
+            for section in page_sections
+        ]
     visual_contract = VisualPlanOutput.model_validate({
         "hero_image_prompt": "contract-validation", "detail_image_prompt": "contract-validation",
         "color_palette": [], "scene_plan": contracts,
@@ -630,8 +682,29 @@ def run_page_planning(*, run_id: str, project_id: str, mode: str) -> dict[str, A
             "product_brief": brief, "approved_facts": facts, "sales_strategy": strategy,
         }, mock=build_mock_page_plan(brief["product_name"]))
         output = _normalise_page_plan(output, facts)
+        page_plan_id = "page-plan:" + _canonical_hash(output)[:24]
+        section_scene_contract = [
+            {
+                "section_id": str(section["id"]),
+                "section_order": index,
+                "scene_id": str(section["id"]),
+                "scene_type": (
+                    "hero_product" if section["id"] == "hero"
+                    else "usage_scene" if section["id"] == "usage_guide"
+                    else "spec_graphic" if section["id"] in {"details_components", "product_information"}
+                    else "feature_closeup"
+                ),
+                "scene_order": index,
+                "element_ids": [f"{section['id']}:text"],
+                "expected_layout_token": str(output.get("layout_concept") or ""),
+                "expected_text_roles": ["headline", "subcopy"],
+            }
+            for index, section in enumerate(output["sections"])
+        ]
         return {"page_planning": {"fact_snapshot_id": snapshot.id, **_store(run, "page_planning", output, metadata={
             **metadata, "fact_snapshot_hash": snapshot.snapshot_hash, "input_hash": _canonical_hash([brief, facts, strategy]),
+            "artifact_id": page_plan_id, "artifact_version": 1,
+            "section_scene_contract": section_scene_contract,
         })}}
     finally:
         if owns_session:
@@ -657,6 +730,7 @@ def run_copywriting(*, run_id: str, project_id: str, mode: str) -> dict[str, Any
         return {"copywriting": {"fact_snapshot_id": snapshot.id, **_store(run, "copywriting", output, metadata={
             **metadata, "fact_snapshot_hash": snapshot.snapshot_hash, "input_hash": _canonical_hash([brief, facts, artifacts["sales_strategy"], artifacts["page_planning"]]),
             "copy_provenance": provenance,
+            "artifact_id": "copy:" + _canonical_hash(output)[:24], "artifact_version": 1,
         })}}
     finally:
         if owns_session:
@@ -702,6 +776,72 @@ def _planning_draft(plan: dict[str, Any], page_plan: dict[str, Any], copy: dict[
             "estimated_cost": 0.0, "revision": 1, "revision_history": [{"revision": 1, "action": "langgraph_lg3_generated"}]}
 
 
+def _freeze_canonical_planning_master(*, run: AgentRun, db: Session) -> None:
+    """Replace one LG-12I pending Master with its immutable planning successor."""
+
+    if run.mode != "lg12i_intake" or not (run.input_snapshot or {}).get("canonical_handoff"):
+        return
+    from src.db.models import CommerceCreativeMasterVersion
+    from src.services.product_intake_version_service import create_commerce_creative_master_version
+
+    artifacts = dict((run.outputs_json or {}).get(COMMERCE_ARTIFACT_KEY) or {})
+
+    def typed_reference(stage: str) -> dict[str, Any]:
+        artifact = dict(artifacts.get(stage) or {})
+        metadata = dict(artifact.get("metadata") or {})
+        reference = {
+            "id": str(metadata.get("artifact_id") or ""),
+            "version": metadata.get("artifact_version"),
+            "hash": str(metadata.get("artifact_hash") or ""),
+            "schema_version": str(artifact.get("schema_version") or ""),
+            "artifact_key": stage,
+        }
+        if (
+            not reference["id"]
+            or not isinstance(reference["version"], int)
+            or reference["version"] < 1
+            or not re.fullmatch(r"[0-9a-f]{64}", reference["hash"])
+        ):
+            raise ValueError(f"LG-12I {stage} artifact has no immutable production identity.")
+        return reference
+
+    page_plan_ref = typed_reference("page_planning")
+    copy_ref = typed_reference("copywriting")
+    parent = (
+        db.query(CommerceCreativeMasterVersion)
+        .filter_by(workspace_id=run.workspace_id, project_id=run.project_id, creator_run_id=run.id)
+        .order_by(CommerceCreativeMasterVersion.version.desc())
+        .first()
+    )
+    if parent is None:
+        raise ValueError("LG-12I canonical planning requires its frozen pending Master.")
+    if (
+        dict(parent.page_plan_artifact_ref_json or {}) == page_plan_ref
+        and dict(parent.copy_artifact_ref_json or {}) == copy_ref
+    ):
+        return
+    create_commerce_creative_master_version(
+        db,
+        workspace_id=run.workspace_id,
+        project_id=run.project_id,
+        creator_run_id=run.id,
+        created_by=run.created_by,
+        source_reference={"id": parent.source_snapshot_version_id, "version": parent.source_snapshot_version, "hash": parent.source_snapshot_hash},
+        truth_reference={"id": parent.truth_version_id, "version": parent.truth_version, "hash": parent.truth_version_hash},
+        confirmation_reference={"id": parent.confirmation_version_id, "version": parent.confirmation_version, "hash": parent.confirmation_version_hash},
+        creative_brief_reference={"id": parent.creative_brief_version_id, "version": parent.creative_brief_version, "hash": parent.creative_brief_hash},
+        brand_kit_reference={"id": parent.brand_kit_version_id, "version": parent.brand_kit_version, "hash": parent.brand_kit_hash},
+        evidence_artifact_refs=list(parent.evidence_artifact_refs_json or []),
+        approved_fact_snapshot_ref=dict(parent.approved_fact_snapshot_ref_json or {}),
+        approved_asset_manifest_ref=dict(parent.approved_asset_manifest_ref_json or {}),
+        copy_artifact_ref=copy_ref,
+        page_plan_artifact_ref=page_plan_ref,
+        target_channels=list(parent.target_channels or []),
+        parent_version_id=parent.id,
+    )
+    db.commit()
+
+
 def run_visual_planning(*, run_id: str, project_id: str, mode: str) -> dict[str, Any]:
     db, owns_session, run = _load_run(run_id, project_id)
     try:
@@ -717,7 +857,15 @@ def run_visual_planning(*, run_id: str, project_id: str, mode: str) -> dict[str,
             "copy_set": artifacts["copywriting"], "sales_strategy": artifacts["sales_strategy"],
         }, mock=build_mock_visual_plan(brief["product_name"]))
         generation_plan = build_generation_plan(run.project, db)
-        scene_plan = _frozen_scene_plan(generation_plan, facts)
+        scene_plan = _frozen_scene_plan(
+            generation_plan,
+            facts,
+            allow_generated_without_reference=(
+                run.mode == "lg12i_intake"
+                and bool((run.input_snapshot or {}).get("canonical_handoff"))
+            ),
+            page_sections=[dict(section) for section in artifacts["page_planning"].get("sections") or []],
+        )
         # The provider's visual suggestions and the immutable ScenePlan are a
         # single versioned result.  Dynamic UX-2E audit timestamps stay out of
         # this artifact, so equal mock inputs produce an equal artifact hash.
@@ -727,7 +875,7 @@ def run_visual_planning(*, run_id: str, project_id: str, mode: str) -> dict[str,
         active_project.planning_draft = draft
         db.add(active_project)
         db.commit()
-        return {"visual_planning": {"fact_snapshot_id": snapshot.id, "scene_count": len(scene_plan), **_store(run, "visual_planning", output, metadata={
+        result = {"visual_planning": {"fact_snapshot_id": snapshot.id, "scene_count": len(scene_plan), **_store(run, "visual_planning", output, metadata={
             **metadata, "fact_snapshot_hash": snapshot.snapshot_hash,
             # ``brief`` contains UX operational status that can legitimately
             # change while the approved facts and planning inputs have not.
@@ -735,6 +883,9 @@ def run_visual_planning(*, run_id: str, project_id: str, mode: str) -> dict[str,
             "input_hash": _canonical_hash([facts, artifacts["page_planning"], artifacts["copywriting"], scene_plan]),
             "scene_plan": scene_plan, "planning_draft_revision": 1,
         })}}
+        db.refresh(run)
+        _freeze_canonical_planning_master(run=run, db=db)
+        return result
     finally:
         if owns_session:
             db.close()

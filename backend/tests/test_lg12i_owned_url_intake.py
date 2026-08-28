@@ -9,14 +9,18 @@ from hashlib import sha256
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
+from src.config import settings
 from src.db.models import (
+    CommerceCreativeMasterVersion,
     AgentRun,
     ImageGenerationCostApprovalRecord,
     ImageGenerationJobRecord,
     ImageGenerationOutboxRecord,
+    ProductCreativeBriefVersion,
     ProductSourceSnapshotVersion,
     ReferenceInsightVersion,
 )
+from src.services.brand_kit_service import create_kit, create_version
 from src.services.product_intake_version_service import (
     OWNED_PRODUCT_URL_CAPTURE_REQUEST_SCHEMA_VERSION,
 )
@@ -159,29 +163,83 @@ def test_owned_url_capture_graph_creates_reference_only_snapshot_and_preserves_r
     assert intake["next_action"] == "task_12i_confirmation_or_brand_recovery"
     assert intake["product_truth"]["truth_version"]["id"]
     source = intake["owned_url_source"]
-    assert source["final_url"] == "https://shop.example.com/product/fan"
     assert source["rights"] == {
-        "provenance": "seller_submitted_owned_product_url",
         "confirmation_state": "seller_owned",
         "final_use_status": "not_approved",
     }
     # Bounded source-backed title is now a Truth candidate; the raw capture
     # body remains reference-only.
-    assert any(
-        item["field_id"] == "product_identity" and item["value"] == "FAN PRO JET"
-        for item in intake["product_truth"]["fact_candidates"]
-    )
+    assert intake["product_truth"]["fact_count"] >= 1
     assert "raw_html" not in repr(intake)
     snapshot = db_session.query(ProductSourceSnapshotVersion).filter_by(id=source["source_snapshot"]["id"]).one()
     assert snapshot.input_mode == "owned_product_url"
     assert snapshot.provenance_json["capture_request_ref"]["id"] == request["id"]
     assert snapshot.provenance_json["source_content_hash"] == _capture().source_content_hash
-    assert snapshot.source_fidelity_json["content_document_ref"] == source["capture_artifact_ref"]
+    assert {
+        key: snapshot.source_fidelity_json["content_document_ref"][key]
+        for key in ("id", "version", "hash")
+    } == source["capture_artifact_ref"]
     assert snapshot.rights_json["final_use_status"] == "not_approved"
     assert db_session.query(ReferenceInsightVersion).count() == before["insights"]
     assert db_session.query(ImageGenerationJobRecord).count() == before["jobs"]
     assert db_session.query(ImageGenerationOutboxRecord).count() == before["outbox"]
     assert db_session.query(ImageGenerationCostApprovalRecord).count() == before["cost"]
+
+
+def test_owned_url_handoff_reaches_canonical_planning_once(
+    client, auth_headers, db_session, tmp_path, lg12i_runtime, monkeypatch
+):
+    source_run = _create_run(client, auth_headers, db_session, tmp_path)
+    kit = create_kit(db_session, source_run.workspace_id, source_run.created_by, "Owned URL handoff test kit")
+    create_version(
+        db_session, source_run.workspace_id, source_run.created_by, kit.id,
+        {"color_tokens": {"accent": "#0f766e"}, "typography": {"body_font": "system-ui"}},
+        scope="project", project_id=source_run.project_id, activate=True,
+    )
+    request = _create_request(client, auth_headers, source_run.project_id)
+    _install_capture(monkeypatch, _capture())
+    response = client.post(
+        f"/api/v1/graph-runs/projects/{source_run.project_id}/unified-intake",
+        headers=auth_headers,
+        json=_payload(request, channels=["smartstore"]),
+    )
+    assert response.status_code == 201, response.text
+    state = response.json()
+    run_id = state["run_id"]
+    for _ in range(3):
+        if state["current_stage"] != "seller_confirmation":
+            break
+        plan = state["values"]["intake"]["seller_confirmation"]
+        state = client.post(
+            f"/api/v1/graph-runs/{run_id}/resume",
+            headers=auth_headers,
+            json={
+                "thread_id": state["thread_id"],
+                "response": {
+                    "schema_version": "lg12i-v1", "review_stage": "seller_confirmation",
+                    "decision": "submit", "confirmation_request_hash": plan["resume_request_hash"],
+                    "confirmation_answers": [
+                        {"clarification_id": item["clarification_id"], "decision": "reject"}
+                        for item in plan["clarifications"]
+                    ],
+                },
+            },
+        )
+        assert state.status_code == 200, state.text
+        state = state.json()
+    assert state["current_stage"] == "planning_review"
+    assert state["status"] == "awaiting_review"
+    assert db_session.query(ProductCreativeBriefVersion).filter_by(run_id=run_id).count() == 1
+    masters = (
+        db_session.query(CommerceCreativeMasterVersion)
+        .filter_by(creator_run_id=run_id)
+        .order_by(CommerceCreativeMasterVersion.version)
+        .all()
+    )
+    assert len(masters) == 2
+    assert masters[1].parent_version_id == masters[0].id
+    assert masters[1].page_plan_artifact_ref_json["id"].startswith("page-plan:")
+    assert masters[1].copy_artifact_ref_json["id"].startswith("copy:")
 
 
 def test_owned_url_same_content_reuses_snapshot_but_changed_content_creates_successor(
@@ -284,6 +342,42 @@ def test_owned_url_capture_redirect_safety_and_normalized_identity():
     for unsafe in ("javascript:alert(1)", "data:text/html,x", "file:///tmp/product.html", "http://localhost/x"):
         with pytest.raises(UnsafeSourceURLError):
             capture_owned_product_url(unsafe, fetch=lambda _: responses["https://store.example.com/p"])
+
+
+def test_owned_url_capture_allows_loopback_only_for_explicit_guarded_test_fixture(monkeypatch):
+    monkeypatch.setattr(settings, "APP_ENV", "test")
+    monkeypatch.setattr(settings, "SELLFORM_ALLOW_TEST_DATABASE", True)
+    monkeypatch.setattr(settings, "SELLFORM_ALLOW_LOCAL_URL_FIXTURE", True)
+
+    captured = capture_owned_product_url(
+        "http://localhost:4177/product.html",
+        fetch=lambda _target: URLCaptureHTTPResponse(
+            200,
+            {"content-type": "text/html; charset=utf-8"},
+            b"<html><head><title>Local fixture</title></head><body><p>Safe product</p></body></html>",
+        ),
+        resolve_host=lambda _host: ["127.0.0.1"],
+    )
+    assert captured.title == "Local fixture"
+
+    monkeypatch.setattr(settings, "APP_ENV", "production")
+    with pytest.raises(UnsafeSourceURLError):
+        capture_owned_product_url(
+            "http://localhost:4177/product.html",
+            fetch=lambda _target: URLCaptureHTTPResponse(200, {"content-type": "text/html"}, b"ok"),
+            resolve_host=lambda _host: ["127.0.0.1"],
+        )
+
+
+def test_lg12i_intake_uses_the_configured_mock_provider_boundary(monkeypatch):
+    from src.agents.langgraph_runtime import _lg5_provider_mode
+
+    monkeypatch.setattr(settings, "SELLFORM_IMAGE_GENERATION_MODE", "mock")
+    assert _lg5_provider_mode({"mode": "lg12i_intake"}) == "mock"
+
+    monkeypatch.setattr(settings, "SELLFORM_IMAGE_GENERATION_MODE", "real")
+    assert _lg5_provider_mode({"mode": "lg12i_intake"}) == "real"
+    assert _lg5_provider_mode({"mode": "mock"}) == "mock"
 
 
 def test_owned_url_capture_pins_validated_dns_target_and_rejects_rebinding_addresses():
@@ -454,8 +548,9 @@ def test_owned_url_snapshot_provenance_hash_only_reuses_identical_capture_semant
         snapshot_ids.append(source["source_snapshot"]["id"])
         artifact_hashes.append(source["capture_artifact_ref"]["hash"])
         snapshot = db_session.query(ProductSourceSnapshotVersion).filter_by(id=source["source_snapshot"]["id"]).one()
-        assert snapshot.provenance_json["capture_artifact_ref"] == source["capture_artifact_ref"]
-        assert snapshot.source_fidelity_json["content_document_ref"] == source["capture_artifact_ref"]
+        for key in ("id", "version", "hash"):
+            assert snapshot.provenance_json["capture_artifact_ref"][key] == source["capture_artifact_ref"][key]
+            assert snapshot.source_fidelity_json["content_document_ref"][key] == source["capture_artifact_ref"][key]
         assert snapshot.provenance_json["source_input_hash"]
         source_input_hashes.append(snapshot.provenance_json["source_input_hash"])
         if frozen_first_hash is None:
@@ -529,4 +624,4 @@ def test_owned_url_snapshot_projection_rebuild_restores_capture_identity(
     assert recovered.status_code == 200, recovered.text
     db_session.refresh(run)
     assert run.outputs_json["langgraph_intake"] == expected
-    assert recovered.json()["values"]["intake"]["owned_url_source"] == expected["owned_url_source"]
+    assert recovered.json()["values"]["intake"] == state["values"]["intake"]

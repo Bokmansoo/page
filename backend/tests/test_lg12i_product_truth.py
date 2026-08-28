@@ -232,22 +232,20 @@ def test_truth_conflicts_stay_unresolved_across_graph_rebuild(
     state = response.json()
     assert state["current_stage"] == "seller_confirmation"
     assert state["values"]["intake"]["next_action"] == "seller_confirmation"
-    conflict = state["values"]["intake"]["product_truth"]["conflict_facts"][0]
-    assert conflict["resolution_status"] == "unresolved"
-    assert "resolved" not in conflict
+    assert state["values"]["intake"]["product_truth"]["conflict_count"] == 1
 
     persisted_run = db_session.query(AgentRun).filter_by(id=state["run_id"]).one()
-    expected = deepcopy(persisted_run.outputs_json["langgraph_intake"])
+    expected = deepcopy(state["values"]["intake"])
     persisted_run.outputs_json = {
         key: value for key, value in persisted_run.outputs_json.items()
         if key != "langgraph_intake"
     }
     persisted_run.status = "running"
     db_session.commit()
-    recovered = client.post(f"/api/v1/graph-runs/{persisted_run.id}/resume", headers=auth_headers)
+    recovered = client.get(f"/api/v1/graph-runs/{persisted_run.id}", headers=auth_headers)
     assert recovered.status_code == 200, recovered.text
     assert recovered.json()["values"]["intake"] == expected
-    assert recovered.json()["values"]["intake"]["product_truth"]["conflict_facts"][0]["resolution_status"] == "unresolved"
+    assert recovered.json()["values"]["intake"]["product_truth"]["conflict_count"] == 1
     assert db_session.query(ImageGenerationJobRecord).count() == 0
     assert db_session.query(ImageGenerationOutboxRecord).count() == 0
     assert db_session.query(ImageGenerationCostApprovalRecord).count() == 0
@@ -479,7 +477,7 @@ def test_truth_source_integrity_block_is_projected_and_rebuilt(
     payload = response.json()
     assert payload["current_stage"] == "truth_blocked_source_integrity"
     assert payload["values"]["intake"]["truth"]["status"] == "blocked_source_integrity"
-    assert "source artifact ID/version/hash" in payload["values"]["intake"]["truth"]["reason"]
+    assert payload["values"]["intake"]["truth"]["reason_code"] == "SOURCE_INTEGRITY_BLOCKED"
     assert db_session.query(ProductTruthVersion).count() == 0
 
     persisted_run = db_session.query(AgentRun).filter_by(id=payload["run_id"]).one()

@@ -737,7 +737,9 @@ class AgentRunEventJournal:
             if event_type == "seller_choice_submitted":
                 allowed_decisions = {"approve", "reject", "refresh", "fallback", "wait"}
                 if payload["stage"] == "image_review":
-                    allowed_decisions.add("upload")
+                    allowed_decisions.update({"regenerate", "upload"})
+                if payload["stage"] == "seller_confirmation":
+                    allowed_decisions.add("submit")
                 if lifecycle["decision"] not in allowed_decisions:
                     raise ValueError("Seller review decision is not allowlisted.")
         if "identity" in payload:
@@ -1583,6 +1585,38 @@ def _public_string_list(value: Any, *, limit: int = 20) -> list[str]:
     return [item for item in (_public_id(raw) for raw in list(value or [])[:limit]) if item]
 
 
+def _public_count(value: Any) -> int:
+    return min(len(value), 1000) if isinstance(value, (list, tuple)) else 0
+
+
+def _public_rights(value: Any) -> dict[str, Any]:
+    source = dict(value or {}) if isinstance(value, dict) else {}
+    return {
+        key: item
+        for key in ("confirmation_state", "final_use_status")
+        if (item := _public_id(source.get(key)))
+    }
+
+
+def _public_product_truth(value: Any) -> dict[str, Any]:
+    source = dict(value or {}) if isinstance(value, dict) else {}
+    if not source:
+        return {}
+    result = {
+        "truth_version": _public_ref(source.get("truth_version")),
+        "fact_count": _public_count(source.get("fact_candidates")),
+        "unknown_count": _public_count(source.get("unknown_facts")),
+        "conflict_count": _public_count(source.get("conflict_facts")),
+        "prohibited_inference_count": _public_count(source.get("prohibited_inferences")),
+        "observation_risk_count": _public_count(source.get("observation_risks")),
+    }
+    if schema_version := _public_id(source.get("schema_version")):
+        result["schema_version"] = schema_version
+    if isinstance(source.get("requires_review"), bool):
+        result["requires_review"] = source["requires_review"]
+    return result
+
+
 def _public_cost_plan(value: Any) -> dict[str, Any]:
     source = dict(value or {}) if isinstance(value, dict) else {}
     result: dict[str, Any] = {}
@@ -1681,6 +1715,70 @@ def _public_intake(value: Any, pending_confirmation: Any) -> dict[str, Any]:
         if item:
             result[key] = item
     result["target_channels"] = _public_string_list(source.get("target_channels") or envelope.get("target_channels"), limit=4)
+    if truth := _public_product_truth(source.get("product_truth")):
+        result["product_truth"] = truth
+    blocked_truth = dict(source.get("truth") or {}) if isinstance(source.get("truth"), dict) else {}
+    if status := _public_id(blocked_truth.get("status")):
+        result["truth"] = {"status": status, "reason_code": "SOURCE_INTEGRITY_BLOCKED"}
+
+    mode = result.get("input_mode")
+    if mode == "manual" and isinstance(source.get("manual_source"), dict):
+        manual = dict(source["manual_source"])
+        public_manual = {
+            "source_snapshot": _public_ref(manual.get("source_snapshot")),
+            "manual_artifact_ref": _public_ref(manual.get("manual_artifact_ref")),
+            "fact_count": _public_count(manual.get("fact_candidates")),
+            "unknown_count": _public_count(manual.get("unknown_candidates")),
+            "conflict_count": _public_count(manual.get("conflict_candidates")),
+            "creative_direction_count": _public_count(manual.get("creative_directions")),
+            "rights": _public_rights(manual.get("rights")),
+        }
+        if schema_version := _public_id(manual.get("schema_version")):
+            public_manual["schema_version"] = schema_version
+        result["manual_source"] = public_manual
+    elif mode == "owned_product_url":
+        if isinstance(source.get("owned_url_source"), dict):
+            owned = dict(source["owned_url_source"])
+            public_owned = {
+                "source_snapshot": _public_ref(owned.get("source_snapshot")),
+                "capture_request_ref": _public_ref(owned.get("capture_request_ref")),
+                "capture_artifact_ref": _public_ref(owned.get("capture_artifact_ref")),
+                "image_asset_count": _public_count(owned.get("image_asset_refs")),
+                "rights": _public_rights(owned.get("rights")),
+            }
+            if schema_version := _public_id(owned.get("schema_version")):
+                public_owned["schema_version"] = schema_version
+            result["owned_url_source"] = public_owned
+        elif isinstance(source.get("owned_url_capture"), dict):
+            capture = dict(source["owned_url_capture"])
+            public_capture = {"capture_request_count": _public_count(capture.get("capture_request_refs"))}
+            if status := _public_id(capture.get("capture_status")):
+                public_capture["capture_status"] = status
+            if isinstance(capture.get("recoverable"), bool):
+                public_capture["recoverable"] = capture["recoverable"]
+            result["owned_url_capture"] = public_capture
+    elif mode == "photo_only":
+        photo = source.get("photo_observation") or source.get("photo_source")
+        if isinstance(photo, dict):
+            photo = dict(photo)
+            public_photo = {
+                "source_snapshot": _public_ref(photo.get("source_snapshot")),
+                "photo_observation_artifact_ref": _public_ref(photo.get("photo_observation_artifact_ref")),
+                "source_asset_count": _public_count(photo.get("source_asset_refs")),
+                "observation_count": _public_count(photo.get("observations")),
+                "unknown_count": _public_count(photo.get("unknown_candidates")),
+                "conflict_count": _public_count(photo.get("conflict_candidates")),
+                "prohibited_inference_count": _public_count(photo.get("prohibited_inference_fields")),
+                "rights": _public_rights(photo.get("rights")),
+            }
+            for key in ("observation_status", "failure_reason"):
+                if item := _public_id(photo.get(key)):
+                    public_photo[key] = item
+            if schema_version := _public_id(photo.get("schema_version")):
+                public_photo["schema_version"] = schema_version
+            if isinstance(photo.get("recoverable"), bool):
+                public_photo["recoverable"] = photo["recoverable"]
+            result["photo_observation"] = public_photo
     for key, ref_key in (("creative_brief", "brief_version"), ("commerce_creative_master", "master_version")):
         nested = dict(source.get(key) or {}) if isinstance(source.get(key), dict) else {}
         result[key] = {ref_key: _public_ref(nested.get(ref_key))}
@@ -1692,11 +1790,33 @@ def _public_intake(value: Any, pending_confirmation: Any) -> dict[str, Any]:
             safe_plan[key] = plan[key]
     if digest := _public_hash(plan.get("resume_request_hash")):
         safe_plan["resume_request_hash"] = digest
+    if isinstance(plan.get("confirmation_cycle"), int) and plan["confirmation_cycle"] > 0:
+        safe_plan["confirmation_cycle"] = plan["confirmation_cycle"]
     safe_plan["confirmation_version"] = _public_ref(plan.get("confirmation_version"))
     clarifications: list[dict[str, Any]] = []
     for raw in list(plan.get("clarifications") or [])[:3]:
         row = dict(raw or {}) if isinstance(raw, dict) else {}
         clarification = {key: item for key in ("clarification_id", "field_id") if (item := _public_id(row.get(key)))}
+        for key in ("type", "question_code", "allowed_answer_type"):
+            if item := _public_id(row.get(key)):
+                clarification[key] = item
+        if digest := _public_hash(row.get("clarification_hash")):
+            clarification["clarification_hash"] = digest
+        if isinstance(row.get("priority"), int) and row["priority"] >= 0:
+            clarification["priority"] = row["priority"]
+        if isinstance(row.get("required"), bool):
+            clarification["required"] = row["required"]
+        options: list[dict[str, str]] = []
+        for index, raw_option in enumerate(list(row.get("allowed_options") or [])[:10]):
+            option = dict(raw_option or {}) if isinstance(raw_option, dict) else {}
+            if observation_id := _public_id(option.get("observation_id")):
+                options.append({
+                    "id": observation_id,
+                    "observation_id": observation_id,
+                    "label": f"관찰 {index + 1}",
+                })
+        if options:
+            clarification["allowed_options"] = options
         if clarification:
             clarifications.append(clarification)
     safe_plan["clarifications"] = clarifications
@@ -2491,6 +2611,13 @@ class LangGraphRunService:
     def _compiled_graph(checkpointer: Any, *, run: AgentRun | None = None) -> Any:
         """Use the migrated graph for the explicit LangGraph rollout."""
         if run is not None and run.mode == "lg12i_intake":
+            if str(run.current_stage or "") in {
+                "sales_strategy", "page_planning", "copywriting", "visual_planning",
+                "planning_review", "generation_pending", "prepare_image_jobs", "dispatch_image_jobs",
+                "provider_wait", "collect_image_results", "validate_generated_images", "image_review",
+                "page_assembly", "canonical_renderer", "quality_evaluation", "quality_promotion_ready",
+            } or bool((run.input_snapshot or {}).get("canonical_handoff")):
+                return build_lg10_compiled_graph(checkpointer=checkpointer, entry_node="sales_strategy")
             return build_lg12i_intake_compiled_graph(checkpointer=checkpointer)
         if run is not None and run.mode == "lg11_edit":
             return build_lg11_compiled_graph(checkpointer=checkpointer)
@@ -2500,6 +2627,55 @@ class LangGraphRunService:
         if build_lg5_compiled_graph is not _UNPATCHED_LG5_GRAPH_BUILDER:
             builder = build_lg5_compiled_graph
         return builder(checkpointer=checkpointer)
+
+    @classmethod
+    def _handoff_master_to_planning(cls, run: AgentRun, db: Session) -> AgentRun:
+        """Continue one frozen LG-12I Master on the existing LG-10 graph."""
+
+        if run.mode != "lg12i_intake" or run.current_stage != "master_ready":
+            return run
+        intake = dict((run.outputs_json or {}).get("langgraph_intake") or {})
+        master_ref = dict(dict(intake.get("commerce_creative_master") or {}).get("master_version") or {})
+        brief_ref = dict(dict(intake.get("creative_brief") or {}).get("brief_version") or {})
+        fact_ref = dict(dict(intake.get("creative_brief") or {}).get("approved_fact_snapshot") or {})
+        if not master_ref.get("id") or not brief_ref.get("id") or not fact_ref.get("id"):
+            raise GraphRunResumeUnavailable("LG-12I Master handoff requires frozen Brief and fact references.")
+        from src.db.models import CommerceCreativeMasterVersion, ProductCreativeBriefVersion
+
+        master = db.query(CommerceCreativeMasterVersion).filter_by(
+            id=master_ref.get("id"), workspace_id=run.workspace_id, project_id=run.project_id,
+            creator_run_id=run.id,
+        ).one_or_none()
+        brief = db.query(ProductCreativeBriefVersion).filter_by(
+            id=brief_ref.get("id"), project_id=run.project_id, run_id=run.id,
+        ).one_or_none()
+        if master is None or brief is None:
+            raise GraphRunResumeUnavailable("LG-12I Master handoff references are not persisted for this run.")
+        snapshot = dict(run.input_snapshot or {})
+        snapshot.update({
+            "approved_fact_snapshot_id": fact_ref.get("id"),
+            "approved_fact_snapshot_hash": fact_ref.get("hash"),
+            "creative_brief_snapshot": {
+                "id": brief.id, "version": brief.version, "output_hash": brief.output_hash,
+            },
+            "canonical_handoff": {
+                "master_id": master.id, "master_version": master.version,
+                "master_hash": master.canonical_hash,
+            },
+        })
+        run.input_snapshot = snapshot
+        run.status = "running"
+        run.current_stage = "sales_strategy"
+        db.add(run)
+        db.commit()
+        initial = build_lg1_graph_input(
+            run_id=run.id, workspace_id=run.workspace_id, project_id=run.project_id,
+            mode=run.mode, input_snapshot=snapshot,
+        )
+        initial["intake"] = intake
+        return cls._execute(
+            run, db, initial_state=initial, rebuild_projection=False,
+        )
 
     @classmethod
     def _mark_execution_failed(
@@ -3240,8 +3416,8 @@ class LangGraphRunService:
             stored = dict((existing.input_snapshot or {}).get("unified_product_intake") or {})
             if stored.get("input_hash") == base_envelope["input_hash"]:
                 if existing.status == "created":
-                    return cls.start(existing.id, workspace_id, db)
-                return existing
+                    existing = cls.start(existing.id, workspace_id, db)
+                return cls._handoff_master_to_planning(existing, db)
 
         run_id = str(uuid.uuid4())
         envelope = {
@@ -3264,7 +3440,7 @@ class LangGraphRunService:
         )
         db.add(run)
         db.commit()
-        return cls.start(run.id, workspace_id, db)
+        return cls._handoff_master_to_planning(cls.start(run.id, workspace_id, db), db)
 
     @classmethod
     def get_state(cls, run_id: str, workspace_id: str, db: Session) -> GraphRunStateView:
@@ -3392,6 +3568,8 @@ class LangGraphRunService:
             brief = dict(intake.get("creative_brief") or {})
             if run.status == "completed" and run.current_stage == "master_ready":
                 return run
+            if run.status == "awaiting_review" and run.current_stage == "planning_review":
+                return run
             if (
                 run.status != "completed"
                 or run.current_stage != "creative_brief_blocked"
@@ -3427,13 +3605,13 @@ class LangGraphRunService:
                     return run
                 raise GraphRunResumeUnavailable("Could not claim the LG-12I prerequisite continuation.")
             run = cls._find_run(run_id, workspace_id, db)
-            return cls._execute(
+            return cls._handoff_master_to_planning(cls._execute(
                 run,
                 db,
                 initial_state=None,
                 rebuild_projection=True,
                 continuation_after="seller_confirmation",
-            )
+            ), db)
         if recovery_only:
             if resume_payload is not None:
                 raise GraphRunReviewRequired("Checkpoint recovery does not accept a seller response.")
@@ -3457,7 +3635,7 @@ class LangGraphRunService:
                     db, run=run, actor_id=actor_id, response=seller_confirmation_response,
                 ):
                     raise GraphRunReviewRequired("Seller confirmation response does not match a persisted confirmation cycle.")
-            return run
+            return cls._handoff_master_to_planning(run, db)
         recovered_from_running = run.status == "running"
         if recovered_from_running:
             run = cls._recover_running_projection(run, db)
@@ -3557,13 +3735,13 @@ class LangGraphRunService:
         if lifecycle_events:
             run.last_applied_event_sequence = max(run.last_applied_event_sequence, *(event.sequence for event in lifecycle_events))
         db.commit()
-        return cls._execute(
+        return cls._handoff_master_to_planning(cls._execute(
             run,
             db,
             initial_state=None,
             rebuild_projection=True,
             resume_payload=resume_payload,
-        )
+        ), db)
 
     @classmethod
     def resume_provider_wait(cls, run_id: str) -> AgentRun | None:

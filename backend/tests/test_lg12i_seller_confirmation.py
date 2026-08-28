@@ -322,7 +322,7 @@ def test_confirmation_successors_require_exact_latest_parent_and_actor(db_sessio
         answers=[
             {"clarification_id": rights["clarification_id"], "decision": "confirm"},
             {"clarification_id": conflict["clarification_id"], "decision": "skip"},
-            {"clarification_id": unknown["clarification_id"], "decision": "skip"},
+            {"clarification_id": unknown["clarification_id"], "decision": "confirm", "answer_value": "seller value"},
         ],
     )
     cycle_two = {
@@ -356,6 +356,8 @@ def test_confirmation_successors_require_exact_latest_parent_and_actor(db_sessio
     assert (second_row.parent_version_id, second_row.parent_version, second_row.parent_version_hash) == (
         first_row.id, first_row.version, first_row.canonical_hash
     )
+    assert second_row.confirmed_fact_refs_json == first_row.confirmed_fact_refs_json
+    assert second_row.rights_confirmations_json == first_row.rights_confirmations_json
 
     stale = deepcopy(cycle_two)
     stale["confirmation_cycle"] = 3
@@ -630,7 +632,7 @@ def test_public_langgraph_resume_persists_one_bounded_confirmation_cycle(
     # the durable SQL projection is written.  The public resume endpoint is
     # the recovery entrypoint and must restore the exact pending cycle.
     persisted = db_session.query(AgentRun).filter_by(id=state["run_id"]).one()
-    expected_intake = deepcopy(persisted.outputs_json["langgraph_intake"])
+    expected_intake = deepcopy(resumed.json()["values"]["intake"])
     persisted.outputs_json = {
         key: value for key, value in persisted.outputs_json.items()
         if key not in {"langgraph_intake", "langgraph_review"}

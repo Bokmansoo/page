@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     UNIT_TEST_DATABASE_URL: str | None = None
     E2E_DATABASE_URL: str | None = None
     SELLFORM_ALLOW_TEST_DATABASE: bool = False
+    # Local URL capture is available only to explicitly guarded test runs.
+    SELLFORM_ALLOW_LOCAL_URL_FIXTURE: bool = False
     UPLOAD_DIR: str = "./uploads"
     MAX_UPLOAD_SIZE_MB: int = 10
 

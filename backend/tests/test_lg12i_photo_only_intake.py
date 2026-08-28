@@ -7,8 +7,17 @@ from contextlib import contextmanager
 
 import pytest
 
-from src.db.models import Asset, ImageGenerationCostApprovalRecord, ImageGenerationJobRecord, ImageGenerationOutboxRecord, ProductSourceSnapshotVersion
+from src.db.models import (
+    Asset,
+    CommerceCreativeMasterVersion,
+    ImageGenerationCostApprovalRecord,
+    ImageGenerationJobRecord,
+    ImageGenerationOutboxRecord,
+    ProductCreativeBriefVersion,
+    ProductSourceSnapshotVersion,
+)
 from src.services.image_asset_inspector import inspect_asset
+from src.services.brand_kit_service import create_kit, create_version
 from src.services.product_intake_version_service import (
     PHOTO_ONLY_SOURCE_CANDIDATES_SCHEMA_VERSION,
     PhotoOnlyIntakeContractError,
@@ -94,6 +103,7 @@ def test_photo_only_creates_source_observations_not_facts_and_reuses_same_snapsh
     assert "raw_body" not in repr(result)
     assert "FAN-PRO visible label" in repr(result)  # bounded visible OCR observation, not a raw OCR document.
     assert {item["field_id"] for item in result["unknown_candidates"]} >= {"exact_weight", "battery_capacity"}
+    assert result["rights"]["confirmation_state"] == "seller_owned"
     assert result["rights"]["final_use_status"] == "not_approved"
     assert db_session.query(ImageGenerationJobRecord).count() == before_jobs
     assert db_session.query(ImageGenerationOutboxRecord).count() == 0
@@ -220,6 +230,65 @@ def test_photo_only_observation_failure_is_a_recoverable_graph_state(
     assert state["values"]["intake"]["next_action"] == "task_12i_manual_or_owned_url_fallback"
 
 
+def test_photo_only_rejected_prohibited_inferences_handoff_to_planning(
+    client, auth_headers, db_session, tmp_path, lg12i_runtime, monkeypatch
+):
+    source_run = _create_run(client, auth_headers, db_session, tmp_path)
+    asset = db_session.query(Asset).filter_by(project_id=source_run.project_id, asset_role="product_main").one()
+    monkeypatch.setattr(
+        "src.services.product_intake_version_service.extract_ocr_blocks",
+        lambda _asset: ([], "ocr_no_text_detected"),
+    )
+    kit = create_kit(db_session, source_run.workspace_id, source_run.created_by, "Photo handoff test kit")
+    create_version(
+        db_session, source_run.workspace_id, source_run.created_by, kit.id,
+        {"color_tokens": {"accent": "#0f766e"}, "typography": {"body_font": "system-ui"}},
+        scope="project", project_id=source_run.project_id, activate=True,
+    )
+    db_session.commit()
+    endpoint = f"/api/v1/graph-runs/projects/{source_run.project_id}/unified-intake"
+    response = client.post(
+        endpoint,
+        headers=auth_headers,
+        json={
+            "input_mode": "photo_only", "source_payload_refs": [_asset_ref(db_session, asset)],
+            "requested_generation_mode": "quick", "target_channels": ["smartstore"],
+        },
+    )
+    assert response.status_code == 201, response.text
+    state = response.json()
+    run_id = state["run_id"]
+    before = (
+        db_session.query(ProductCreativeBriefVersion).filter_by(run_id=run_id).count(),
+        db_session.query(CommerceCreativeMasterVersion).filter_by(creator_run_id=run_id).count(),
+    )
+    for _ in range(5):
+        if state["current_stage"] != "seller_confirmation":
+            break
+        plan = state["values"]["intake"]["seller_confirmation"]
+        state = client.post(
+            f"/api/v1/graph-runs/{run_id}/resume",
+            headers=auth_headers,
+            json={
+                "thread_id": state["thread_id"],
+                "response": {
+                    "schema_version": "lg12i-v1", "review_stage": "seller_confirmation",
+                    "decision": "submit", "confirmation_request_hash": plan["resume_request_hash"],
+                    "confirmation_answers": [
+                        {"clarification_id": item["clarification_id"], "decision": "reject"}
+                        for item in plan["clarifications"]
+                    ],
+                },
+            },
+        )
+        assert state.status_code == 200, state.text
+        state = state.json()
+    assert state["current_stage"] == "planning_review"
+    assert state["status"] == "awaiting_review"
+    assert db_session.query(ProductCreativeBriefVersion).filter_by(run_id=run_id).count() == before[0] + 1
+    assert db_session.query(CommerceCreativeMasterVersion).filter_by(creator_run_id=run_id).count() == before[1] + 2
+
+
 @pytest.mark.parametrize(
     ("ocr_status", "expected_observation_status", "expected_stage", "role"),
     [
@@ -256,7 +325,7 @@ def test_photo_only_ocr_structured_statuses_use_explicit_graph_contract(
         assert observation["failure_reason"] == ocr_status
         assert observation["photo_observation_artifact_ref"] is not None
     else:
-        source = state["values"]["intake"]["photo_source"]
+        source = state["values"]["intake"]["photo_observation"]
         assert source["observation_status"] == expected_observation_status
         assert state["values"]["intake"]["product_truth"]["truth_version"]["id"]
 
@@ -285,7 +354,7 @@ def test_photo_only_ocr_exception_is_recoverable_and_preserves_observation_artif
     assert observation["failure_reason"] == "ocr_failed"
     assert observation["photo_observation_artifact_ref"] is not None
     persisted_run = db_session.query(type(source_run)).filter_by(id=response.json()["run_id"]).one()
-    expected = deepcopy(persisted_run.outputs_json["langgraph_intake"])
+    expected = deepcopy(response.json()["values"]["intake"])
     persisted_run.outputs_json = {
         key: value for key, value in persisted_run.outputs_json.items() if key != "langgraph_intake"
     }

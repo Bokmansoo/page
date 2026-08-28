@@ -331,9 +331,9 @@ def test_public_brand_kit_continuation_reuses_the_same_frozen_intake_lineage(
         json={"thread_id": state["thread_id"], "mode": "continue"},
     )
     assert continued.status_code == 200, continued.text
-    assert continued.json()["current_stage"] == "master_ready"
+    assert continued.json()["current_stage"] == "planning_review"
     assert _immutable_counts(db_session)[:3] == source_truth_confirmation
-    assert _immutable_counts(db_session)[3:] == (1, 1)
+    assert _immutable_counts(db_session)[3:] == (1, 2)
 
     # A completed continuation is read/idempotent; the original confirmation
     # replay also remains a no-op after Master has been frozen.
@@ -344,4 +344,4 @@ def test_public_brand_kit_continuation_reuses_the_same_frozen_intake_lineage(
     assert again.status_code == 200, again.text
     replay = client.post(f"/api/v1/graph-runs/{run.id}/resume", headers=auth_headers, json=response)
     assert replay.status_code == 200, replay.text
-    assert _immutable_counts(db_session) == (*source_truth_confirmation, 1, 1)
+    assert _immutable_counts(db_session) == (*source_truth_confirmation, 1, 2)

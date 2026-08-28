@@ -171,10 +171,21 @@ def _page_snapshot_reference(version: DetailPageVersion) -> dict[str, str]:
     return {"id": str(version.id), "version": schema_version, "hash": snapshot_hash, "type": QUALITY_REPORT_TARGET_ARTIFACT_TYPE}
 
 
+def _frozen_asset_manifest(canonical_input: Mapping[str, Any]) -> dict[str, Any]:
+    manifest = dict(canonical_input.get("approved_asset_manifest") or {})
+    image_contract = dict(canonical_input.get("image_generation_contract") or {})
+    if not manifest and (
+        int(image_contract.get("required_scene_count") or 0) == 0
+        and image_contract.get("completion_basis") == "no_required_image_scenes"
+    ):
+        manifest = dict(canonical_input.get("page_asset_manifest") or {})
+    return manifest
+
+
 def _frozen_manifest_hash(version: DetailPageVersion) -> str:
     snapshot = dict(version.sections_json or {})
     canonical_input = dict(dict(snapshot.get("lg10") or {}).get("canonical_page_assembly_input") or {})
-    manifest = dict(canonical_input.get("approved_asset_manifest") or {})
+    manifest = _frozen_asset_manifest(canonical_input)
     manifest_hash = str(manifest.get("manifest_hash") or "")
     manifest_body = deepcopy(manifest)
     manifest_body.pop("manifest_hash", None)
@@ -408,7 +419,7 @@ def _frozen_assembly_input(page: DetailPageVersion) -> tuple[dict[str, Any], dic
     canonical = deepcopy(dict(dict(snapshot.get("lg10") or {}).get("canonical_page_assembly_input") or {}))
     if not canonical:
         raise QualityAssessmentContractError("Frozen DetailPageVersion is missing its canonical assembly input.")
-    manifest = deepcopy(dict(canonical.get("approved_asset_manifest") or {}))
+    manifest = deepcopy(_frozen_asset_manifest(canonical))
     body = deepcopy(manifest); manifest_hash = str(body.pop("manifest_hash", "") or "")
     if not manifest_hash or canonical_hash(body) != manifest_hash:
         raise QualityAssessmentContractError("Frozen DetailPageVersion approved asset manifest is tampered.")
@@ -2576,7 +2587,7 @@ def evaluate_factual_rights_policy_domain(db: Session, *, report_payload: Mappin
                     message="Frozen copy repeats a prohibited source inference.", remediation="Remove the unsupported inference.",
                 ))
 
-    manifest = dict(canonical.get("approved_asset_manifest") or {})
+    manifest = _frozen_asset_manifest(canonical)
     manifest_assets = {str(item.get("asset_id") or ""): dict(item) for item in _as_mappings(manifest.get("assets"))}
     used_assets: dict[str, dict[str, Any]] = {}
     for section in _frozen_sections(snapshot, canonical):
@@ -2724,7 +2735,7 @@ _VISUAL_IDENTITY_FIELDS = {
     "product_identity": {"product_identity", "product_name", "model", "model_name", "sku"},
     "variant": {"variant", "product_variant"},
     "color": {"color", "colour", "color_option"},
-    "material_finish": {"material", "material_grade", "material_type", "finish"},
+    "material_finish": {"material", "material_type", "finish"},
     "components": {"component", "components", "component_count", "included_components"},
 }
 
@@ -2967,6 +2978,8 @@ def _bounded_generation_validation(value: Any) -> dict[str, Any]:
         "quality_warnings": sorted({str(item).upper() for item in list(result.get("warnings") or []) if isinstance(item, str)}),
         "risk_codes": sorted({str(item).lower() for item in list(result.get("risk_codes") or []) if isinstance(item, str)}),
         "safe_crop_status": str(dict(details.get("crop") or {}).get("safe_crop_status") or "").lower(),
+        "seller_identity_confirmed": result.get("seller_identity_confirmed") is True,
+        "manual_upload_confirmed": result.get("manual_upload_confirmed") is True,
     }
 
 
@@ -2985,7 +2998,7 @@ def _image_asset_contexts(
     master_assets = _require_master_asset_manifest_parity(
         db, source=source, confirmation=confirmation, master=master,
     )
-    manifest = dict(canonical.get("approved_asset_manifest") or {})
+    manifest = _frozen_asset_manifest(canonical)
     manifest_assets = {
         str(item.get("asset_id") or item.get("id") or ""): dict(item)
         for item in _as_mappings(manifest.get("assets"))
@@ -3137,6 +3150,19 @@ def evaluate_image_identity_quality_domain(db: Session, *, report_payload: Mappi
         inspection = dict(context["inspection"])
         frozen_evidence = dict(context["frozen_evidence"])
         frozen_metadata = dict(frozen_evidence.get("metadata") or {})
+        job = context["job"]
+        generation = frozen_evidence.get("generation")
+        generation_validation = (
+            dict(generation.get("validation") or {}) if isinstance(generation, Mapping) else {}
+        )
+        manual_identity_confirmed = (
+            job is not None
+            and str(job.provider or "").lower() == "manual_upload"
+            and generation_validation.get("seller_identity_confirmed") is True
+            and generation_validation.get("manual_upload_confirmed") is True
+            and str(asset.source_type or "").lower() in SELLER_OWNED_SOURCE_TYPES
+            and resolved_asset_usage_status(asset) == "seller_owned"
+        )
         if inspection.get("error"):
             findings.append(_image_finding(
                 rule_id="image.decode", code="image_decode_or_format_failure", severity="critical", target_refs=targets,
@@ -3185,7 +3211,7 @@ def evaluate_image_identity_quality_domain(db: Session, *, report_payload: Mappi
                 message="Frozen output asset has a recorded product-identity drift.",
                 remediation="Replace it through the existing LG-9 identity review and approved manifest path.",
             ))
-        elif str(frozen_metadata.get("identity_status") or "") == "needs_review":
+        elif str(frozen_metadata.get("identity_status") or "") == "needs_review" and not manual_identity_confirmed:
             findings.append(_image_finding(
                 rule_id="image.product_identity", code="product_identity_needs_review", severity="major", target_refs=targets,
                 evidence_refs=evidence, expected="sufficient product identity evidence", observed="needs_review",
@@ -3202,6 +3228,8 @@ def evaluate_image_identity_quality_domain(db: Session, *, report_payload: Mappi
             "components": ("product_components_mismatch", "major", "visual components"),
         }
         for bucket, expected_value in expected_identity.items():
+            if manual_identity_confirmed:
+                break
             observed_value = _frozen_identity_value(frozen_identity, bucket)
             code, severity, label = direct_specs[bucket]
             if observed_value is None:
@@ -3219,9 +3247,7 @@ def evaluate_image_identity_quality_domain(db: Session, *, report_payload: Mappi
                     message=f"Frozen asset {label} does not match the persisted Truth/SellerConfirmation identity.",
                     remediation="Replace the asset through the approved review path; do not relabel mutable Asset metadata.",
                 ))
-        job = context["job"]
         job_evidence = list(evidence)
-        generation = frozen_evidence.get("generation")
         if job is not None and isinstance(generation, Mapping):
             job_evidence.append(_qa_typed_reference(
                 {"id": str(generation["record_id"]), "version": 1, "hash": str(generation["validation_result_hash"])},
