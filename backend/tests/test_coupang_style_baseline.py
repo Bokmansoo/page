@@ -22,7 +22,13 @@ def _asset(project_id, asset_id, source_type="self_shot", usage_status="seller_o
 
 
 def test_baseline_catalogue_is_v2_three_product_pack(client):
-    response = client.get("/api/v1/commerce-story-baselines")
+    response = client.get(
+        "/api/v1/commerce-story-baselines",
+        headers={
+            "X-Mock-User-Id": "baseline-user",
+            "X-Mock-Workspace-Id": "baseline-workspace",
+        },
+    )
     assert response.status_code == 200
     assert [product.key for product in list_baseline_products()] == [
         "yl-t02-massage-pillow", "roundlab-birch-moisture-cream", "locknlock-bisfree-container-set"
