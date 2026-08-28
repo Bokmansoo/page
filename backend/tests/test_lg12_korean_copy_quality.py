@@ -99,7 +99,10 @@ def _setup(db, client, headers, tmp_path, *, sections=None, renderer_sections=No
 
 def _evaluate(db, run, master, page, manifest_hash, profile):
     return evaluate_korean_copy_readability_domain(
-        db, report_payload=_report_payload(run, page, manifest_hash, master, profile),
+        db, report_payload=_report_payload(
+            run, page, manifest_hash, master, profile,
+            report_id=f"test-report:{run.id}:{page.id}",
+        ),
     )
 
 

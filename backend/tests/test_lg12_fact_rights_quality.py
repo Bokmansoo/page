@@ -12,6 +12,7 @@ from src.db.models import Asset, DetailPageVersion
 from src.schemas.lg12_quality_report import QualityAssessmentContractError
 from src.services.product_intake_version_service import IntakeVersionContractError, canonical_version_hash
 from src.services.prompt_intelligence_service import canonical_hash
+from src.services.product_identity_validator import LG12_FROZEN_IMAGE_EVIDENCE_SCHEMA_VERSION
 from src.services.quality_assessment_service import (
     FACTUAL_RIGHTS_POLICY_EVALUATOR_VERSION, _confirmed_fact_supports_claim,
     evaluate_factual_rights_policy_domain,
@@ -128,7 +129,10 @@ def _replace_frozen_snapshot(page, mutate):
 
 def _evaluate(db, run, master, page, manifest_hash, profile):
     return evaluate_factual_rights_policy_domain(
-        db, report_payload=_report_payload(run, page, manifest_hash, master, profile),
+        db, report_payload=_report_payload(
+            run, page, manifest_hash, master, profile,
+            report_id=f"test-report:{run.id}:{page.id}",
+        ),
     )
 
 
@@ -294,6 +298,16 @@ def test_final_asset_rights_and_manifest_parity(client, db_session, auth_headers
     else:
         chain = _source_truth_confirmation(db_session, run)
         master = _create_master(db_session, run, chain=chain)
+    evidence_body = {
+        "schema_version": LG12_FROZEN_IMAGE_EVIDENCE_SCHEMA_VERSION,
+        "asset": {"id": asset.id, "version": 1, "hash": digest},
+        "file": {"content_hash": digest, "format": "PNG"},
+        "metadata": {},
+        "generation": None,
+    }
+    manifest_asset["lg12_frozen_image_evidence"] = {
+        **evidence_body, "evidence_hash": canonical_hash(evidence_body),
+    }
     sections = [{"section_id": "hero", "title": "confirmed", "copy_ref": {"fact_ids": ["fact:capacity"]}, "approved_assets": [manifest_asset]}]
     page, manifest_hash = _frozen_page(db_session, run, master, sections=sections, assets=[manifest_asset])
     profile = create_quality_threshold_profile(
