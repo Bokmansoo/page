@@ -1657,9 +1657,14 @@ def _public_generation(value: Any) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key in ("estimated_cost", "actual_cost", "pending_count", "review_count", "required_scene_count", "approved_count"):
         _put_public_number(result, key, source.get(key))
-    for key in ("failed_job_ids", "remaining_required_scene_ids"):
+    for key in (
+        "failed_job_ids",
+        "remaining_required_scene_ids",
+        "approved_generated_asset_ids",
+        "review_generated_asset_ids",
+    ):
         result[key] = _public_string_list(source.get(key))
-    for key in ("image_generation_required", "all_required_scenes_approved", "cost_approved"):
+    for key in ("image_generation_required", "all_required_scenes_approved", "cost_approved", "validation_complete"):
         if isinstance(source.get(key), bool):
             result[key] = source[key]
     for key in ("next_action", "error_code"):
@@ -1677,7 +1682,9 @@ def _public_generation(value: Any) -> dict[str, Any]:
         row = dict(raw or {}) if isinstance(raw, dict) else {}
         job: dict[str, Any] = {}
         for key in ("job_id", "scene_id", "section_id", "role", "status", "output_asset_id", "outbox_status"):
-            if item := _public_id(row.get(key)):
+            if key == "output_asset_id" and key in row:
+                job[key] = _public_id(row.get(key))
+            elif item := _public_id(row.get(key)):
                 job[key] = item
         code = str(row.get("error_code") or "")
         if code:
