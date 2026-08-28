@@ -40,7 +40,7 @@ def test_create_and_list_facts(client, setup_project):
     fact = res.json()
     assert fact["fact_text"] == "???곹뭹??媛濡?湲몄씠??100cm?낅땲??"
     assert fact["source_text"] == "Width 100cm"
-    assert fact["verification_status"] == "unknown"
+    assert fact["verification_status"] == "extracted"
     fact_id = fact["id"]
 
     # 2. List facts
@@ -70,13 +70,13 @@ def test_update_fact_and_verify_history(client, setup_project):
     # 2. Update fact text and status
     update_payload = {
         "fact_text": "???곹뭹???ㅼ젣 ?믪씠??50cm?대ŉ 源딆씠??20cm?낅땲??",
-        "verification_status": "confirmed"
+        "verification_status": "seller_confirmed"
     }
     update_res = client.patch(f"/api/v1/projects/{project_id}/facts/{fact_id}", json=update_payload, headers=headers)
     assert update_res.status_code == 200
     updated_fact = update_res.json()
     assert updated_fact["fact_text"] == "???곹뭹???ㅼ젣 ?믪씠??50cm?대ŉ 源딆씠??20cm?낅땲??"
-    assert updated_fact["verification_status"] == "confirmed"
+    assert updated_fact["verification_status"] == "seller_confirmed"
 
     # 3. Check history log
     history_res = client.get(f"/api/v1/projects/{project_id}/facts/{fact_id}/history", headers=headers)
@@ -84,7 +84,7 @@ def test_update_fact_and_verify_history(client, setup_project):
     history = history_res.json()
     assert len(history) == 1
     assert history[0]["previous_fact_text"] == "???곹뭹???몃줈 湲몄씠??50cm?낅땲??"
-    assert history[0]["previous_verification_status"] == "unknown"
+    assert history[0]["previous_verification_status"] == "extracted"
     assert history[0]["updated_by"] == "user-1"
 
 
