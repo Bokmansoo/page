@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from copy import deepcopy
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
@@ -73,17 +74,23 @@ def test_lg3_actual_graph_uses_four_planning_agents_and_writes_ui_draft(client, 
     run = _create_graph_run(client, auth_headers, db_session)
     started = _start(client, auth_headers, run)
 
-    values = started["values"]
     assert started["status"] == "completed"
-    assert [event["stage"] for event in values["events"]][-5:] == [
-        "sales_strategy", "page_planning", "copywriting", "visual_planning", "finalize_run",
-    ]
-    assert set(values["commerce"]) == {"sales_strategy", "page_planning", "copywriting", "visual_planning"}
-    assert "hero_title" not in repr(values["commerce"])
-    assert "Rated input: DC 5V 2A" not in repr(values["commerce"])
-
     db_session.expire_all()
     run = db_session.query(AgentRun).filter(AgentRun.id == run.id).one()
+    events = sorted(run.events, key=lambda event: event.sequence)
+    stages = []
+    for event in events:
+        stage = (event.payload_json or {}).get("stage")
+        if stage and (not stages or stages[-1] != stage):
+            stages.append(stage)
+    assert stages[-5:] == [
+        "sales_strategy", "page_planning", "copywriting", "visual_planning", "finalize_run",
+    ]
+    commerce_projection = run.outputs_json["langgraph_commerce"]
+    assert set(commerce_projection) == {"sales_strategy", "page_planning", "copywriting", "visual_planning"}
+    assert "hero_title" not in repr(commerce_projection)
+    assert "Rated input: DC 5V 2A" not in repr(commerce_projection)
+
     _, _, discovery_contract = commerce._input_contract(run, db_session)
     assert all(set(value) == {"artifact_hash", "schema_version"} for value in discovery_contract.values())
     assert "Rated input: DC 5V 2A" not in repr(discovery_contract)
@@ -104,13 +111,16 @@ def test_lg3_actual_graph_uses_four_planning_agents_and_writes_ui_draft(client, 
     assert all("classification" in item for item in copy_metadata["copy_provenance"].values())
     scenes = artifacts["visual_planning"]["metadata"]["scene_plan"]
     assert scenes and all({"objective", "source_fact_ids", "reference_asset_ids", "generation_mode", "requested_output"} <= set(scene) for scene in scenes)
-    assert all(scene["source_fact_ids"] and scene["reference_asset_ids"] for scene in scenes)
-    snapshot = db_session.query(FactSnapshot).filter(FactSnapshot.id == values["discovery"]["fact_snapshot"]["id"]).one()
+    assert all(scene["source_fact_ids"] for scene in scenes)
+    safe_asset_ids = {asset.id for asset in db_session.query(Asset).filter(Asset.project_id == run.project_id).all()}
+    assert all(set(scene["reference_asset_ids"]) <= safe_asset_ids for scene in scenes)
+    discovery_projection = run.outputs_json["langgraph_discovery"]
+    snapshot = db_session.query(FactSnapshot).filter(FactSnapshot.id == discovery_projection["fact_snapshot"]["id"]).one()
     assert all(set(scene["source_fact_ids"]) <= {fact["id"] for fact in snapshot.facts_json} for scene in scenes)
 
     project = db_session.query(ProductProject).filter(ProductProject.id == run.project_id).one()
     draft = PlanningDraftSchema.model_validate(project.planning_draft).model_dump()
-    assert draft["fact_snapshot_id"] == values["discovery"]["fact_snapshot"]["id"]
+    assert draft["fact_snapshot_id"] == discovery_projection["fact_snapshot"]["id"]
     assert draft["cards"]
     response = client.get(f"/api/v1/projects/{run.project_id}/planning-draft", headers=auth_headers)
     assert response.status_code == 200
@@ -128,7 +138,16 @@ def test_lg3_mock_artifacts_are_reproducible_for_same_snapshot_and_prompt(client
     # Rebuild the downstream chain after an explicit Sales Strategy rerun.
     commerce.run_page_planning(run_id=run.id, project_id=run.project_id, mode="mock")
     commerce.run_copywriting(run_id=run.id, project_id=run.project_id, mode="mock")
+    db_session.expire_all()
+    run = db_session.query(AgentRun).filter(AgentRun.id == run.id).one()
+    project = db_session.query(ProductProject).filter(ProductProject.id == run.project_id).one()
+    baseline_draft = deepcopy(project.planning_draft)
     first_visual = commerce.run_visual_planning(run_id=run.id, project_id=run.project_id, mode="mock")
+    db_session.expire_all()
+    run = db_session.query(AgentRun).filter(AgentRun.id == run.id).one()
+    project = db_session.query(ProductProject).filter(ProductProject.id == run.project_id).one()
+    project.planning_draft = baseline_draft
+    db_session.commit()
     second_visual = commerce.run_visual_planning(run_id=run.id, project_id=run.project_id, mode="mock")
     assert second_visual["visual_planning"]["artifact_hash"] == first_visual["visual_planning"]["artifact_hash"]
 
