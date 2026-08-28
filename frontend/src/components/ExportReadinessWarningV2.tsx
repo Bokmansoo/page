@@ -22,6 +22,9 @@ const BLOCKER_MESSAGES: Record<string, string> = {
   visual_spec_rows_required: "스펙 표에 필요한 항목이 비어 있습니다.",
   asset_not_eligible: "일부 이미지가 내보내기 조건을 충족하지 않습니다.",
   internal_edit_marker: "AI 수정 표시가 남아 있는 섹션이 있습니다.",
+  seller_action_required: "판매자 확인 항목을 먼저 완료해 주세요.",
+  ai_redesign_required: "AI 리디자인 이미지를 생성하고 검수해 주세요.",
+  hero_visual_required: "첫 화면에 사용할 검수 완료 상품 이미지가 필요합니다.",
 };
 
 function blockerLabel(blocker: Blocker): string {

@@ -2,12 +2,14 @@ import sys
 import os
 import tempfile
 import uuid
+from pathlib import Path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
+from scripts.postgres_test_environment import require_local_postgres_test_url
 from src.app import app
 from src.db.database import Base, get_db
 from src.db.models import User, Workspace, Brand, ProductProject, Asset, ProductPage, PageSection, ProductFact, PageVersion, AuditLog, JobStatus, AiJobLog, ExportJob, PublishedPage, FigmaExportJob, ImageGenerationJobRecord
@@ -18,7 +20,40 @@ from src.config import settings
 settings.OPENAI_API_KEY = None
 settings.GEMINI_API_KEY = None
 settings.ANTHROPIC_API_KEY = None
+# Tests must not inherit a developer's local rollout flag. Individual LG-2/
+# LG-3 fixtures explicitly enable the compiled migration graph they exercise.
+settings.SELLFORM_GRAPH_RUNTIME = "legacy"
+settings.SELLFORM_IMAGE_WORKER_ENABLED = False
 settings.SELLFORM_FIGMA_PLUGIN_TICKET_SECRET = "test-only-figma-plugin-secret-32-chars"
+# Legacy header identities remain available only inside this explicit test
+# fixture; deployed and normal local browser traffic use server sessions.
+settings.SELLFORM_AUTH_MODE = "test"
+settings.SELLFORM_AUTH_ALLOW_TEST_MOCK = True
+
+
+def pytest_addoption(parser):
+    """Keep checked-in LG-12 Golden baselines immutable during ordinary pytest."""
+
+    parser.addoption(
+        "--update-lg12-golden",
+        action="store_true",
+        default=False,
+        help="Explicitly refresh checked-in TASK-12.11 Golden baselines.",
+    )
+
+
+def pytest_sessionstart(session):
+    """Give each Windows test run an isolated, caller-owned ``tmp_path`` root.
+
+    Pytest's default base path is shared by all runs for the user.  A stale
+    directory left by another account or process then makes pytest fail during
+    fixture setup before the test itself can run.  A unique base directory is
+    created by the process running pytest, avoiding both the stale profile
+    directory and concurrent-run cleanup races.
+    """
+    session.config._tmp_path_factory._given_basetemp = Path(tempfile.gettempdir()) / (
+        f"sellform-pytest-{os.getpid()}-{uuid.uuid4().hex}"
+    )
 
 # Setup a clean temporary SQLite database for testing.
 #
@@ -44,6 +79,33 @@ def _configure_test_sqlite_connection(dbapi_connection, _connection_record):
     cursor.close()
 
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+@pytest.fixture(scope="function")
+def postgres_session():
+    """Explicit, guarded PostgreSQL session for persisted integration tests.
+
+    SQLite remains the default for fast unit/schema coverage.  Tests opting
+    into this fixture must provide the local Docker URL and a deliberate allow
+    flag; there is no fallback to ``DATABASE_URL`` or Supabase.
+    """
+
+    url = require_local_postgres_test_url(
+        os.environ.get("TEST_DATABASE_URL"),
+        allow=os.environ.get("SELLFORM_ALLOW_TEST_DATABASE") == "1",
+    )
+    pg_engine = create_engine(url)
+    connection = pg_engine.connect()
+    transaction = connection.begin()
+    session = sessionmaker(autocommit=False, autoflush=False, bind=connection)()
+    try:
+        yield session
+    finally:
+        session.close()
+        if transaction.is_active:
+            transaction.rollback()
+        connection.close()
+        pg_engine.dispose()
 
 
 @pytest.fixture(scope="function")

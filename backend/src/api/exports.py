@@ -9,7 +9,9 @@ from sqlalchemy.orm import Session
 
 from src.api.auth import get_current_user_and_workspace
 from src.db.database import get_db, SessionLocal
-from src.db.models import ProductProject, ProductPage, ExportJob, Asset, User
+from src.db.models import DetailPageVersion, ProductProject, ProductPage, ExportJob, ExportArtifact, Asset, User, WorkspaceMember
+from src.config import settings
+from src.services.auth_service import create_session
 from src.schemas.export_history import ExportHistoryItem, ExportHistoryResponse
 from src.services.compliance_checker import PageComplianceChecker
 from src.services.page_readiness_service import inspect_page_readiness
@@ -17,6 +19,22 @@ from src.services.renderer import PageRendererService
 from src.services.page_finalization_service import (
     FinalPageNotFoundError,
     get_final_page_version,
+)
+from src.services.export_service import (
+    FrozenExportSnapshotError,
+    _LG10_COPYABLE_HTML_ARTIFACT,
+    _LG10_STANDALONE_PACKAGE_ARTIFACT,
+    build_lg10_copyable_html,
+    build_lg10_standalone_export_bundle,
+    parse_lg11_export_artifact_token as _parse_lg11_export_artifact_token,
+    write_lg12_frozen_export_parity_evidence,
+)
+from src.services.page_visual_contract import LG11CanvasSafetyError, ensure_lg11_canvas_safe
+from src.services.channel_export_service import supported_channel_keys
+from src.services.quality_promotion_service import (
+    QualityPromotionGateError,
+    require_current_quality_export_artifact,
+    require_current_quality_promotion,
 )
 
 router = APIRouter(tags=["Exports"])
@@ -60,11 +78,41 @@ class ExportJobResponse(BaseModel):
     class Config:
         from_attributes = True
 
+
+class StandaloneExportRequest(BaseModel):
+    final_version_id: Optional[str] = Field(
+        None,
+        description="The frozen LG-10 DetailPageVersion to package.",
+    )
+    # Legacy LG-10 standalone callers retain the existing smartstore default.
+    # LG-11 checks that the field was explicitly supplied below.
+    channel: Literal["smartstore", "coupang"] = "smartstore"
+
+
+class StandaloneExportResponse(BaseModel):
+    detail_page_version_id: str
+    approved_asset_manifest_hash: Optional[str]
+    copyable_html: str
+    html_download_url: str
+    zip_download_url: str
+    warnings: List[str]
+
+
+@router.get("/export/channel-presets")
+def list_channel_export_presets():
+    """Public, versioned output settings used by the web preview/export UI."""
+    from src.services.channel_export_service import serialize_channel_presets
+    return {"items": serialize_channel_presets()}
+
 # =====================================================================
 # Helper functions
 # =====================================================================
 
 def slugify(text: str) -> str:
+    from src.services.commerce_content_quality_service import export_slug
+    return export_slug(text)
+
+def _legacy_slugify(text: str) -> str:
     import re
     text = text.strip()
     text = re.sub(r'\s+', '-', text)
@@ -89,6 +137,12 @@ def _asset_id_from_download_url(url: str) -> Optional[str]:
     if marker not in url:
         return None
     return url.rstrip("/").split(marker, 1)[1].split("?", 1)[0]
+
+
+def parse_lg11_export_artifact_token(artifact_token: str) -> Optional[Dict[str, str]]:
+    """Compatibility import for the shared production artifact-token parser."""
+
+    return _parse_lg11_export_artifact_token(artifact_token)
 
 
 def _exported_image_asset_for_job(db: Session, job: ExportJob) -> Optional[Asset]:
@@ -136,7 +190,12 @@ def get_project_or_404(db: Session, project_id: str, workspace_id: str) -> Produ
 
 def get_page_or_404(db: Session, project_id: str, workspace_id: str) -> ProductPage:
     get_project_or_404(db, project_id, workspace_id)
-    page = db.query(ProductPage).filter(ProductPage.project_id == project_id).first()
+    page = (
+        db.query(ProductPage)
+        .filter(ProductPage.project_id == project_id)
+        .order_by(ProductPage.created_at.asc(), ProductPage.id.asc())
+        .first()
+    )
     if not page:
         raise HTTPException(status_code=404, detail="Page draft not found for this project")
     return page
@@ -155,6 +214,7 @@ def run_export_task(
     final_version_id: Optional[str] = None,
 ):
     db = SessionLocal()
+    render_session = None
     try:
         # 1. 작업 상태를 rendering으로 업데이트
         job = db.query(ExportJob).filter(ExportJob.id == job_id).first()
@@ -178,20 +238,61 @@ def run_export_task(
             version = get_final_page_version(db, project_id)
 
         # 3. export_service의 run_export 구동
+        project = db.query(ProductProject).filter(ProductProject.id == project_id).first()
+        if project is None:
+            raise QualityPromotionGateError("Export project is unavailable.")
+        require_current_quality_promotion(
+            db, workspace_id=project.workspace_id, project_id=project_id,
+            page_id=version.id, channel=preset_name,
+        )
         from src.services.export_service import capture_next_render_export
         project = db.query(ProductProject).filter(ProductProject.id == project_id).first()
+        export_user = db.get(User, job.created_by)
+        if not project or not export_user or not export_user.is_active:
+            raise HTTPException(status_code=403, detail="Export identity is no longer available")
+        has_workspace_access = project.workspace.owner_id == export_user.id or db.query(WorkspaceMember).filter_by(
+            workspace_id=project.workspace_id,
+            user_id=export_user.id,
+        ).first()
+        if not has_workspace_access:
+            raise HTTPException(status_code=403, detail="Export user no longer has workspace access")
+        # The headless renderer is a different browser process.  Use a
+        # short-lived server session rather than legacy mock identity headers.
+        render_session, render_token, _ = create_session(db, export_user, project.workspace)
         export_res = capture_next_render_export(
             project_id=project_id,
             version_id=version.id,
+            channel=preset_name,
             output_format=output_format,
-            auth_headers={
-                "X-Mock-User-Id": job.created_by,
-                "X-Mock-Workspace-Id": project.workspace_id if project else "",
-            },
+            auth_headers={"Cookie": f"{settings.SELLFORM_SESSION_COOKIE_NAME}={render_token}"},
         )
         
-        long_image_path = export_res["long_vertical_image"]
-        zip_path = export_res["section_images_zip"]
+        source_long_image_path = export_res["long_vertical_image"]
+        section_zip_path = export_res["section_images_zip"]
+        from src.services.channel_export_service import create_channel_export_bundle
+        project = db.query(ProductProject).filter(ProductProject.id == project_id).first()
+        project_name = project.name if project and project.name else "sellform-detail-page"
+        project_slug = slugify(project_name)
+        try:
+            channel_bundle = create_channel_export_bundle(
+                master_path=source_long_image_path,
+                output_dir=os.path.dirname(source_long_image_path),
+                project_slug=project_slug,
+                preset_key=preset_name,
+                output_format=output_format,
+                section_heights=export_res.get("section_heights", []),
+                section_images_zip=section_zip_path,
+                generation_plan=(version.sections_json or {}).get("ux2e0_generation_plan"),
+            )
+            long_image_path = channel_bundle["long_image"]
+            zip_path = channel_bundle["package_zip"]
+        except Exception as exc:
+            # Unit-render doubles may return marker bytes rather than a real
+            # image. Production exports always have a valid Playwright image;
+            # retain the canonical artifact instead of masking the real result.
+            logger.warning("Channel packaging skipped: %s", exc)
+            long_image_path = source_long_image_path
+            zip_path = section_zip_path
 
         # 4. ZIP 파일을 Asset 모델로 영구 등록
         zip_size = os.path.getsize(zip_path)
@@ -200,6 +301,7 @@ def run_export_task(
         zip_asset = Asset(
             project_id=project_id,
             source_type="exported_zip",
+            usage_status="blocked",
             filename=zip_filename,
             file_path=zip_path,
             mime_type="application/zip",
@@ -210,13 +312,12 @@ def run_export_task(
 
         # 5. 긴 세로 이미지도 Asset 모델로 영구 등록 및 output_images 지정
         long_size = os.path.getsize(long_image_path)
-        project_name = project.name if project and project.name else "sellform-detail-page"
-        project_slug = slugify(project_name)
-        export_filename = f"{project_slug}-상세페이지.{output_format}"
+        export_filename = os.path.basename(long_image_path)
         
         long_asset = Asset(
             project_id=project_id,
             source_type="exported_image",
+            usage_status="blocked",
             filename=export_filename,
             file_path=long_image_path,
             mime_type="image/jpeg" if output_format in {"jpg", "jpeg"} else "image/png",
@@ -225,11 +326,45 @@ def run_export_task(
         db.add(long_asset)
         db.flush()
 
+        # Preserve channel preset/version and the immutable page version without
+        # requiring a schema migration. Artifact types are intentionally
+        # machine-readable for later preset replacement/re-download checks.
+        long_artifact = ExportArtifact(
+                project_id=project_id,
+                version_id=version.id,
+                artifact_type=f"channel_long:{preset_name}:{output_format}",
+                file_path=long_image_path,
+            )
+        package_artifact = ExportArtifact(
+                project_id=project_id,
+                version_id=version.id,
+                artifact_type=f"channel_package:{preset_name}:{output_format}",
+                file_path=zip_path,
+            )
+        db.add_all([long_artifact, package_artifact])
+        db.flush()
+        # LG-12 parity evidence is supplementary quality evidence.  It must
+        # never turn a valid pre-existing LG-11 frozen export into a failed
+        # production export merely because that historical snapshot lacks a
+        # canonical field required by the newer evaluator.  In that case the
+        # evaluator will deliberately return needs_review (no sidecar), while
+        # the existing LG-11 safety/export contract remains unchanged.
+        try:
+            write_lg12_frozen_export_parity_evidence(
+                version=version, artifact=long_artifact, channel=preset_name,
+            )
+            write_lg12_frozen_export_parity_evidence(
+                version=version, artifact=package_artifact, channel=preset_name,
+            )
+        except FrozenExportSnapshotError:
+            pass
+
         # 6. 완료 상태 업데이트
         job.status = "completed"
         job.zip_asset_id = zip_asset.id
         job.output_images = [
-            f"/api/v1/projects/{project_id}/page/export/download/{long_asset.id}"
+            f"/api/v1/projects/{project_id}/page/export/download/{long_asset.id}",
+            f"/api/v1/projects/{project_id}/page/export/download/{zip_asset.id}",
         ]
         job.completed_at = datetime.datetime.utcnow()
         db.commit()
@@ -244,6 +379,9 @@ def run_export_task(
             job.completed_at = datetime.datetime.utcnow()
             db.commit()
     finally:
+        if render_session:
+            render_session.revoked_at = datetime.datetime.utcnow()
+            db.commit()
         db.close()
 
 # =====================================================================
@@ -281,47 +419,127 @@ def request_page_export(
             detail="Access denied: Insufficient permissions for this workspace"
         )
 
-    # 2. Check budget and rate limits
-    from src.api.auth import check_workspace_limits
-    check_workspace_limits(db, workspace.id)
-
-    page = get_page_or_404(db, project_id, workspace.id)
+    get_project_or_404(db, project_id, workspace.id)
+    if req.preset_name not in set(supported_channel_keys()):
+        raise HTTPException(status_code=422, detail="Unsupported channel export preset.")
+    final_version = None
     if req.final_version_id:
-        from src.db.models import DetailPageVersion
-
         requested_final = db.query(DetailPageVersion).filter(
             DetailPageVersion.id == req.final_version_id,
             DetailPageVersion.project_id == project_id,
-            DetailPageVersion.is_final == True,  # noqa: E712
         ).first()
         if not requested_final:
             raise HTTPException(
                 status_code=409,
-                detail="The requested version is not the current finalized page.",
+                detail={"code": "quality_gate_blocked", "message": "The requested frozen page is unavailable."},
+            )
+        version_snapshot = requested_final.sections_json if isinstance(requested_final.sections_json, dict) else {}
+        quality_snapshot = version_snapshot.get("ux2d_content_quality")
+        if quality_snapshot and not quality_snapshot.get("ready_for_sale", False):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "선택한 최종본의 판매용 품질 확인 항목이 해결되지 않았습니다.",
+                    "content_quality": quality_snapshot,
+                },
             )
 
+        final_version = requested_final
+    else:
+        try:
+            final_version = get_final_page_version(db, project_id)
+        except FinalPageNotFoundError:
+            final_version = None
+
+    version_snapshot = (
+        final_version.sections_json if final_version and isinstance(final_version.sections_json, dict) else {}
+    )
+    is_lg10_version = version_snapshot.get("schema_version") == "lg10-detail-page-version-v1"
+    page = None if is_lg10_version else get_page_or_404(db, project_id, workspace.id)
+
+    if is_lg10_version and final_version:
+        try:
+            ensure_lg11_canvas_safe(version_snapshot=version_snapshot, channel=req.preset_name)
+        except LG11CanvasSafetyError as exc:
+            raise HTTPException(status_code=409, detail={"message": str(exc), "canvas_safety": exc.result}) from exc
+
+    if final_version:
+        try:
+            require_current_quality_promotion(
+                db, workspace_id=workspace.id, project_id=project_id,
+                page_id=final_version.id, channel=req.preset_name,
+            )
+        except QualityPromotionGateError as exc:
+            raise HTTPException(status_code=409, detail={"code": "quality_gate_blocked", "message": str(exc)}) from exc
+
+    # Only charge/rate-limit a request after the immutable final-quality gate.
+    # A non-promoted modern page must deterministically receive the same
+    # quality-gate response even when a workspace is at an unrelated limit.
+    from src.api.auth import check_workspace_limits
+    check_workspace_limits(db, workspace.id)
+
     # 0. Readiness check (visual contract, edit markers, etc.)
-    readiness = inspect_page_readiness(page, db)
-    if not readiness.ready:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "message": "Page is not ready for export. Resolve blockers first.",
-                "blockers": [b.model_dump() for b in readiness.blockers],
-            },
-        )
+    if not is_lg10_version:
+        readiness = inspect_page_readiness(page, db)
+        if not readiness.ready:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "message": "Page is not ready for export. Resolve blockers first.",
+                    "blockers": [b.model_dump() for b in readiness.blockers],
+                },
+            )
 
     # 1. 검수 룰 재확인 (Blocker 있으면 차단)
-    compliance = PageComplianceChecker.inspect_page(db, page)
-    if should_block_export(compliance, req.export_target):
-        blockers = [issue for issue in compliance["issues"] if issue["severity"] == "Blocker"]
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "message": "Blocker compliance issues must be resolved before export.",
-                "issues": blockers
-            }
+    if not is_lg10_version:
+        compliance = PageComplianceChecker.inspect_page(db, page)
+        if should_block_export(compliance, req.export_target):
+            blockers = [issue for issue in compliance["issues"] if issue["severity"] == "Blocker"]
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "message": "Blocker compliance issues must be resolved before export.",
+                    "issues": blockers
+                }
+            )
+
+    # An export is derived from the immutable final page version. Return the
+    # previous exact artifact immediately rather than launching duplicate work.
+    if final_version:
+        artifact_type = f"channel_long:{req.preset_name}:{req.output_format}"
+        existing_artifact = (
+            db.query(ExportArtifact)
+            .filter_by(project_id=project_id, version_id=final_version.id, artifact_type=artifact_type)
+            .order_by(ExportArtifact.created_at.desc()).first()
         )
+        if existing_artifact and os.path.isfile(existing_artifact.file_path):
+            existing_asset = db.query(Asset).filter_by(
+                project_id=project_id, file_path=existing_artifact.file_path
+            ).first()
+            if existing_asset:
+                package_artifact = (
+                    db.query(ExportArtifact)
+                    .filter_by(project_id=project_id, version_id=final_version.id,
+                               artifact_type=f"channel_package:{req.preset_name}:{req.output_format}")
+                    .order_by(ExportArtifact.created_at.desc()).first()
+                )
+                package_asset = db.query(Asset).filter_by(
+                    project_id=project_id, file_path=package_artifact.file_path if package_artifact else ""
+                ).first()
+                job = ExportJob(
+                    project_id=project_id, preset_name=req.preset_name, status="completed",
+                    created_by=user.id, zip_asset_id=package_asset.id if package_asset else None,
+                    output_images=[
+                        f"/api/v1/projects/{project_id}/page/export/download/{existing_asset.id}",
+                        *(
+                            [f"/api/v1/projects/{project_id}/page/export/download/{package_asset.id}"]
+                            if package_asset else []
+                        ),
+                    ],
+                    completed_at=datetime.datetime.utcnow(),
+                )
+                db.add(job); db.commit(); db.refresh(job)
+                return job
 
     # 2. ExportJob 생성
     job = ExportJob(
@@ -338,15 +556,190 @@ def request_page_export(
     background_tasks.add_task(
         run_export_task,
         project_id=project_id,
-        page_id=page.id,
+        page_id=page.id if page else "",
         job_id=job.id,
         preset_name=req.preset_name,
         use_commerce_cut=req.use_commerce_cut,
         output_format=req.output_format,
-        final_version_id=req.final_version_id,
+        final_version_id=final_version.id if final_version else req.final_version_id,
     )
 
     return job
+
+
+@router.post(
+    "/projects/{project_id}/page/export/standalone",
+    response_model=StandaloneExportResponse,
+)
+def create_lg10_standalone_export(
+    project_id: str,
+    req: StandaloneExportRequest,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Create or re-download the clean HTML/ZIP for one frozen LG-10 version."""
+    user = auth_ctx["user"]
+    workspace = auth_ctx["workspace"]
+    role = auth_ctx.get("role") or "owner"
+    if role not in ["owner", "admin", "member"]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: Insufficient permissions for this workspace")
+    get_project_or_404(db, project_id, workspace.id)
+
+    if req.final_version_id:
+        version = db.query(DetailPageVersion).filter(
+            DetailPageVersion.id == req.final_version_id,
+            DetailPageVersion.project_id == project_id,
+            DetailPageVersion.is_final == True,  # noqa: E712
+        ).first()
+    else:
+        try:
+            version = get_final_page_version(db, project_id)
+        except FinalPageNotFoundError:
+            version = None
+    if not version:
+        raise HTTPException(status_code=409, detail="A finalized LG-10 detail page version is required for standalone export.")
+
+    try:
+        require_current_quality_promotion(
+            db, workspace_id=workspace.id, project_id=project_id, page_id=version.id, channel=req.channel,
+        )
+    except QualityPromotionGateError as exc:
+        raise HTTPException(status_code=409, detail={"code": "quality_gate_blocked", "message": str(exc)}) from exc
+
+    snapshot = version.sections_json if isinstance(version.sections_json, dict) else {}
+    if snapshot.get("schema_version") != "lg10-detail-page-version-v1":
+        raise HTTPException(status_code=409, detail="Standalone export is available only for frozen LG-10 DetailPageVersion snapshots.")
+
+    if isinstance(snapshot.get("lg11"), dict) and "channel" not in req.model_fields_set:
+        raise HTTPException(status_code=409, detail="LG-11 standalone export requires an explicit channel identity.")
+    try:
+        ensure_lg11_canvas_safe(version_snapshot=snapshot, channel=req.channel)
+    except LG11CanvasSafetyError as exc:
+        raise HTTPException(status_code=409, detail={"message": str(exc), "canvas_safety": exc.result}) from exc
+
+    def _artifact_asset(artifact_type: str) -> tuple[ExportArtifact | None, Asset | None]:
+        artifact = (
+            db.query(ExportArtifact)
+            .filter_by(project_id=project_id, version_id=version.id, artifact_type=artifact_type)
+            .order_by(ExportArtifact.created_at.desc())
+            .first()
+        )
+        asset = (
+            db.query(Asset).filter_by(project_id=project_id, file_path=artifact.file_path).first()
+            if artifact and os.path.isfile(artifact.file_path)
+            else None
+        )
+        return artifact, asset
+
+    try:
+        copyable = build_lg10_copyable_html(
+            db=db,
+            project_id=project_id,
+            version=version,
+            channel=req.channel,
+        )
+    except FrozenExportSnapshotError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    is_lg11_snapshot = isinstance(snapshot.get("lg11"), dict)
+    is_lg12_quality_snapshot = isinstance(snapshot.get("lg12_quality_lineage"), dict)
+    # LG-12 quality-gated pages need the same channel identity at download
+    # time as LG-11 exports. Preserve legacy LG-10 keys only where no
+    # quality-gate lineage is present.
+    requires_channel_artifact_identity = is_lg11_snapshot or is_lg12_quality_snapshot
+    html_artifact_type = (
+        f"{_LG10_COPYABLE_HTML_ARTIFACT}:{req.channel}"
+        if requires_channel_artifact_identity else _LG10_COPYABLE_HTML_ARTIFACT
+    )
+    zip_artifact_type = (
+        f"{_LG10_STANDALONE_PACKAGE_ARTIFACT}:{req.channel}"
+        if requires_channel_artifact_identity else _LG10_STANDALONE_PACKAGE_ARTIFACT
+    )
+    html_artifact, html_asset = _artifact_asset(html_artifact_type)
+    zip_artifact, zip_asset = _artifact_asset(zip_artifact_type)
+    warnings: list[str] = list(copyable["warnings"])
+    if not html_asset or not zip_asset:
+        try:
+            bundle = build_lg10_standalone_export_bundle(
+            db=db,
+            project_id=project_id,
+            version=version,
+            channel=req.channel,
+            )
+        except FrozenExportSnapshotError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        warnings.extend(bundle["warnings"])
+
+        def _persist_asset(*, path: str, source_type: str, mime_type: str) -> Asset:
+            existing = db.query(Asset).filter_by(project_id=project_id, file_path=path).first()
+            if existing:
+                return existing
+            asset = Asset(
+                project_id=project_id,
+                source_type=source_type,
+                usage_status="blocked",
+                filename=os.path.basename(path),
+                file_path=path,
+                mime_type=mime_type,
+                file_size=os.path.getsize(path),
+            )
+            db.add(asset)
+            db.flush()
+            return asset
+
+        html_asset = _persist_asset(
+            path=bundle["html_path"], source_type="exported_html", mime_type="text/html; charset=utf-8"
+        )
+        zip_asset = _persist_asset(
+            path=bundle["zip_path"], source_type="exported_standalone_zip", mime_type="application/zip"
+        )
+        if not html_artifact or html_artifact.file_path != bundle["html_path"]:
+            html_artifact = ExportArtifact(project_id=project_id, version_id=version.id, artifact_type=html_artifact_type, file_path=bundle["html_path"])
+            db.add(html_artifact)
+        if not zip_artifact or zip_artifact.file_path != bundle["zip_path"]:
+            zip_artifact = ExportArtifact(project_id=project_id, version_id=version.id, artifact_type=zip_artifact_type, file_path=bundle["zip_path"])
+            db.add(zip_artifact)
+        db.flush()
+        if is_lg11_snapshot:
+            try:
+                write_lg12_frozen_export_parity_evidence(version=version, artifact=html_artifact, channel=req.channel)
+                write_lg12_frozen_export_parity_evidence(version=version, artifact=zip_artifact, channel=req.channel)
+            except FrozenExportSnapshotError:
+                # See the equivalent channel-export path above.  No evidence
+                # is safer than synthesizing parity evidence from an invalid
+                # historical frozen snapshot.
+                pass
+        db.commit()
+
+    html_url = f"/api/v1/projects/{project_id}/page/export/download/{html_asset.id}"
+    zip_url = f"/api/v1/projects/{project_id}/page/export/download/{zip_asset.id}"
+    # A completed job makes the package durable in the existing export history
+    # without changing the legacy image-export data model.
+    db.add(ExportJob(
+        project_id=project_id,
+        preset_name=f"lg10_standalone:{req.channel}" if is_lg11_snapshot else "lg10_standalone",
+        status="completed",
+        created_by=user.id,
+        zip_asset_id=zip_asset.id,
+        output_images=[html_url, zip_url],
+        completed_at=datetime.datetime.utcnow(),
+    ))
+    db.commit()
+    manifest = (
+        ((snapshot.get("lg10") or {}).get("canonical_page_assembly_input") or {})
+        .get("page_asset_manifest")
+        or ((snapshot.get("lg10") or {}).get("canonical_page_assembly_input") or {})
+        .get("approved_asset_manifest")
+        or {}
+    )
+    return StandaloneExportResponse(
+        detail_page_version_id=version.id,
+        approved_asset_manifest_hash=manifest.get("manifest_hash"),
+        copyable_html=copyable["html"],
+        html_download_url=html_url,
+        zip_download_url=zip_url,
+        warnings=sorted(set(warnings)),
+    )
 
 
 @router.get("/projects/{project_id}/page/export/jobs", response_model=List[ExportJobResponse])
@@ -405,6 +798,60 @@ def download_export_file(
     if not os.path.exists(asset.file_path):
         raise HTTPException(status_code=404, detail="File has been deleted or not ready on disk")
 
+    artifacts = (
+        db.query(ExportArtifact)
+        .filter_by(project_id=project_id, file_path=asset.file_path)
+        .order_by(ExportArtifact.created_at.desc())
+        .all()
+    )
+    artifact = artifacts[0] if artifacts else None
+    if artifact and artifact.version_id:
+        version = db.query(DetailPageVersion).filter_by(id=artifact.version_id, project_id=project_id).first()
+        try:
+            require_current_quality_export_artifact(
+                db,
+                workspace_id=workspace.id,
+                project_id=project_id,
+                file_path=asset.file_path,
+            )
+        except QualityPromotionGateError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "quality_gate_blocked", "message": str(exc)},
+            ) from exc
+        if (
+            version
+            and isinstance(version.sections_json, dict)
+            and isinstance(version.sections_json.get("lg11"), dict)
+        ):
+            try:
+                artifact_identity = parse_lg11_export_artifact_token(str(artifact.artifact_type or ""))
+                if artifact_identity is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={
+                            "message": "Frozen LG-11 export artifact has an invalid channel identity.",
+                            "canvas_safety": {
+                                "schema_version": "lg11-canvas-safety-v1",
+                                "checked": True,
+                                "safe": False,
+                                "channel": None,
+                                "issues": [{
+                                    "code": "invalid_export_artifact_channel",
+                                    "reason": "The frozen export artifact token does not contain a valid channel and format.",
+                                    "section_id": None,
+                                    "element_id": None,
+                                }],
+                            },
+                        },
+                    )
+                ensure_lg11_canvas_safe(
+                    version_snapshot=version.sections_json,
+                    channel=artifact_identity["channel"],
+                )
+            except LG11CanvasSafetyError as exc:
+                raise HTTPException(status_code=409, detail={"message": str(exc), "canvas_safety": exc.result}) from exc
+
     from urllib.parse import quote
     encoded_filename = quote(asset.filename)
     _, ext = os.path.splitext(asset.filename)
@@ -433,13 +880,48 @@ def get_sales_package(
 
 def _to_export_history_item(job: ExportJob, db: Session) -> ExportHistoryItem:
     download_url = None
+    package_download_url = None
     if job.output_images and len(job.output_images) > 0:
         download_url = job.output_images[0]
+    if job.output_images and len(job.output_images) > 1:
+        package_download_url = job.output_images[1]
 
     image_asset = _exported_image_asset_for_job(db, job)
     image_format = _image_format_from_asset(image_asset)
     if image_asset:
         download_url = f"/api/v1/projects/{job.project_id}/page/export/download/{image_asset.id}"
+
+    output_asset_ids = [
+        asset_id
+        for asset_id in (_asset_id_from_download_url(url) for url in (job.output_images or []))
+        if asset_id
+    ]
+    output_paths = [
+        asset.file_path
+        for asset in db.query(Asset).filter(
+            Asset.project_id == job.project_id,
+            Asset.id.in_(output_asset_ids),
+        ).all()
+    ]
+    artifact = (
+        db.query(ExportArtifact)
+        .filter(
+            ExportArtifact.project_id == job.project_id,
+            ExportArtifact.file_path.in_(output_paths),
+        )
+        .order_by(ExportArtifact.created_at.desc())
+        .first()
+        if output_paths
+        else None
+    )
+    version_snapshot = artifact.version.sections_json if artifact and isinstance(artifact.version.sections_json, dict) else {}
+    approved_asset_manifest = (
+        ((version_snapshot.get("lg10") or {}).get("canonical_page_assembly_input") or {})
+        .get("page_asset_manifest")
+        or ((version_snapshot.get("lg10") or {}).get("canonical_page_assembly_input") or {})
+        .get("approved_asset_manifest")
+        or {}
+    )
 
     return ExportHistoryItem(
         id=job.id,
@@ -450,6 +932,9 @@ def _to_export_history_item(job: ExportJob, db: Session) -> ExportHistoryItem:
         filename=image_asset.filename if image_asset else None,
         content_type=image_asset.mime_type if image_asset else None,
         download_url=download_url,
+        package_download_url=package_download_url,
+        version_id=artifact.version_id if artifact else None,
+        approved_asset_manifest_hash=approved_asset_manifest.get("manifest_hash") if artifact else None,
         error_message=job.error_message,
         created_at=job.created_at.isoformat() if job.created_at else "",
         completed_at=job.completed_at.isoformat() if job.completed_at else None,

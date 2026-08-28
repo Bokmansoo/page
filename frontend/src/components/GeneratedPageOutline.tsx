@@ -10,6 +10,7 @@ export interface OutlineSection {
   image_asset_id: string | null;
   sort_order: number;
   is_visible: boolean;
+  visual_payload?: Record<string, unknown>;
   warnings?: string[];
 }
 

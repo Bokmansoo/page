@@ -95,7 +95,7 @@ def run_ai_analysis(
                 project_id=project_id,
                 fact_text=fact_schema.fact_text,
                 source_text=fact_schema.source_text,
-                verification_status="unknown"  # 기본 검증 상태는 '모름'
+                verification_status="extracted"
             )
             db.add(new_fact)
             new_facts_list.append({

@@ -3,6 +3,7 @@ import { expect, test } from "@playwright/test";
 const projectId = "completed-detail-page-project";
 
 test("shows a completed page and downloads PNG/JPG via browser download", async ({ page }) => {
+  let exportShouldFail = false;
   await page.route(`**/api/v1/projects/${projectId}`, async (route) => {
     await route.fulfill({
       contentType: "application/json",
@@ -32,8 +33,8 @@ test("shows a completed page and downloads PNG/JPG via browser download", async 
                 candidate_id: "hero-generated-candidate",
                 slot_id: "hero",
                 asset_id: "hero-generated",
-                source_type: "real-generated",
-                label: "거실 사용 장면",
+                source_type: "uploaded",
+                label: "대표 상품 사진",
                 is_recommended: true,
                 needs_identity_review: false,
               },
@@ -52,12 +53,35 @@ test("shows a completed page and downloads PNG/JPG via browser download", async 
                 candidate_id: "detail-generated-candidate",
                 slot_id: "detail_1",
                 asset_id: "detail-generated",
-                source_type: "real-generated",
-                label: "각도 조절 장면",
+                source_type: "uploaded",
+                label: "상품 상세 사진",
                 is_recommended: true,
                 needs_identity_review: false,
               },
             ],
+          },
+          {
+            id: "fact-card-section",
+            section_type: "benefits_summary",
+            title: "확인된 핵심 수치",
+            body_copy: "",
+            image_asset_id: null,
+            visual_kind: "html_graphic",
+            visual_payload: {
+              layout_variant: "numeric_highlights",
+              highlights: [
+                {
+                  label: "연속 사용 시간",
+                  value: "40분",
+                  body: "판매자가 확인한 상품 정보입니다.",
+                  verification_status: "confirmed",
+                  source_fact_ids: ["fact-40-minutes"],
+                },
+              ],
+            },
+            sort_order: 2,
+            is_visible: true,
+            image_candidates: [],
           },
         ],
       }),
@@ -73,14 +97,14 @@ test("shows a completed page and downloads PNG/JPG via browser download", async 
           filename: "hero.png",
           file_path: "",
           mime_type: "image/png",
-          source_type: "real-generated",
+          source_type: "uploaded",
         },
         {
           id: "detail-generated",
           filename: "detail.png",
           file_path: "",
           mime_type: "image/png",
-          source_type: "real-generated",
+          source_type: "uploaded",
         },
       ]),
     });
@@ -143,12 +167,14 @@ test("shows a completed page and downloads PNG/JPG via browser download", async 
         id: jobId,
         project_id: projectId,
         preset_name: "smartstore",
-        status: "completed",
-        error_message: null,
-        zip_asset_id: "zip-1",
-        output_images: [
-          `/api/v1/projects/${projectId}/page/export/download/export-image-${requestedFormat}`,
-        ],
+        status: exportShouldFail ? "failed" : "completed",
+        error_message: exportShouldFail
+          ? "JPG/PNG 내보내기에 필요한 Chromium이 설치되지 않았습니다. 백엔드 폴더에서 다음 명령을 실행한 뒤 다시 시도해 주세요: uv run playwright install chromium"
+          : null,
+        zip_asset_id: exportShouldFail ? null : "zip-1",
+        output_images: exportShouldFail
+          ? null
+          : [`/api/v1/projects/${projectId}/page/export/download/export-image-${requestedFormat}`],
         created_at: "2026-07-04T00:00:00",
         completed_at: "2026-07-04T00:00:01",
       }),
@@ -175,18 +201,25 @@ test("shows a completed page and downloads PNG/JPG via browser download", async 
 
   await expect(page.getByRole("heading", { name: "완성된 상세페이지" })).toBeVisible();
   await expect(page.getByAltText("공간마다 따라오는 나만의 화면")).toHaveAttribute("src", /hero-generated/);
+  await expect(page.getByText("직접 업로드").first()).toBeVisible();
+  await expect(page.getByText("ai_generated", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("40분", { exact: true })).toBeVisible();
 
-  // Test PNG download via browser download event
+  // Test PNG download via browser download event.
   const pngDownloadPromise = page.waitForEvent("download");
   await page.getByLabel("저장 형식").selectOption("png");
   await page.getByRole("button", { name: "PNG로 다운로드" }).click();
   const pngDownload = await pngDownloadPromise;
   expect(pngDownload.suggestedFilename()).toBe("삼탠바이미-상세페이지.png");
 
-  // Test JPG download via browser download event
+  // Test JPG download via browser download event.
   const jpgDownloadPromise = page.waitForEvent("download");
   await page.getByLabel("저장 형식").selectOption("jpg");
   await page.getByRole("button", { name: "JPG로 다운로드" }).click();
   const jpgDownload = await jpgDownloadPromise;
   expect(jpgDownload.suggestedFilename()).toBe("삼탠바이미-상세페이지.jpg");
+
+  exportShouldFail = true;
+  await page.getByRole("button", { name: "JPG로 다운로드" }).click();
+  await expect(page.getByText(/uv run playwright install chromium/)).toBeVisible();
 });

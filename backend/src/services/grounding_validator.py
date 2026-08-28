@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import re
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,10 @@ PERFORMANCE_PATTERNS = ["업계 최고", "초강력", "최강", "압도적"]
 SAFETY_PATTERNS = ["안전한", "무독성", "어린이 안전", "알레르기 걱정 없음"]
 HEALTH_PATTERNS = ["의학", "치료", "예방", "개선", "효능"]
 CERTIFICATION_PATTERNS = ["KC 인증", "인증 완료", "공식 인증"]
+NUMERIC_VALUE_PATTERN = re.compile(
+    r"\b\d[\d,.]*\s*(?:mAh|Ah|kg|g|W|V|Hz|Pa|cm|mm|ml|mL|L|%|℃|도|분|시간|초)\b",
+    re.IGNORECASE,
+)
 
 
 def _has_evidence(phrase: str, confirmed_facts: list[str]) -> bool:
@@ -26,6 +31,21 @@ def _has_evidence(phrase: str, confirmed_facts: list[str]) -> bool:
 
 def detect_claim_risks(text: str, confirmed_facts: list[str]) -> list[GroundingWarning]:
     warnings: list[GroundingWarning] = []
+
+    dynamic_numeric_phrases = list(dict.fromkeys(NUMERIC_VALUE_PATTERN.findall(text)))
+    # ``findall`` returns the full token because the pattern has no capturing
+    # groups. Static marketing tokens are retained for expressions such as
+    # "1위" that do not carry a physical unit.
+    for phrase in dynamic_numeric_phrases:
+        if not _has_evidence(phrase, confirmed_facts):
+            warnings.append(
+                GroundingWarning(
+                    "numeric_claim_without_evidence",
+                    phrase,
+                    "수치 표현은 확인된 사실 카드에 근거가 있어야 합니다.",
+                    "확인된 수치만 사용하거나 표현을 완화하세요.",
+                )
+            )
 
     for phrase in NUMERIC_PATTERNS:
         if phrase in text and not _has_evidence(phrase, confirmed_facts):

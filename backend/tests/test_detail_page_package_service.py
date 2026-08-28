@@ -92,10 +92,10 @@ def test_asset_approval_filtering_and_fallback(client, setup_package_project, db
     page = db_session.query(ProductPage).filter(ProductPage.project_id == project_id).first()
     
     # Create two assets:
-    # 1. Original asset (sourced)
+    # 1. Seller-owned original asset
     orig_asset = Asset(
         project_id=project_id,
-        source_type="sourced",
+        source_type="self_shot",
         filename="original_product.jpg",
         file_path="/uploads/original_product.jpg",
         mime_type="image/jpeg",
@@ -169,7 +169,7 @@ def test_asset_approval_filtering_and_fallback(client, setup_package_project, db
     assert sec1_visual["kind"] == "product_image"
     assert sec1_visual["asset_id"] == ai_approved_asset.id
 
-    # Section 2 (original asset) must show the product image correctly
+    # Section 2 (seller-owned original asset) must show the product image correctly
     if len(page_sections) > 2:
         sec2_visual = page_sections[2]["visual_slot"]
         assert sec2_visual["kind"] == "product_image"

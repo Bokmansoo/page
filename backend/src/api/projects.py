@@ -1,13 +1,14 @@
 import datetime
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.orm import Session
 from src.api.auth import get_current_user_and_workspace
 from src.db.database import get_db
-from src.db.models import ProductProject, AuditLog, JobStatus, Brand, Asset, ExportJob, AgentRun
+from src.db.models import AssetInspectionRecord, ProductProject, AuditLog, JobStatus, Brand, Asset, ExportJob, AgentRun, SourceCapture
 from src.schemas.project_worklist import ProjectWorklistItem, ProjectWorklistResponse
 from src.services.validation import validate_external_url
+from src.services.brand_kit_service import snapshot_project_brand_kit
 from src.services.visual_background_service import VisualBackgroundService
 from src.services.product_intake_service import ProductIntakeInput, normalize_intake_input
 from src.services.product_understanding_service import generate_understanding_summary, ProductUnderstandingResponse
@@ -45,14 +46,49 @@ class AssetResponseSchema(BaseModel):
     id: str
     project_id: str
     source_type: str
+    usage_status: str
     filename: str
-    file_path: str
     mime_type: str
     file_size: int
+    intake_order: Optional[int] = None
     source_asset_id: Optional[str] = None
     cutout_status: Optional[str] = None
     background_removed: bool = False
     product_identity_preserved: bool = True
+    asset_role: str = "unknown"
+    role_confidence: float = 0.0
+    role_source: str = "auto"
+    quality_status: str = "warning"
+    identity_status: str = "needs_review"
+    width: Optional[int] = None
+    height: Optional[int] = None
+    image_format: Optional[str] = None
+    quality_warnings: List[str] = Field(default_factory=list)
+    safe_crop_status: str = "needs_review"
+    is_representative: bool = False
+    representative_source: str = "auto"
+    classification_version: int = 0
+
+    @field_validator("quality_warnings", mode="before")
+    @classmethod
+    def normalize_legacy_quality_warnings(cls, value):
+        # Older imported assets may predate the non-null JSON default. Keep
+        # project listing compatible without mutating the persisted evidence.
+        return value or []
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SourceCaptureResponseSchema(BaseModel):
+    id: str
+    project_id: str
+    platform: str
+    source_role: str
+    collection_status: str
+    failure_code: Optional[str] = None
+    collected_image_count: int
+    collected_spec_count: int
+    attempted_at: datetime.datetime
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -66,12 +102,10 @@ class ProjectResponseSchema(BaseModel):
     current_step: str
     category: Optional[str]
     category_confirmed: bool
-    raw_input_url: Optional[str]
-    raw_input_text: Optional[str]
     selected_background: Optional[str] = None
     created_at: datetime.datetime
     updated_at: datetime.datetime
-    assets: List[AssetResponseSchema] = []
+    assets: List[AssetResponseSchema] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -222,6 +256,8 @@ def create_project(
         current_step="raw_input"
     )
     db.add(project)
+    db.flush()
+    snapshot_project_brand_kit(db, project)
     db.commit()
     db.refresh(project)
 
@@ -434,6 +470,7 @@ class ProjectAssetResponse(BaseModel):
     id: str
     project_id: str
     source_type: str
+    usage_status: str
     filename: str
     file_path: str
     mime_type: str
@@ -442,6 +479,23 @@ class ProjectAssetResponse(BaseModel):
     cutout_status: Optional[str] = None
     background_removed: bool = False
     product_identity_preserved: bool = True
+    asset_role: str = "unknown"
+    role_confidence: float = 0.0
+    role_source: str = "auto"
+    quality_status: str = "warning"
+    identity_status: str = "needs_review"
+    width: Optional[int] = None
+    height: Optional[int] = None
+    image_format: Optional[str] = None
+    quality_warnings: List[str] = []
+    ocr_text: Optional[str] = None
+    safe_crop_status: str = "needs_review"
+    is_representative: bool = False
+    representative_source: str = "auto"
+    classification_version: int = 0
+    # LG-12I photo-only intake sends an immutable asset reference. Expose the
+    # persisted digest so clients never need to invent one after upload.
+    content_hash: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -461,8 +515,320 @@ def list_project_assets(
         raise HTTPException(status_code=404, detail="Project not found")
 
     from src.db.models import Asset
+    from src.services.image_asset_inspector import backfill_project_asset_metadata
+    backfill_project_asset_metadata(project_id, db)
     assets = db.query(Asset).filter(Asset.project_id == project_id).all()
     return assets
+
+
+@router.get("/{project_id}/source-captures", response_model=List[SourceCaptureResponseSchema])
+def list_project_source_captures(
+    project_id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Show URL collection attempts, including normal access-limited outcomes."""
+    workspace = auth_ctx["workspace"]
+    project = db.query(ProductProject).filter(
+        ProductProject.id == project_id,
+        ProductProject.workspace_id == workspace.id,
+    ).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return (
+        db.query(SourceCapture)
+        .filter(SourceCapture.project_id == project.id)
+        .order_by(SourceCapture.attempted_at.asc())
+        .all()
+    )
+
+
+class AssetClassificationUpdate(BaseModel):
+    asset_role: Optional[Literal[
+        "product_main",
+        "product_detail",
+        "product_component",
+        "product_in_use",
+        "feature",
+        "usage_scene",
+        "components",
+        "material_detail",
+        "package",
+        "shipping_info",
+        "spec_reference",
+        "supplier_banner",
+        "decorative",
+        "unidentifiable_reference",
+        "unknown",
+    ]] = None
+    is_representative: Optional[bool] = None
+
+
+class AssetInspectionResponse(BaseModel):
+    id: str
+    project_id: str
+    asset_id: str
+    analysis_version: int
+    status: Literal["pending", "completed", "failed"]
+    analyzer_version: str
+    asset_role: Optional[str] = None
+    rights_status: Optional[str] = None
+    final_output_eligible: bool = False
+    duplicate_asset_ids: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    ocr_blocks: List[dict] = Field(default_factory=list)
+    translation_blocks: List[dict] = Field(default_factory=list)
+    numeric_evidence: List[str] = Field(default_factory=list)
+    analysis_metadata: dict = Field(default_factory=dict)
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    created_at: datetime.datetime
+    completed_at: Optional[datetime.datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AssetInspectionRunRequest(BaseModel):
+    asset_ids: Optional[List[str]] = None
+
+
+class AssetInspectionReviewRequest(BaseModel):
+    translated_text_by_index: Dict[int, str] = Field(default_factory=dict)
+    confirm_identity: bool = False
+
+
+class AssetUnderstandingReadinessResponse(BaseModel):
+    ready: bool
+    blockers: List[dict] = Field(default_factory=list)
+
+
+def _project_or_404(project_id: str, workspace_id: str, db: Session) -> ProductProject:
+    project = db.query(ProductProject).filter(
+        ProductProject.id == project_id,
+        ProductProject.workspace_id == workspace_id,
+    ).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+@router.get("/{project_id}/asset-inspections", response_model=List[AssetInspectionResponse])
+def list_asset_inspections(
+    project_id: str,
+    include_history: bool = False,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Show the latest analysis state (or history) for the Sprint 2 asset board."""
+    _project_or_404(project_id, auth_ctx["workspace"].id, db)
+    if include_history:
+        return (
+            db.query(AssetInspectionRecord)
+            .filter(AssetInspectionRecord.project_id == project_id)
+            .order_by(AssetInspectionRecord.asset_id, AssetInspectionRecord.analysis_version.desc())
+            .all()
+        )
+    from src.services.asset_understanding_service import latest_asset_inspections
+    return latest_asset_inspections(project_id, db)
+
+
+@router.post(
+    "/{project_id}/asset-inspections",
+    response_model=List[AssetInspectionResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+def create_asset_inspections(
+    project_id: str,
+    payload: AssetInspectionRunRequest,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Run a non-destructive classification/OCR-evidence pass for image assets."""
+    _project_or_404(project_id, auth_ctx["workspace"].id, db)
+    if payload.asset_ids:
+        found = {
+            asset.id for asset in db.query(Asset).filter(
+                Asset.project_id == project_id, Asset.id.in_(payload.asset_ids)
+            ).all()
+        }
+        missing = set(payload.asset_ids) - found
+        if missing:
+            raise HTTPException(status_code=404, detail="Asset not found in project")
+    from src.services.asset_understanding_service import run_project_asset_inspections
+    records = run_project_asset_inspections(project_id, db, payload.asset_ids)
+    db.add(AuditLog(
+        workspace_id=auth_ctx["workspace"].id,
+        user_id=auth_ctx["user"].id,
+        action="asset_inspection_requested",
+        entity_type="project",
+        entity_id=project_id,
+        payload={"asset_ids": payload.asset_ids or "all", "record_count": len(records)},
+    ))
+    db.commit()
+    for record in records:
+        db.refresh(record)
+    return records
+
+
+@router.post(
+    "/{project_id}/assets/{asset_id}/asset-inspections/retry",
+    response_model=AssetInspectionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def retry_asset_inspection(
+    project_id: str,
+    asset_id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Create a fresh analysis version for one asset without erasing history."""
+    _project_or_404(project_id, auth_ctx["workspace"].id, db)
+    asset = db.query(Asset).filter(Asset.id == asset_id, Asset.project_id == project_id).first()
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    from src.services.asset_understanding_service import run_asset_inspection
+    record = run_asset_inspection(asset, db)
+    db.add(AuditLog(
+        workspace_id=auth_ctx["workspace"].id,
+        user_id=auth_ctx["user"].id,
+        action="asset_inspection_retried",
+        entity_type="asset",
+        entity_id=asset.id,
+        payload={"analysis_version": record.analysis_version},
+    ))
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+@router.patch(
+    "/{project_id}/assets/{asset_id}/asset-inspections/{inspection_id}/review",
+    response_model=AssetInspectionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def review_asset_inspection_result(
+    project_id: str,
+    asset_id: str,
+    inspection_id: str,
+    payload: AssetInspectionReviewRequest,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Save seller-confirmed identity/translation as a new immutable version."""
+    _project_or_404(project_id, auth_ctx["workspace"].id, db)
+    asset = db.query(Asset).filter(Asset.id == asset_id, Asset.project_id == project_id).first()
+    current = db.query(AssetInspectionRecord).filter(
+        AssetInspectionRecord.id == inspection_id,
+        AssetInspectionRecord.asset_id == asset_id,
+        AssetInspectionRecord.project_id == project_id,
+    ).first()
+    if not asset or not current:
+        raise HTTPException(status_code=404, detail="Asset inspection not found")
+    from src.services.asset_understanding_service import review_asset_inspection
+    try:
+        record = review_asset_inspection(
+            asset,
+            current,
+            db,
+            translated_text_by_index=payload.translated_text_by_index,
+            confirm_identity=payload.confirm_identity,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    db.add(AuditLog(
+        workspace_id=auth_ctx["workspace"].id,
+        user_id=auth_ctx["user"].id,
+        action="asset_inspection_seller_reviewed",
+        entity_type="asset",
+        entity_id=asset.id,
+        payload={
+            "analysis_version": record.analysis_version,
+            "translation_indexes": sorted(payload.translated_text_by_index),
+            "confirm_identity": payload.confirm_identity,
+        },
+    ))
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+@router.get(
+    "/{project_id}/asset-understanding-readiness",
+    response_model=AssetUnderstandingReadinessResponse,
+)
+def get_asset_understanding_readiness(
+    project_id: str,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    project = _project_or_404(project_id, auth_ctx["workspace"].id, db)
+    input_bundle = (project.intake_snapshot or {}).get("input_bundle") or {}
+    from src.services.asset_understanding_service import project_asset_understanding_blockers
+    blockers = project_asset_understanding_blockers(
+        project_id,
+        db,
+        asset_ids=input_bundle.get("asset_ids") or None,
+    )
+    return {"ready": not blockers, "blockers": blockers}
+
+
+@router.patch("/{project_id}/assets/{asset_id}/classification", response_model=ProjectAssetResponse)
+def update_asset_classification(
+    project_id: str,
+    asset_id: str,
+    payload: AssetClassificationUpdate,
+    db: Session = Depends(get_db),
+    auth_ctx: dict = Depends(get_current_user_and_workspace),
+):
+    """Apply a seller-selected image role; manual choices outrank auto hints."""
+    workspace = auth_ctx["workspace"]
+    project = db.query(ProductProject).filter(
+        ProductProject.id == project_id,
+        ProductProject.workspace_id == workspace.id,
+    ).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    asset = db.query(Asset).filter(Asset.id == asset_id, Asset.project_id == project_id).first()
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    if payload.asset_role is not None:
+        asset.asset_role = payload.asset_role
+        asset.role_confidence = 1.0
+        asset.role_source = "manual"
+    if payload.is_representative is True:
+        for project_asset in db.query(Asset).filter(Asset.project_id == project_id).all():
+            project_asset.is_representative = project_asset.id == asset.id
+            if project_asset.id != asset.id and project_asset.representative_source == "manual":
+                project_asset.representative_source = "auto"
+        asset.is_representative = True
+        asset.representative_source = "manual"
+        asset.identity_status = "confirmed"
+        # A confirmed representative is the product's primary visual by
+        # definition.  Keep the two signals in sync even when the asset was
+        # previously classified as a detail/package image.
+        asset.asset_role = "product_main"
+        asset.role_confidence = 1.0
+        asset.role_source = "manual"
+    elif payload.is_representative is False:
+        asset.is_representative = False
+        asset.representative_source = "auto"
+        asset.identity_status = "needs_review"
+    # Keep the latest inspection board consistent with the seller's manual
+    # decision while preserving previous analysis versions.
+    from src.services.asset_understanding_service import run_asset_inspection
+    run_asset_inspection(asset, db)
+    db.add(AuditLog(
+        workspace_id=workspace.id,
+        user_id=auth_ctx["user"].id,
+        action="asset_visual_role_updated",
+        entity_type="asset",
+        entity_id=asset.id,
+        payload={"asset_role": payload.asset_role, "is_representative": payload.is_representative},
+    ))
+    db.commit()
+    db.refresh(asset)
+    return asset
 
 
 @router.post("/{project_id}/intake", response_model=ProjectResponseSchema)

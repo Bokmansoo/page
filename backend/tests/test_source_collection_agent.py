@@ -51,3 +51,25 @@ def test_source_collection_preserves_freeform_and_reference_urls():
     assert output["reference_urls"] == ["https://example.com/reference"]
     assert output["freeform_input"] == "아이 첫 자전거입니다. LED 조명이 있습니다."
     assert output["source_summary"]["has_freeform_input"] is True
+
+
+def test_source_collection_keeps_supplier_capture_out_of_final_image_candidates():
+    state = AgentRunState(
+        project_id="project-1",
+        input_snapshot={
+            "uploaded_assets": [
+                {
+                    "asset_id": "supplier-detail",
+                    "filename": "fabric-detail.jpg",
+                    "source_type": "sourced",
+                    "usage_status": "reference_only",
+                }
+            ],
+        },
+    )
+
+    output = SourceCollectionAgent().run(state).outputs["source_collection"]
+
+    assert output["uploaded_images"] == []
+    assert output["reference_images"][0]["asset_id"] == "supplier-detail"
+    assert output["source_summary"]["has_uploaded_image"] is False

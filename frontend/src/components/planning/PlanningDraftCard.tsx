@@ -12,6 +12,13 @@ export interface PlanningCard {
   visual_strategy: string;
   is_enabled: boolean;
   sort_order: number;
+  image_asset_id?: string | null;
+  candidate_asset_ids?: string[];
+  image_requirement?: "asset_ready" | "ai_redesign_required" | "seller_upload_required" | "derived_graphic" | "not_required" | string | null;
+  scene_request?: string | null;
+  rendering_template?: string | null;
+  facts_stale?: boolean;
+  missing_reasons?: string[];
 }
 
 interface PlanningDraftCardProps {
@@ -29,6 +36,14 @@ const visualStrategyLabels: Record<string, string> = {
   graphic_chart: "비교/그래픽",
   text_only: "텍스트 중심",
   html_graphic: "HTML 그래픽",
+};
+
+const imageRequirementLabels: Record<string, string> = {
+  asset_ready: "승인 자산 연결됨",
+  ai_redesign_required: "AI 리디자인 필요",
+  seller_upload_required: "판매자 이미지 필요",
+  derived_graphic: "사실 기반 그래픽",
+  not_required: "이미지 없음",
 };
 
 export default function PlanningDraftCard({
@@ -80,7 +95,7 @@ export default function PlanningDraftCard({
           </span>
           <span className="text-sm font-extrabold text-slate-800">{card.label}</span>
           <span className="rounded border border-emerald-100 bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
-            {visualStrategyLabels[card.visual_strategy] || card.visual_strategy}
+            {visualStrategyLabels[card.visual_strategy] || "구성 안내"}
           </span>
         </div>
 
@@ -89,21 +104,21 @@ export default function PlanningDraftCard({
             type="button"
             onClick={onMoveUp}
             disabled={index === 0}
-            className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-50 hover:text-slate-700 disabled:opacity-30"
+            className="rounded-lg p-1.5 text-slate-600 transition-colors hover:bg-slate-50 hover:text-slate-700 disabled:opacity-30"
             title="위로 이동"
             aria-label={`${card.label} 위로 이동`}
           >
-            ↑
+            위로
           </button>
           <button
             type="button"
             onClick={onMoveDown}
             disabled={index === totalCards - 1}
-            className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-50 hover:text-slate-700 disabled:opacity-30"
+            className="rounded-lg p-1.5 text-slate-600 transition-colors hover:bg-slate-50 hover:text-slate-700 disabled:opacity-30"
             title="아래로 이동"
             aria-label={`${card.label} 아래로 이동`}
           >
-            ↓
+            아래로
           </button>
           <button
             type="button"
@@ -121,7 +136,7 @@ export default function PlanningDraftCard({
 
       <div className="space-y-4">
         <div>
-          <label className="mb-1 block text-[11px] font-bold uppercase tracking-wider text-slate-400">
+          <label className="mb-1 block text-[11px] font-bold uppercase tracking-wider text-slate-600">
             제목 / 메시지
           </label>
           <input
@@ -135,12 +150,12 @@ export default function PlanningDraftCard({
         </div>
 
         <div className="space-y-2">
-          <label className="mb-1 block text-[11px] font-bold uppercase tracking-wider text-slate-400">
+            <label className="mb-1 block text-[11px] font-bold uppercase tracking-wider text-slate-600">
             본문 포인트
           </label>
           {card.bullets.map((bullet, bulletIndex) => (
             <div key={`${card.id}-bullet-${bulletIndex}`} className="flex items-center gap-2">
-              <span className="text-sm text-slate-400">•</span>
+              <span className="text-sm text-slate-600">•</span>
               <input
                 type="text"
                 value={bullet}
@@ -153,7 +168,7 @@ export default function PlanningDraftCard({
                 type="button"
                 onClick={() => handleRemoveBullet(bulletIndex)}
                 disabled={!card.is_enabled || card.bullets.length <= 1}
-                className="rounded-lg px-2 py-1 text-xs font-bold text-slate-400 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-30"
+                className="rounded-lg px-2 py-1 text-xs font-bold text-slate-600 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-30"
               >
                 삭제
               </button>
@@ -168,6 +183,24 @@ export default function PlanningDraftCard({
             포인트 추가
           </button>
         </div>
+
+        {(card.image_requirement || card.scene_request || card.facts_stale) && (
+          <div className="rounded-xl border border-slate-100 bg-slate-50 p-3 text-xs leading-5 text-slate-600">
+            <div className="flex flex-wrap gap-2">
+              {card.image_requirement && (
+                <span className="rounded-md bg-white px-2 py-1 font-bold text-slate-700">
+                  {imageRequirementLabels[card.image_requirement] || "이미지 준비 상태"}
+                </span>
+              )}
+              {(card.candidate_asset_ids || []).length > 0 && <span>자산 후보 {card.candidate_asset_ids?.length}개</span>}
+              {card.source_fact_ids.length > 0 && <span>근거 사실 {card.source_fact_ids.length}개</span>}
+              {card.rendering_template && <span>페이지 구성 준비됨</span>}
+              {card.facts_stale && <span className="font-bold text-amber-700">연결 사실 변경됨</span>}
+            </div>
+            {card.scene_request && <p className="mt-2">장면 요청: {card.scene_request}</p>}
+            {(card.missing_reasons || []).map((reason) => <p key={reason} className="mt-1 text-amber-700">{reason}</p>)}
+          </div>
+        )}
       </div>
     </div>
   );

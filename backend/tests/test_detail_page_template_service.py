@@ -76,6 +76,13 @@ def test_page_section_template_properties():
     assert section.editable is True
 
 
+def test_every_template_ends_with_a_final_specifications_section():
+    for template_id in ("general_sales", "problem_solving", "lifestyle", "comparison_focused", "beginner_seller", "premium"):
+        template = DetailPageTemplateService.get_template(template_id)
+        assert template is not None
+        assert template["sections"][-1]["type"] == "specifications"
+
+
 def test_detail_page_package_endpoint_returns_template_fields(client, db_session):
     user = User(id="user-temp", email="temp@example.com", name="Temp User")
     workspace = Workspace(id="workspace-temp", name="Temp Workspace", owner_id=user.id)

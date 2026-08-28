@@ -74,16 +74,12 @@ export default function BulkFactModal({ isOpen, onClose, projectId, onSuccess }:
 
     try {
       setIsSubmitting(true);
-      const uid = localStorage.getItem("X-Mock-User-Id") || "00000000-0000-0000-0000-000000000001";
-      const wid = localStorage.getItem("X-Mock-Workspace-Id") || "00000000-0000-0000-0000-000000000002";
-      
       const res = await fetch(`http://localhost:8001/api/v1/projects/${projectId}/facts/bulk`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Mock-User-Id': uid,
-          'X-Mock-Workspace-Id': wid,
         },
+        credentials: 'include',
         body: JSON.stringify({
           items,
           default_status: defaultStatus,

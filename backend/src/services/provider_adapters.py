@@ -14,6 +14,7 @@ from src.agents.schemas import (
     CopySetOutput,
     VisualPlanOutput,
     QAReportOutput,
+    CreativeBriefStructuredOutput,
 )
 from src.agents.mock_outputs import (
     build_mock_product_understanding,
@@ -35,6 +36,7 @@ SCHEMA_MAP = {
     "visual_plan": VisualPlanOutput,
     "qa_report": QAReportOutput,
     "copy_rewrite": CopyRewriteResult,
+    "creative_brief": CreativeBriefStructuredOutput,
 }
 
 
@@ -69,14 +71,32 @@ class MockTextProvider:
             content = build_mock_product_understanding(pname)
         elif schema == "sales_strategy":
             content = build_mock_sales_strategy(pname)
-        elif schema == "page_plan":
+        elif schema in {"page_plan", "page_planning"}:
             content = build_mock_page_plan(pname)
-        elif schema == "copy_set":
+        elif schema in {"copy_set", "copywriting"}:
             content = build_mock_copy_set(pname)
-        elif schema == "visual_plan":
+        elif schema in {"visual_plan", "visual_planning"}:
             content = build_mock_visual_plan(pname)
         elif schema == "qa_report":
             content = build_mock_qa_report(pname)
+        elif schema == "creative_brief":
+            content = {
+                "schema_version": "lg7r-v1",
+                "target_audience": "판매자 입력과 리뷰 인사이트로 확인한 고객",
+                "customer_problem": [],
+                "purchase_motivation": [],
+                "desired_mood": ["명확함", "신뢰감"],
+                "emphasis": [],
+                "forbidden_claims": ["검증되지 않은 효능", "미승인 수치"],
+                "forbidden_scenes": [],
+                "section_strategy": [
+                    {"section": "problem", "target": "구매 맥락 제시", "objective": "고객 문제를 과장 없이 공감시킵니다.", "fact_ids": [], "copy_classification": "creative", "source": "creative_insight", "claim_policy": "narrative_non_claim"},
+                    {"section": "benefit", "target": "핵심 효익 설명", "objective": "승인된 사실로 제품 이점을 설명합니다.", "fact_ids": [], "copy_classification": "fact", "source": "approved_facts", "claim_policy": "approved_fact_required"},
+                    {"section": "proof", "target": "신뢰 근거 제시", "objective": "승인된 근거를 명확히 보여줍니다.", "fact_ids": [], "copy_classification": "fact", "source": "approved_facts", "claim_policy": "approved_fact_required"},
+                    {"section": "details", "target": "구매 정보 확인", "objective": "제품 사양과 구성을 안내합니다.", "fact_ids": [], "copy_classification": "fact", "source": "approved_facts", "claim_policy": "approved_fact_required"},
+                    {"section": "cta", "target": "안전한 행동 유도", "objective": "판매자 톤에 맞춰 다음 행동을 안내합니다.", "fact_ids": [], "copy_classification": "creative", "source": "seller_direction", "claim_policy": "narrative_non_claim"},
+                ],
+            }
         else:
             content = {}
 

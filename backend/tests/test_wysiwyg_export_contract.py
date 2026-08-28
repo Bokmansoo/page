@@ -2,6 +2,7 @@ import pytest
 import os
 import zipfile
 from unittest.mock import patch
+from PIL import Image
 
 from src.api.exports import run_export_task
 from src.db.models import (
@@ -134,10 +135,9 @@ def test_export_task_uses_explicit_final_version_id(
     assert job.output_images
     assert capture_export.call_args.kwargs["version_id"] == final.id
     assert capture_export.call_args.kwargs["project_id"] == project.id
-    assert capture_export.call_args.kwargs["auth_headers"] == {
-        "X-Mock-User-Id": user.id,
-        "X-Mock-Workspace-Id": project.workspace_id,
-    }
+    auth_headers = capture_export.call_args.kwargs["auth_headers"]
+    assert set(auth_headers) == {"Cookie"}
+    assert auth_headers["Cookie"].startswith("sellform_session=")
 
 
 def test_next_render_export_captures_exact_final_version(tmp_path):
@@ -151,8 +151,11 @@ def test_next_render_export_captures_exact_final_version(tmp_path):
 
         def screenshot(self, *, path, type, quality=None):
             events.append(("screenshot", self.name, type, quality))
-            with open(path, "wb") as output:
-                output.write(b"\x89PNG\r\n\x1a\n" if type == "png" else b"\xff\xd8\xff")
+            # The export implementation reads each section's pixel height to
+            # preserve section boundaries.  Write a valid tiny image instead
+            # of only a file signature so this fake matches Playwright.
+            image = Image.new("RGB", (2, 3), "white")
+            image.save(path, format="PNG" if type == "png" else "JPEG")
 
         def count(self):
             return 2

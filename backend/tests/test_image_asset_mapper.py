@@ -153,7 +153,7 @@ def test_mapping_returns_role_confidence_and_respects_reuse_limit():
     assert max(
         sum(item["asset_id"] == asset["id"] for item in assignments)
         for asset in assets
-    ) <= 2
+    ) <= 1
     assert next(item for item in assignments if item["section_id"] == "info")[
         "asset_role"
     ] == "package_or_components"
@@ -178,3 +178,19 @@ def test_find_missing_image_roles_reports_unavailable_required_visuals():
 
     assert "lifestyle_scene" in missing
     assert "package_or_components" in missing
+
+
+def test_mapping_does_not_auto_reuse_same_content_hash_copy():
+    sections = [
+        {"id": "hero", "section_type": "hero"},
+        {"id": "feature", "section_type": "feature_1"},
+    ]
+    assets = [
+        {"id": "original", "filename": "product-main.jpg", "mime_type": "image/jpeg", "source_type": "uploaded", "content_hash": "identical"},
+        {"id": "copy", "filename": "product-detail-copy.jpg", "mime_type": "image/jpeg", "source_type": "uploaded", "content_hash": "identical"},
+    ]
+
+    assignments = map_image_assets_to_sections(sections, assets)
+
+    assert len(assignments) == 1
+    assert assignments[0]["asset_id"] == "original"

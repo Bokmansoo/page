@@ -64,10 +64,7 @@ function resolveAssetUrl(asset: ProjectAsset): string {
   return apiUrl(`/api/v1/files/assets/${asset.id}`);
 }
 
-const MOCK_HEADERS = {
-  "X-Mock-User-Id": "00000000-0000-0000-0000-000000000001",
-  "X-Mock-Workspace-Id": "00000000-0000-0000-0000-000000000002",
-};
+const MOCK_HEADERS: Record<string, string> = {};
 
 export default function ReviewEditorLayout({
   projectId,
@@ -197,16 +194,21 @@ export default function ReviewEditorLayout({
               {visibleSections.map((section) => {
                 const asset = projectAssets.find((item) => item.id === section.image_asset_id);
                 const isSelected = selectedSectionId === section.id;
+                const crop = section.visual_payload?.crop as { x?: number; y?: number } | undefined;
+                const objectPosition = `${Math.round((crop?.x ?? 0.5) * 100)}% ${Math.round((crop?.y ?? 0.5) * 100)}%`;
+                const presentation = section.visual_payload?.presentation as { text_align?: "left" | "center" | "right"; content_spacing?: "compact" | "normal" | "relaxed" } | undefined;
+                const paddingClass = presentation?.content_spacing === "compact" ? "p-4" : presentation?.content_spacing === "relaxed" ? "p-8" : "p-6";
 
                 return (
                   <button
                     key={section.id}
                     type="button"
                     onClick={() => onSelectSection(section.id)}
-                    className={`block w-full border-b border-slate-100 p-6 text-left transition-all ${
+                    className={`block w-full border-b border-slate-100 ${paddingClass} transition-all ${
                       isSelected ? "bg-emerald-50/70" : "bg-white hover:bg-slate-50"
                     }`}
                   >
+                    <div style={{ textAlign: presentation?.text_align || "left" }}>
                     <span className="text-[10px] font-extrabold uppercase tracking-[0.2em] text-emerald-700">
                       {section.section_type.replace(/_/g, " ")}
                     </span>
@@ -215,7 +217,7 @@ export default function ReviewEditorLayout({
                     <div className="mt-4 overflow-hidden rounded-2xl border border-slate-100 bg-slate-50 aspect-video flex items-center justify-center">
                       {asset ? (
                         <div className="relative h-full w-full">
-                          <img src={resolveAssetUrl(asset)} alt={section.title} className="h-full w-full object-cover" />
+                          <img src={resolveAssetUrl(asset)} alt={section.title} className="h-full w-full object-cover" style={{ objectPosition }} />
                           <span className="absolute right-3 top-3 rounded-full bg-emerald-600 px-2 py-1 text-[10px] font-extrabold text-white">
                             출처: {sourceLabel(asset.source_type)}
                           </span>
@@ -227,7 +229,7 @@ export default function ReviewEditorLayout({
                         section.image_asset_id === "asset-default"
                       ) ? (
                         <div className="relative h-full w-full">
-                          <img src={apiUrl(`/api/v1/files/assets/${section.image_asset_id}`)} alt={section.title} className="h-full w-full object-cover" />
+                          <img src={apiUrl(`/api/v1/files/assets/${section.image_asset_id}`)} alt={section.title} className="h-full w-full object-cover" style={{ objectPosition }} />
                           <span className="absolute right-3 top-3 rounded-full bg-emerald-600 px-2 py-1 text-[10px] font-extrabold text-white">
                             출처: {sourceLabel(section.image_asset_id.includes("uploaded") ? "uploaded" : "mock-generated")}
                           </span>
@@ -235,6 +237,7 @@ export default function ReviewEditorLayout({
                       ) : (
                         <span className="text-xs font-bold text-amber-600">이미지 누락</span>
                       )}
+                    </div>
                     </div>
 
                   </button>

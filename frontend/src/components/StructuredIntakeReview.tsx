@@ -5,12 +5,19 @@ import type { StructuredIntakeDraft } from "@/lib/api";
 
 type Props = {
   draft: StructuredIntakeDraft;
+  inputBundle?: {
+    salesChannel: string;
+    modelOptions: string;
+    images: Array<{ order: number; filename: string; sourceType: string }>;
+  };
   onBack: () => void;
   onConfirm: (draft: StructuredIntakeDraft) => void;
 };
 
-export default function StructuredIntakeReview({ draft, onBack, onConfirm }: Props) {
+export default function StructuredIntakeReview({ draft, inputBundle, onBack, onConfirm }: Props) {
   const [productName, setProductName] = useState(draft.product_name.value);
+  const [category, setCategory] = useState(draft.category?.value ?? "");
+  const [description, setDescription] = useState(draft.description?.value ?? "");
   const [price, setPrice] = useState(draft.price?.value ?? "");
   const [shipping, setShipping] = useState(draft.shipping?.value ?? "");
   const [mood, setMood] = useState(draft.desired_mood.join(", "));
@@ -22,6 +29,16 @@ export default function StructuredIntakeReview({ draft, onBack, onConfirm }: Pro
     onConfirm({
       ...draft,
       product_name: { ...draft.product_name, value: productName.trim() },
+      category: {
+        value: category,
+        source: draft.category?.source ?? "seller_review",
+        confidence: "confirmed",
+      },
+      description: {
+        value: description.trim(),
+        source: draft.description?.source ?? "seller_review",
+        confidence: "confirmed",
+      },
       selling_points: sellingPoints
         .filter((point) => point.enabled && point.text.trim())
         .map((point) => ({
@@ -49,6 +66,49 @@ export default function StructuredIntakeReview({ draft, onBack, onConfirm }: Pro
           value={productName}
           onChange={(event) => setProductName(event.target.value)}
         />
+      </label>
+
+      <label className="mt-5 block text-sm font-semibold text-slate-700">
+        상품 카테고리
+        <select
+          aria-label="확인 상품 카테고리"
+          className="mt-2 w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm"
+          value={category}
+          onChange={(event) => setCategory(event.target.value)}
+        >
+          <option value="">선택 안 함</option>
+          <option value="Living">리빙·소형 가전</option>
+          <option value="Beauty">뷰티</option>
+          <option value="Fashion">패션</option>
+          <option value="Food">식품</option>
+        </select>
+      </label>
+
+      {inputBundle && (
+        <div className="mt-5 rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700">
+          <p className="font-semibold text-slate-900">저장될 상품 자료 묶음</p>
+          <dl className="mt-3 grid gap-2 sm:grid-cols-2">
+            <div><dt className="text-xs text-slate-500">판매 채널</dt><dd>{inputBundle.salesChannel || "입력 안 함"}</dd></div>
+            <div><dt className="text-xs text-slate-500">모델·옵션</dt><dd>{inputBundle.modelOptions || "입력 안 함"}</dd></div>
+          </dl>
+          <ol className="mt-3 space-y-1 text-xs">
+            {inputBundle.images.map((image) => (
+              <li key={`${image.order}-${image.filename}`}>{image.order}. {image.filename} · {image.sourceType === "self_shot" ? "직접 촬영·보유" : image.sourceType === "uploaded" ? "사용 허가 자료" : "공급처 참고용"}</li>
+            ))}
+          </ol>
+        </div>
+      )}
+
+      <label className="mt-5 block text-sm font-semibold text-slate-700">
+        상세 정보
+        <textarea
+          aria-label="확인 상세 정보"
+          className="mt-2 w-full rounded-xl border border-slate-200 px-4 py-3 text-sm leading-6"
+          value={description}
+          onChange={(event) => setDescription(event.target.value)}
+          rows={3}
+        />
+        <span className="mt-2 block text-xs font-normal text-slate-500">수치와 단위를 확인해 주세요. 예: 260g, 10분, 800mAh</span>
       </label>
 
       <div className="mt-5">

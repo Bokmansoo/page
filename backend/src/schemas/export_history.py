@@ -13,6 +13,9 @@ class ExportHistoryItem(BaseModel):
     filename: Optional[str] = None
     content_type: Optional[str] = None
     download_url: Optional[str] = None
+    package_download_url: Optional[str] = None
+    version_id: Optional[str] = None
+    approved_asset_manifest_hash: Optional[str] = None
     error_message: Optional[str] = None
     created_at: str
     completed_at: Optional[str] = None

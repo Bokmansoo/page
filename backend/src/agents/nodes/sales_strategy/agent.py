@@ -25,3 +25,8 @@ class SalesStrategyAgent(AgentNode):
             SalesStrategyOutput,
         )
         return state
+
+    def run_delta(self, *, run_id: str, project_id: str, mode: str) -> dict:
+        from src.services.langgraph_commerce_planning_service import run_sales_strategy
+
+        return run_sales_strategy(run_id=run_id, project_id=project_id, mode=mode)

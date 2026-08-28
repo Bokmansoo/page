@@ -1,5 +1,5 @@
 from src.api.auth import DEFAULT_BRAND_ID
-from src.db.models import ProductPage
+from src.db.models import ProductFact, ProductPage
 from src.services.page_visual_contract import normalize_visual, validate_visual
 
 
@@ -21,10 +21,23 @@ def test_page_api_returns_html_visual_payload(client, db_session):
     ).status_code == 201
     page = db_session.query(ProductPage).filter(ProductPage.project_id == project_id).one()
     section = page.sections[0]
+    fact = ProductFact(
+        project_id=project_id,
+        fact_text="필요한 곳으로 옮겨 사용",
+        source_text="판매자가 확인한 이동 사용 정보",
+        verification_status="confirmed",
+    )
+    db_session.add(fact)
+    db_session.flush()
     section.visual_kind = "html_graphic"
     section.visual_payload = {
         "layout_variant": "benefit_cards",
-        "cards": [{"title": "간편한 이동", "body": "필요한 곳으로 옮겨 사용"}],
+        "cards": [{
+            "title": "간편한 이동",
+            "body": "필요한 곳으로 옮겨 사용",
+            "verification_status": "confirmed",
+            "source_fact_ids": [fact.id],
+        }],
     }
     section.image_asset_id = None
     db_session.commit()
@@ -47,8 +60,8 @@ def test_html_graphic_is_complete_without_image_asset():
         visual_payload={
             "layout_variant": "comparison_cards",
             "cards": [
-                {"title": "기존 방식", "body": "전원 위치에 제약", "tone": "muted"},
-                {"title": "무선 사용", "body": "필요한 장소로 이동", "tone": "positive"},
+                {"title": "기존 방식", "body": "전원 위치에 제약", "tone": "muted", "verification_status": "confirmed", "source_fact_ids": ["fact-1"]},
+                {"title": "무선 사용", "body": "필요한 장소로 이동", "tone": "positive", "verification_status": "confirmed", "source_fact_ids": ["fact-2"]},
             ],
         },
     )
@@ -107,6 +120,39 @@ def test_html_graphic_cards_required_for_benefit():
     assert "html_cards_required" in errors
 
 
+def test_html_graphic_rejects_cards_without_confirmed_fact_grounding():
+    visual = normalize_visual(
+        section_type="detail_1",
+        image_asset_id=None,
+        visual_kind="html_graphic",
+        visual_payload={
+            "layout_variant": "benefit_cards",
+            "cards": [{"title": "가벼움", "body": "쉽게 이동"}],
+        },
+    )
+    assert "html_card_grounding_required" in validate_visual(visual)
+
+
+def test_numeric_highlights_require_confirmed_fact_grounding():
+    visual = normalize_visual(
+        section_type="benefits_summary",
+        image_asset_id=None,
+        visual_kind="html_graphic",
+        visual_payload={
+            "layout_variant": "numeric_highlights",
+            "highlights": [
+                {
+                    "label": "사용 시간",
+                    "value": "40분",
+                    "verification_status": "confirmed",
+                    "source_fact_ids": ["fact-1"],
+                }
+            ],
+        },
+    )
+    assert validate_visual(visual) == []
+
+
 def test_spec_table_requires_rows():
     visual = normalize_visual(
         section_type="guarantee",
@@ -116,6 +162,24 @@ def test_spec_table_requires_rows():
     )
     errors = validate_visual(visual)
     assert "spec_rows_required" in errors
+
+
+def test_steps_and_checklist_require_grounded_content():
+    steps = normalize_visual(
+        section_type="lifestyle_scene",
+        image_asset_id=None,
+        visual_kind="html_graphic",
+        visual_payload={"layout_variant": "steps"},
+    )
+    checklist = normalize_visual(
+        section_type="pre_purchase",
+        image_asset_id=None,
+        visual_kind="html_graphic",
+        visual_payload={"layout_variant": "checklist"},
+    )
+
+    assert "html_steps_required" in validate_visual(steps)
+    assert "html_checklist_required" in validate_visual(checklist)
 
 
 def test_invalid_visual_kind_returns_error():

@@ -76,6 +76,8 @@ def test_auto_map_images_api_success(client: TestClient, db_session: Session):
     # Verify database update
     db_session.refresh(sec)
     assert sec.image_asset_id == "asset-auto-map-1"
+    assert sec.visual_kind == "image"
+    assert sec.visual_payload["ux2c_selection_state"] == "automatic"
 
 
 def test_auto_map_images_does_not_overwrite_manual_mapping_by_default(

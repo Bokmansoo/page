@@ -209,6 +209,13 @@ class VisualPackagePlanner:
                     "source_type": asset.source_type,
                     "source_asset_id": getattr(asset, "source_asset_id", None),
                     "background_removed": getattr(asset, "background_removed", False),
+                    "asset_role": getattr(asset, "asset_role", "unknown"),
+                    "role_confidence": getattr(asset, "role_confidence", 0.0),
+                    "quality_status": getattr(asset, "quality_status", "warning"),
+                    "quality_warnings": getattr(asset, "quality_warnings", []) or [],
+                    "content_hash": getattr(asset, "content_hash", None),
+                    "ocr_text": getattr(asset, "ocr_text", None),
+                    "is_representative": getattr(asset, "is_representative", False),
                 })
                 a_id = asset.id
                 src_asset_id = getattr(asset, "source_asset_id", None)

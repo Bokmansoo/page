@@ -4,6 +4,7 @@ from typing import List, Literal
 from pydantic import BaseModel
 
 from src.db.models import ProductProject
+from src.services.commerce_policy import is_confirmed_fact_status
 
 
 SALES_DIRECTION_TO_STYLE = {
@@ -82,7 +83,7 @@ def _confirmed_fact_texts(project: ProductProject) -> list[str]:
     return [
         fact.fact_text.strip()
         for fact in (project.facts or [])
-        if fact.verification_status == "confirmed" and fact.fact_text and fact.fact_text.strip()
+        if is_confirmed_fact_status(fact.verification_status) and fact.fact_text and fact.fact_text.strip()
     ]
 
 

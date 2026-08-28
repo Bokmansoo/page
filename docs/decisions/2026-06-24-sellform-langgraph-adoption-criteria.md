@@ -1,5 +1,8 @@
 # Sellform LangGraph 도입 판단 기록
 
+> 상태: **대체됨** — 2026-08-06부터 실제 LangGraph 전환 결정은
+> [LangGraph 실행기와 체크포인트 책임 경계](./2026-08-06-sellform-langgraph-runtime-and-checkpoint-boundary.md)를 기준으로 한다.
+
 | 항목 | 내용 |
 | --- | --- |
 | 결정 일자 | 2026-06-24 |

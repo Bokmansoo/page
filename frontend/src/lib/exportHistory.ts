@@ -37,13 +37,7 @@ interface LegacyProjectListResponse {
   items?: LegacyProjectItem[];
 }
 
-function mockHeaders(): Record<string, string> {
-  if (typeof window === "undefined") return {};
-  return {
-    "X-Mock-User-Id": localStorage.getItem("X-Mock-User-Id") || "00000000-0000-0000-0000-000000000001",
-    "X-Mock-Workspace-Id": localStorage.getItem("X-Mock-Workspace-Id") || "00000000-0000-0000-0000-000000000002",
-  };
-}
+function sessionHeaders(): Record<string, string> { return {}; }
 
 function extensionFromAsset(asset: LegacyProjectAsset): "png" | "jpg" | null {
   const filename = asset.filename.toLowerCase();
@@ -79,7 +73,7 @@ function historyFromLegacyProjects(projects: LegacyProjectItem[]): ExportHistory
 
 async function fetchLegacyExportHistory(): Promise<ExportHistoryItem[]> {
   const response = await fetch(apiUrl("/api/v1/projects"), {
-    headers: mockHeaders(),
+    headers: sessionHeaders(), credentials: "include",
     cache: "no-store",
   });
   if (!response.ok) throw new Error("출력 이력을 불러오지 못했습니다.");
@@ -90,7 +84,7 @@ async function fetchLegacyExportHistory(): Promise<ExportHistoryItem[]> {
 
 export async function fetchExportHistory(): Promise<ExportHistoryItem[]> {
   const response = await fetch(apiUrl("/api/v1/page/exports"), {
-    headers: mockHeaders(),
+    headers: sessionHeaders(), credentials: "include",
     cache: "no-store",
   });
   if (response.status === 404) {
