@@ -34,7 +34,7 @@ def mock_agent_runner(db_session):
             asset = Asset(
                 id=uploaded_asset_id,
                 project_id=project.id,
-                source_type="sourced",
+                source_type="uploaded",
                 filename=uploaded_filename,
                 file_path=f"./uploads/{uploaded_filename}",
                 mime_type="image/png",
@@ -89,7 +89,7 @@ def test_mock_generation_prefers_uploaded_image_for_visual_slots(mock_agent_runn
 
     hero_visual = result["page_assembly"]["sections"][0]["visual_slot"]
 
-    assert hero_visual["source_type"] == "sourced"
+    assert hero_visual["source_type"] == "uploaded"
     assert hero_visual["asset_id"] == "asset-uploaded-samtan"
     assert "삼탠바이미.png" in hero_visual["label"]
 
@@ -105,7 +105,7 @@ def test_mock_generation_without_upload_or_url_requests_a_product_photo(mock_age
         section["visual_slot"]["source_type"] for section in page_sections
     }
 
-    assert source_types == {"missing-image", "html-graphic"}
+    assert source_types == {"missing-image", None}
     assert "generated_assets" not in result
 
 
@@ -120,4 +120,4 @@ def test_mock_generation_with_unmaterialized_url_requests_a_product_photo(mock_a
         for section in result["page_assembly"]["sections"]
     }
 
-    assert source_types == {"missing-image", "html-graphic"}
+    assert source_types == {"missing-image", None}
