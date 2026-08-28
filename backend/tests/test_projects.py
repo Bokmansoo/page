@@ -17,7 +17,7 @@ def test_create_and_get_project(client):
     assert response.status_code == 201
     data = response.json()
     assert data["name"] == "Test Cotton Shirt"
-    assert data["raw_input_text"] == "Size M, L. Made in Korea."
+    assert "raw_input_text" not in data
     assert data["status"] == "draft"
     assert data["current_step"] == "raw_input"
     project_id = data["id"]
@@ -74,4 +74,4 @@ def test_autosave_patch_project(client):
     assert patch_res.status_code == 200
     data = patch_res.json()
     assert data["name"] == "Autosaved Shirt Name"
-    assert data["raw_input_text"] == "Updated content"
+    assert "raw_input_text" not in data
