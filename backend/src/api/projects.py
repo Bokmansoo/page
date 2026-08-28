@@ -98,8 +98,6 @@ class ProjectResponseSchema(BaseModel):
     workspace_id: str
     brand_id: str
     name: str
-    raw_input_url: Optional[str] = None
-    raw_input_text: Optional[str] = None
     status: str
     current_step: str
     category: Optional[str]
