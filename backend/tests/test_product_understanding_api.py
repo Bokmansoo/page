@@ -65,8 +65,11 @@ def test_submit_intake_and_get_understanding(client: TestClient, db_session: Ses
     )
     assert resp.status_code == 200
     data = resp.json()
-    assert data["raw_input_url"] == "https://detail.1688.com/offer/12345.html"
-    assert data["raw_input_text"] == "이 상품은 오가닉 대나무 테이블 매트 상품입니다."
+    assert "raw_input_url" not in data
+    assert "raw_input_text" not in data
+    db_session.refresh(proj)
+    assert proj.raw_input_url == "https://detail.1688.com/offer/12345.html"
+    assert proj.raw_input_text == "이 상품은 오가닉 대나무 테이블 매트 상품입니다."
 
     # 4. Get understanding of the project (should detect "테이블 매트")
     resp_und = client.get(
