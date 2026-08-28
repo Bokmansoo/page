@@ -246,9 +246,11 @@ def _append_provider_attempt(
             ImageGenerationProviderAttemptRecord.semantic_idempotency_key == key
         ).one()
         return row
-    _project_provider_costs(run, db)
     from src.services.langgraph_run_service import AgentRunEventJournal
     AgentRunEventJournal.append_provider_cost_event(run, db, ledger=row)
+    # The journal owns the AgentRun row lock. Acquire it before mutating the
+    # cost projection so a fast worker and graph dispatch use one lock order.
+    _project_provider_costs(run, db)
     return row
 
 
@@ -294,12 +296,12 @@ def reconcile_provider_cost_projection(run_id: str, db: Session) -> bool:
     ).order_by(ImageGenerationProviderAttemptRecord.started_at.asc(), ImageGenerationProviderAttemptRecord.id.asc()).all()
     if not rows:
         return False
-    _project_provider_costs(run, db)
     from src.services.langgraph_run_service import AgentRunEventJournal
     changed = False
     for row in rows:
         _event, appended, _locked = AgentRunEventJournal.append_provider_cost_event(run, db, ledger=row)
         changed = changed or appended
+    _project_provider_costs(run, db)
     return changed
 
 

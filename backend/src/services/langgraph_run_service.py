@@ -1282,7 +1282,11 @@ class AgentRunEventJournal:
 
         payload = {**payload, "identity": cls._event_identity(run, checkpoint_id=checkpoint_id)}
         cls.validate_payload(event_type, payload)
-        locked = db.query(AgentRun).filter(AgentRun.id == run.id).with_for_update().one_or_none()
+        # Lock before SQLAlchemy can autoflush a dirty AgentRun projection.
+        # Otherwise graph dispatch and the fast provider worker can each write
+        # a row version, then deadlock while both try to journal the next event.
+        with db.no_autoflush:
+            locked = db.query(AgentRun).filter(AgentRun.id == run.id).with_for_update().one_or_none()
         if locked is None or (workspace_id is not None and locked.workspace_id != workspace_id) or (project_id is not None and locked.project_id != project_id):
             raise GraphRunNotFound("AgentRun event scope does not match the persisted run.")
         expected_thread = locked.graph_thread_id or locked.id
