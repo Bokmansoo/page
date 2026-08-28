@@ -59,7 +59,7 @@ def source_asset(db_session: Session, orchestrator_project, tmp_path):
     asset = Asset(
         id="orch-remediation-source",
         project_id=orchestrator_project,
-        source_type="sourced",
+        source_type="uploaded",
         filename="source.png",
         file_path=str(img_path),
         mime_type="image/png",
