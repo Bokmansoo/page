@@ -1,7 +1,7 @@
 # Sellform V2.1 AI Commerce Studio 최종 기획
 
 작성일: 2026-08-07  
-개정일: 2026-08-18
+개정일: 2026-08-20
 상태: **현재 제품·구현 기준이 되는 최종 기획**
 구현 로드맵: [Sellform V2.1 Sprint 로드맵](../plans/2026-08-07-sellform-v2-ai-commerce-studio-v2.1-roadmap.md)  
 이전 기준: [2026-08-06 LangGraph 최종 기획](./2026-08-06-sellform-v2-langgraph-agent-system-final-design.md)
@@ -204,6 +204,30 @@ MASTER-05. source/truth/confirmation 변경이나 approved asset manifest·`copy
 MASTER-06. 소셜·영상은 상세페이지 PNG·JPG를 재분석하지 않고 master의 fact, brief, brand와 asset reference를 사용한다.
 MASTER-07. restart/history rebuild 후 동일 master lineage와 downstream version reference가 복원돼야 한다.
 MASTER-08. reference-only, supplier, blocked 또는 rights 미확정 asset은 master의 final-use asset reference가 될 수 없다.
+
+### 5.3 Product Experience / Commerce Content Studio UX Principles
+
+Sellform의 primary UX는 내부 AI pipeline을 보여 주는 개발자용 graph dashboard가 아니라, 판매자가 상품을 한 번 가져온 뒤 필요한 판매 콘텐츠를 차례로 만들고 관리하는 Commerce Content Studio다. 내부 version·checkpoint·node·lineage 용어는 사용자 화면의 primary label로 노출하지 않는다.
+
+1. 상품 진입은 `owned_product_url`, `photo_only`(상품 사진 1~2장), `manual` 세 방식뿐이며, 서로 다른 제품 기능이 아니라 같은 상품을 가져오는 세 input mode로 안내한다.
+2. 진행 상태는 기술 용어 대신 `상품 분석 중`, `상품 정보를 확인했어요`, `몇 가지만 확인해주세요`, `콘텐츠 기준을 준비하고 있어요`, `상세페이지가 준비됐어요`처럼 현재 할 일과 결과를 중심으로 설명한다.
+3. 상품 입력 한 번으로 만든 동일 Commerce Creative Master에서 상세페이지, 소셜 소재, 영상, 캠페인 팩이 각각의 immutable output lineage로 파생된다. Social/Video는 Detail Page PNG·JPG를 다시 분석해 만들지 않는다.
+4. 결과 화면의 정보 hierarchy는 `상품 → 생성 가능한 콘텐츠 → 생성 결과 → 품질 상태 → 편집/재생성 → export` 순서로 둔다. 내부 pipeline/debug 정보는 일반 판매자의 primary UI에서 숨긴다.
+5. LG-14 Detail Page Beta는 상품 입력 → AI 상품 이해 → 필요한 seller confirmation → 상세페이지 생성 → preview/edit → SmartStore/Coupang export를 하나의 자연스러운 판매자 workflow로 제공한다. 결과 중심 화면에는 상세페이지 준비 상태, preview, 품질 상태, 편집, 재생성, export를 표시한다.
+6. LG-15에서는 같은 Master의 카드뉴스 초안을 카드형 visual preview로 보여 주고, 판매자가 개별 카드 미리보기·수정·재생성·다운로드/export를 할 수 있게 한다.
+7. LG-16에서는 같은 Master의 confirmed facts, approved assets, visual direction, Brand Kit, Creative Brief를 사용해 독립적인 VideoProject lineage를 만든다. 영상은 상세페이지 이미지를 단순 영상화한 결과로 제한하지 않는다.
+8. LG-17에서는 하나의 상품 workspace에서 Detail Page, Social Kit, Video Project의 생성 가능 상태와 완료 결과를 함께 보여 주고, 각 결과의 미리보기·편집·내보내기로 이어지게 한다.
+9. Mirr, 후커블, 드랩아트, 크리에이지 등 동종 제품의 단순한 입력·결과 중심·카드형 preview 같은 UX 원칙은 참고할 수 있으나, 특정 서비스의 layout·문구·브랜드 표현·icon/visual asset·pixel-level 화면 구조를 복제하지 않는다. Sellform 고유 design system과 information architecture를 사용한다.
+
+UX-01. 세 input mode는 하나의 상품 가져오기 진입점과 동일한 downstream product contract로 안내한다.
+UX-02. 일반 판매자의 primary UI는 내부 graph/version/checkpoint/node/lineage 용어 대신 task/result 중심의 한국어 상태와 다음 행동을 제공한다.
+UX-03. 동일 Commerce Creative Master에서 Detail Page, Social Kit, Video Studio, Campaign Pack이 파생되며, downstream 콘텐츠는 Detail Page PNG·JPG를 상품 source로 재분석하지 않는다.
+UX-04. 결과 화면은 상품, 생성 가능한 콘텐츠, 생성 결과, 품질 상태, 편집/재생성, export의 순서를 유지한다.
+UX-05. LG-14는 세 input mode부터 preview/edit와 SmartStore/Coupang export까지의 단일 판매자 workflow를 제공한다.
+UX-06. LG-15는 카드형 preview와 개별 카드 수정·재생성·export를 제공한다.
+UX-07. LG-16은 Master 기반의 독립 VideoProject lineage와 영상 preview/edit/export 경험을 제공한다.
+UX-08. LG-17은 하나의 상품 workspace에서 Detail Page, Social Kit, Video Project를 통합 관리한다.
+UX-09. 경쟁 제품은 UX 원칙만 참고하고 Sellform 고유 design system과 information architecture를 유지한다.
 
 ## 6. 시스템 계층
 

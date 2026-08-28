@@ -1,7 +1,7 @@
 # Sellform V2.1 AI Commerce Studio Sprint 로드맵
 
 작성일: 2026-08-07  
-개정일: 2026-08-18
+개정일: 2026-08-20
 상태: **현재 구현 로드맵 — LG-12I 삽입 개정**
 상위 기획: [Sellform V2.1 AI Commerce Studio 최종 기획](../specs/2026-08-07-sellform-v2-ai-commerce-studio-v2.1-final-design.md)  
 이전 로드맵: [2026-08-06 LangGraph 전환 로드맵](./2026-08-06-sellform-v2-langgraph-migration-roadmap.md)
@@ -447,7 +447,14 @@ section 구조와 내부 자유 배치를 결합한 Hybrid Canvas와 자연어 �
 
 ### 대상 요구사항
 
-LG-14 Detail Page Beta에 필요한 최종 기획 요구사항과 완료 정의, 특히 `INTAKE-*`, `SOURCE-*`, `MASTER-*`, 기존 LG-5R~LG-13 계약
+LG-14 Detail Page Beta에 필요한 최종 기획 요구사항과 완료 정의, 특히 `INTAKE-*`, `SOURCE-*`, `MASTER-*`, `UX-01`~`UX-05`, 기존 LG-5R~LG-13 계약
+
+### User Experience Acceptance Direction
+
+- 판매자는 `owned_product_url`, `photo_only`, `manual` 중 하나로 같은 상품 가져오기 경험을 시작하며, 세 mode가 서로 다른 제품 기능처럼 보이지 않는다.
+- 화면은 LangGraph·node·checkpoint·immutable lineage 같은 내부 용어가 아니라 `상품 분석 중`, `몇 가지만 확인해주세요`, `상세페이지가 준비됐어요`처럼 task/result 중심의 상태와 다음 행동을 제공한다.
+- 상품 입력 → AI 상품 이해 → 필요한 seller confirmation → 상세페이지 생성 → preview/edit → SmartStore/Coupang export가 하나의 자연스러운 판매자 workflow로 이어진다.
+- 결과 중심 화면은 상세페이지 준비 상태, preview, 품질 상태, 편집, 재생성, export를 우선 보여 주며 개발자용 graph dashboard를 primary UI로 사용하지 않는다.
 
 ### 주요 작업
 
@@ -483,7 +490,13 @@ LG-14 Detail Page Beta에 필요한 최종 기획 요구사항과 완료 정의,
 
 ### 대상 요구사항
 
-`SOCIAL-01`~`SOCIAL-06`, `MASTER-04`, `MASTER-06`, 기존 fact/rights/Brand Kit 계약
+`SOCIAL-01`~`SOCIAL-06`, `MASTER-04`, `MASTER-06`, `UX-03`, `UX-04`, `UX-06`, 기존 fact/rights/Brand Kit 계약
+
+### User Experience Acceptance Direction
+
+- 판매자는 같은 Commerce Creative Master에서 생성 가능한 소셜 소재를 확인하고 카드형 visual preview로 초안을 본다.
+- 카드뉴스는 `[01] [02] [03] [04] [05]`처럼 개별 결과를 식별할 수 있으며, 각 카드에 대해 미리보기·수정·재생성·다운로드/export를 수행할 수 있다.
+- Social Kit은 상세페이지 PNG·JPG를 재분석하는 우회 경로가 아니라 Master의 fact, asset, Brand Kit, Creative Brief reference에서 파생된다.
 
 ### 범위
 
@@ -502,7 +515,13 @@ LG-14 Detail Page Beta에 필요한 최종 기획 요구사항과 완료 정의,
 
 ### 대상 요구사항
 
-`VIDEO-01`~`VIDEO-06`, `MASTER-04`, `MASTER-06`, 기존 비용 승인·outbox·rights 계약
+`VIDEO-01`~`VIDEO-06`, `MASTER-04`, `MASTER-06`, `UX-03`, `UX-04`, `UX-07`, 기존 비용 승인·outbox·rights 계약
+
+### User Experience Acceptance Direction
+
+- 판매자는 같은 Master를 기준으로 제품 소개, 기능 강조, 사용 장면, 숏폼 홍보 영상을 만들 수 있음을 결과 화면에서 확인한다.
+- 영상은 상세페이지 이미지를 단순 영상화한 산출물이 아니라 confirmed facts, approved assets, visual direction, Brand Kit, Creative Brief를 참조하는 독립 VideoProject lineage다.
+- 판매자 UX는 영상 초안/preview, 품질·비용 확인, 선택적 편집·재생성, export 순서로 안내한다.
 
 ### 범위
 
@@ -520,7 +539,13 @@ LG-14 Detail Page Beta에 필요한 최종 기획 요구사항과 완료 정의,
 
 ### 대상 요구사항
 
-`CAMPAIGN-01`~`CAMPAIGN-05`, `MASTER-04`~`MASTER-07`
+`CAMPAIGN-01`~`CAMPAIGN-05`, `MASTER-04`~`MASTER-07`, `UX-03`, `UX-04`, `UX-08`, 기존 output/version 계약
+
+### User Experience Acceptance Direction
+
+- 하나의 상품 workspace에서 Detail Page, Social Kit, Video Project의 생성 가능 상태와 완료된 콘텐츠를 함께 보여 준다.
+- 판매자는 각 콘텐츠의 preview, 품질 상태, 편집/재생성, export로 바로 이동할 수 있으며, 하나의 결과를 다른 결과의 상품 source로 다시 분석하지 않는다.
+- Campaign Pack은 사용자에게 콘텐츠 묶음으로 보이되, 내부적으로는 원본 Master와 각 immutable output lineage를 유지한다.
 
 ### 범위
 
@@ -595,6 +620,7 @@ LG-6 Prompt Intelligence
 | INTAKE-01~INTAKE-10 | LG-12I, LG-13, LG-14 |
 | SOURCE-01~SOURCE-08 | LG-12I, LG-12, LG-14 |
 | MASTER-01~MASTER-08 | LG-12I, LG-14~LG-17 |
+| UX-01~UX-09 | LG-14~LG-17 |
 | SOCIAL-01~SOCIAL-06 | LG-15 |
 | VIDEO-01~VIDEO-06 | LG-16 |
 | CAMPAIGN-01~CAMPAIGN-05 | LG-17 |
