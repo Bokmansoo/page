@@ -1839,7 +1839,8 @@ def _public_intake(value: Any, pending_confirmation: Any) -> dict[str, Any]:
 
 def _public_rendering(value: Any) -> dict[str, Any]:
     source = dict(value or {}) if isinstance(value, dict) else {}
-    return {"detail_page_version": _public_ref(source.get("detail_page_version"))}
+    detail_page_version = _public_ref(source.get("detail_page_version"))
+    return {"detail_page_version": detail_page_version} if detail_page_version else {}
 
 
 def _public_quality(value: Any) -> dict[str, Any]:
