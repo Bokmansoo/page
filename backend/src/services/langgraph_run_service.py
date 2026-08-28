@@ -2124,11 +2124,15 @@ def _public_review(value: Any) -> dict[str, Any] | None:
                     "automatic_attempts": int(slo08_choice.get("automatic_attempts") or 2),
                 },
             })
-    cost_plan = _public_cost_plan(dict(context.get("generation") or {}).get("cost_plan"))
+    generation_context = context.get("generation")
+    public_generation = _public_generation(generation_context) if isinstance(generation_context, dict) else {}
+    cost_plan = public_generation.get("cost_plan") or _public_cost_plan(
+        dict(generation_context or {}).get("cost_plan") if isinstance(generation_context, dict) else None
+    )
     confirmation = _public_intake({}, context.get("seller_confirmation")).get("seller_confirmation")
-    if cost_plan or confirmation:
+    if public_generation or cost_plan or confirmation:
         result["context"] = {
-            "generation": {"cost_plan": cost_plan},
+            "generation": public_generation or {"cost_plan": cost_plan},
             "seller_confirmation": confirmation,
         }
     return result
