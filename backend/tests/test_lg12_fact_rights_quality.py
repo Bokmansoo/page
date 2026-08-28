@@ -298,10 +298,12 @@ def test_final_asset_rights_and_manifest_parity(client, db_session, auth_headers
     else:
         chain = _source_truth_confirmation(db_session, run)
         master = _create_master(db_session, run, chain=chain)
+    evidence_asset_id = str(manifest_asset["asset_id"])
+    evidence_asset_hash = str(manifest_asset["asset_content_hash"])
     evidence_body = {
         "schema_version": LG12_FROZEN_IMAGE_EVIDENCE_SCHEMA_VERSION,
-        "asset": {"id": asset.id, "version": 1, "hash": digest},
-        "file": {"content_hash": digest, "format": "PNG"},
+        "asset": {"id": evidence_asset_id, "version": 1, "hash": evidence_asset_hash},
+        "file": {"content_hash": evidence_asset_hash, "format": "PNG"},
         "metadata": {},
         "generation": None,
     }
