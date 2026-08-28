@@ -2,8 +2,9 @@ from copy import deepcopy
 
 import pytest
 
-from src.db.models import Asset, Brand, FactEvidence, ProductFact, ProductProject, User, Workspace
+from src.db.models import Asset, Brand, FactEvidence, FactSnapshot, ProductFact, ProductProject, User, Workspace
 from src.services.fact_evidence_service import mark_fact_dependents_stale
+from src.services.langgraph_image_generation_service import approve_graph_storyboard
 from src.services.storyboard_service import (
     StoryboardValidationError,
     generate_storyboard,
@@ -94,6 +95,40 @@ def test_recommendations_build_three_candidates_and_never_assign_reference_asset
     assert hero["image_asset_id"] is None
     assert reference.id in hero["candidate_asset_ids"]
     assert hero["scene_request"]
+
+
+def test_recommendations_preserve_canonical_langgraph_section_ids(db_session):
+    project, user, fact, reference = _setup(db_session)
+    snapshot = FactSnapshot(
+        project_id=project.id,
+        purpose="lg12i-approved-facts",
+        snapshot_hash="b" * 64,
+        facts_json=[{"id": "seller-confirmed-fact", "value": "confirmed"}],
+    )
+    db_session.add(snapshot)
+    db_session.flush()
+    project.planning_draft = {
+        "cards": [
+            {"id": "hero", "type": "hero", "source_fact_ids": ["seller-confirmed-fact"], "is_enabled": True,
+             "rendering_template": "langgraph_commerce_planning"},
+            {"id": "feature_1", "type": "feature_1", "source_fact_ids": ["seller-confirmed-fact"], "is_enabled": True,
+             "rendering_template": "langgraph_commerce_planning"},
+            {"id": "product_information", "type": "product_specifications", "source_fact_ids": ["seller-confirmed-fact"],
+             "is_enabled": True, "rendering_template": "langgraph_commerce_planning"},
+        ],
+        "fact_snapshot_id": snapshot.id,
+        "fact_snapshot_hash": snapshot.snapshot_hash,
+    }
+    db_session.commit()
+
+    draft = generate_storyboard(project, [fact], [], db_session, user.id)
+
+    expected = {"hero", "feature_1", "product_information"}
+    assert {card["id"] for card in draft["cards"]} == expected
+    assert all({card["id"] for card in candidate["cards"]} == expected for candidate in draft["recommendations"])
+    assert all(card["rendering_template"] == "langgraph_commerce_planning" for card in draft["cards"])
+    assert draft["fact_snapshot_id"] == snapshot.id
+    assert draft["fact_snapshot_hash"] == snapshot.snapshot_hash
 
 
 def test_mock_ai_placeholders_do_not_hide_required_sprint5_scenes(db_session):
@@ -211,3 +246,36 @@ def test_storyboard_endpoints_select_approve_and_fact_asset_changes_mark_stale(c
     project.planning_draft["cards"][0]["candidate_asset_ids"] = [reference.id]
     assert mark_storyboard_assets_stale(project, [reference.id]) is True
     assert project.planning_draft["status"] == "stale"
+
+
+def test_graph_storyboard_approval_reuses_its_frozen_fact_snapshot(db_session):
+    project, _user, _legacy_fact, _reference = _setup(db_session)
+    snapshot = FactSnapshot(
+        project_id=project.id,
+        purpose="lg12i-approved-facts",
+        snapshot_hash="a" * 64,
+        facts_json=[{"id": "seller-confirmed-fact", "value": "confirmed"}],
+    )
+    db_session.add(snapshot)
+    db_session.flush()
+    project.planning_draft = {
+        "cards": [
+            {"id": "hero", "type": "hero", "source_fact_ids": [], "is_enabled": True},
+            {
+                "id": "product_information",
+                "type": "product_specifications",
+                "source_fact_ids": ["seller-confirmed-fact"],
+                "is_enabled": True,
+            },
+        ],
+        "fact_snapshot_id": snapshot.id,
+        "fact_snapshot_hash": snapshot.snapshot_hash,
+        "status": "draft",
+    }
+    db_session.commit()
+
+    approved = approve_graph_storyboard(project_id=project.id, db=db_session)
+
+    assert approved["status"] == "approved"
+    assert approved["fact_snapshot_id"] == snapshot.id
+    assert approved["fact_snapshot_hash"] == snapshot.snapshot_hash

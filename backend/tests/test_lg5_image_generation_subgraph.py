@@ -1412,6 +1412,7 @@ def test_lg10_manifest_keeps_scene_complete_when_one_seller_asset_is_reused(
         f"{run.id}-detail_closeup",
     }
     assert {item["asset_id"] for item in manifest["assets"]} == {asset.id}
+    assert {item["rights_status"] for item in manifest["assets"]} == {"seller_owned"}
     assert len(_manifest_entries(run=run, approved_asset_manifest=manifest, db=db_session)) == 2
 
     incomplete = deepcopy(manifest)

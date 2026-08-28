@@ -14,6 +14,7 @@ from src.services.storyboard_image_generation_service import (
     prepare_storyboard_jobs,
     start_storyboard_job,
     update_storyboard_job,
+    build_storyboard_generation_contracts,
 )
 from src.services.page_asset_policy import get_page_eligible_assets
 
@@ -90,6 +91,23 @@ def test_prepare_creates_two_reviewable_variants_and_keeps_reference_input_only(
     assert jobs[0]["input_snapshot"]["storyboard_status"] == "approved"
     # Idempotent preparation must not create an extra chargeable duplicate.
     assert len(prepare_storyboard_jobs(project, db_session)) == 1
+
+
+def test_graph_contracts_skip_explicit_non_generation_sections(db_session, tmp_path):
+    project, _ = _project(db_session, tmp_path)
+    draft = dict(project.planning_draft)
+    draft["cards"] = [
+        *draft["cards"][:-1],
+        {"id": "feature_1", "type": "benefit_a", "title": "Information only", "is_enabled": True,
+         "image_requirement": "not_required", "candidate_asset_ids": [], "source_fact_ids": []},
+        draft["cards"][-1],
+    ]
+    project.planning_draft = draft
+    db_session.commit()
+
+    contracts = build_storyboard_generation_contracts(project, db_session)
+
+    assert [contract["section_id"] for contract in contracts] == ["storyboard-hero-1"]
 
 
 def test_three_distinct_storyboard_scenes_create_independent_redesign_variants(db_session, tmp_path):

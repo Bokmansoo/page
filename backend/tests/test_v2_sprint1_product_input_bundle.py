@@ -1,4 +1,5 @@
 import base64
+import hashlib
 from unittest.mock import patch
 
 import pytest
@@ -238,6 +239,7 @@ def test_upload_endpoint_persists_seller_rights_choice(client):
     assert supplier.json()["usage_status"] == "reference_only"
     assert owned.status_code == 201
     assert owned.json()["usage_status"] == "seller_owned"
+    assert owned.json()["content_hash"] == hashlib.sha256(ONE_PIXEL_PNG).hexdigest()
 
     invalid = client.post(
         "/api/v1/files/upload",

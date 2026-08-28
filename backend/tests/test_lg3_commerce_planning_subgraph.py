@@ -171,3 +171,34 @@ def test_lg3_blocks_contextless_numbers_and_competitive_superiority_claims():
     assert cleaned["hero_title"] == "판매자 확인 정보 기준으로 안내합니다."
     assert provenance["feature_1_body"]["classification"] == "blocked_unsupported_claim"
     assert provenance["hero_title"]["classification"] == "blocked_unsupported_claim"
+
+
+def test_canonical_handoff_without_reference_freezes_information_only_scenes():
+    scenes = commerce._frozen_scene_plan(
+        {
+            "product_brief": {"safe_reference_assets": []},
+            "scenes": [{
+                "id": "hero",
+                "scene_type": "hero_product",
+                "objective": "Explain the product without inventing imagery.",
+                "source_fact_ids": ["fact-1"],
+                "requested_output": "generated_image",
+                "rendering_strategy": "cutout_composite",
+                "mock_status": "generation_pending",
+            }],
+        },
+        [{"id": "fact-1"}],
+        allow_generated_without_reference=True,
+        page_sections=[
+            {"id": "hero", "name": "Hero", "source_fact_ids": ["fact-1"]},
+            {"id": "product_information", "name": "Details", "source_fact_ids": ["fact-1"]},
+        ],
+    )
+
+    assert [scene["id"] for scene in scenes] == ["hero", "product_information"]
+    assert scenes[0]["reference_asset_ids"] == []
+    assert scenes[0]["generation_mode"] == "html_information_fallback"
+    assert scenes[0]["rendering_strategy"] == "html_information_fallback"
+    assert scenes[0]["mock_status"] == "information_fallback"
+    assert scenes[1]["scene_type"] == "spec_graphic"
+    assert scenes[1]["generation_mode"] == "html_information_fallback"
