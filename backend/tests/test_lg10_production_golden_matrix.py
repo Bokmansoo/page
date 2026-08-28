@@ -239,7 +239,11 @@ def test_lg10_fake_provider_production_golden_matrix(
     }
     db_session.commit()
 
-    generation_pending = _to_generation_pending(client, auth_headers, run.id, db_session)
+    # Make the golden scenario explicitly require provider work; the shared
+    # helper otherwise permits the no-image path to advance directly to QA.
+    generation_pending = _to_generation_pending(
+        client, auth_headers, run.id, db_session, minimum_generation_scenes=2
+    )
     provider_wait = _resume(
         client,
         auth_headers,
