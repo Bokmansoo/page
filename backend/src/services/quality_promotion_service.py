@@ -48,7 +48,8 @@ def _canonical_hash(value: Any) -> str:
 
 
 def _snapshot(version: DetailPageVersion) -> dict[str, Any]:
-    return deepcopy(dict(version.sections_json or {}))
+    value = version.sections_json
+    return deepcopy(value) if isinstance(value, dict) else {}
 
 
 def _has_lg12_quality_lineage(version: DetailPageVersion) -> bool:
