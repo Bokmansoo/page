@@ -104,7 +104,8 @@ def test_asset_approval_filtering_and_fallback(client, setup_package_project, db
     # 2. AI generated asset (ai_corrected) - but unapproved
     ai_unapproved_asset = Asset(
         project_id=project_id,
-        source_type="ai_corrected",
+        source_type="ai_generated",
+        usage_status="reference_only",
         filename="ai_generated_unapproved.jpg",
         file_path="/uploads/ai_generated_unapproved.jpg",
         mime_type="image/jpeg",
@@ -113,7 +114,7 @@ def test_asset_approval_filtering_and_fallback(client, setup_package_project, db
     # 3. AI generated asset - approved
     ai_approved_asset = Asset(
         project_id=project_id,
-        source_type="ai_corrected",
+        source_type="ai_generated",
         filename="ai_generated_approved.jpg",
         file_path="/uploads/ai_generated_approved.jpg",
         mime_type="image/jpeg",
@@ -204,7 +205,9 @@ def test_ai_edit_command_execution(client, setup_package_project, db_session):
         "freeform_instruction": "Make the title sound cooler"
     }
     res = client.post(f"/api/v1/projects/{project_id}/page/sections/{section_id}/ai-edit", json=payload, headers=headers)
-    assert res.status_code == 200
+    assert res.status_code == 410
+    assert "copy-rewrite/preview" in res.json()["detail"]["new_endpoint"]
+    return
     
     # Verify mock revision is appended in DB & Response
     db_session.refresh(target_section)
@@ -263,7 +266,7 @@ def test_ai_edit_rejects_section_from_another_project(
         headers=headers,
     )
 
-    assert response.status_code == 404
+    assert response.status_code == 410
     db_session.refresh(foreign_section)
     assert foreign_section.title == original_title
 
@@ -317,9 +320,7 @@ def test_move_section_changes_package_order(client, setup_package_project, db_se
         headers=headers,
     )
 
-    assert response.status_code == 200
-    reordered_ids = [section["id"] for section in response.json()["copy_sections"]]
-    assert reordered_ids[:2] == [second_id, first_id]
+    assert response.status_code == 410
 
 
 def test_page_scope_applies_copy_command_to_all_visible_sections(
@@ -346,16 +347,7 @@ def test_page_scope_applies_copy_command_to_all_visible_sections(
         headers=headers,
     )
 
-    assert response.status_code == 200
-    visible = [
-        section
-        for section in response.json()["copy_sections"]
-        if section["is_visible"]
-    ]
-    assert all(
-        "[Revision: Natural Tone]" in (section["body_copy"] or "")
-        for section in visible
-    )
+    assert response.status_code == 410
 
 
 def test_page_patch_rejects_unapproved_generated_asset(
@@ -373,14 +365,26 @@ def test_page_patch_rejects_unapproved_generated_asset(
     generated = Asset(
         project_id=project_id,
         source_type="ai_generated",
+        usage_status="reference_only",
         filename="unapproved.png",
         file_path="/uploads/unapproved.png",
         mime_type="image/png",
         file_size=100,
     )
-    db_session.add(generated)
-    db_session.commit()
     sections = package["copy_sections"]
+    db_session.add(generated)
+    db_session.add(
+        ImageGenerationJobRecord(
+            project_id=project_id,
+            job_id="unapproved-generated-job",
+            section_id=sections[0]["id"],
+            role="hero",
+            prompt="test prompt",
+            status="generating",
+            output_asset_id=generated.id,
+        )
+    )
+    db_session.commit()
     sections[0]["image_asset_id"] = generated.id
 
     response = client.patch(
@@ -401,7 +405,7 @@ def test_page_patch_rejects_unapproved_generated_asset(
         headers=headers,
     )
 
-    assert response.status_code == 400
+    assert response.status_code == 422
 
 
 def test_uploaded_original_asset_is_renderable(
