@@ -191,7 +191,9 @@ def test_lg11_regenerates_only_target_after_new_cost_approval_and_forks_frozen_v
     final = completed.json()
     assert final["status"] == "awaiting_review"
     assert final["current_stage"] == "quality_review"
-    fork = final["values"]["edit"]["scene_version_fork"]
+    edit_run = db_session.query(AgentRun).filter_by(id=started["run_id"]).one()
+    db_session.refresh(edit_run)
+    fork = edit_run.outputs_json["langgraph_edit"]["scene_version_fork"]
     child = db_session.query(DetailPageVersion).filter_by(id=fork["detail_page_version_id"]).one()
     assert child.sections_json["lg11"]["source_detail_page_version_id"] == source.id
     assert child.sections_json["lg11"]["scene_change"]["replacement_asset_id"] != original_asset_id

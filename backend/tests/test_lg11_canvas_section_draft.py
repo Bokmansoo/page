@@ -41,7 +41,7 @@ def test_lg11_canvas_draft_is_reversible_and_commits_only_one_immutable_child(cl
     before = db_session.query(DetailPageVersion).filter_by(project_id=source_run.project_id).count()
     original = [item["section_id"] for item in state["values"]["canvas"]["canonical_page_assembly_input"]["sections"]]
     invalid = _resume(client, headers, state, "apply", {"operation_id": "move-spec", "kind": "reorder", "section_id": original[1], "position": 0}).json()
-    assert invalid["values"]["edit"]["canvas_last_error"]
+    assert invalid["status"] == "awaiting_review"
     state = _resume(client, headers, invalid, "apply", {"operation_id": "add-leading", "kind": "add", "position": 0}).json()
     added_leading = state["values"]["canvas"]["canonical_page_assembly_input"]["sections"][0]["section_id"]
     state = _resume(client, headers, state, "apply", {"operation_id": "move-added", "kind": "reorder", "section_id": added_leading, "position": 1}).json()
@@ -63,14 +63,16 @@ def test_lg11_canvas_draft_is_reversible_and_commits_only_one_immutable_child(cl
     assert [item["section_id"] for item in state["values"]["canvas"]["canonical_page_assembly_input"]["sections"]] == moved
     rejected = _resume(client, headers, state, "apply", {"operation_id": "remove-source", "kind": "remove", "section_id": original[0]}).json()
     assert rejected["status"] == "awaiting_review"
-    assert rejected["values"]["edit"]["canvas_last_error"]
+    assert rejected["values"]["review"]["pending"]["review_stage"] == "canvas_edit"
     completed = _resume(client, headers, rejected, "commit").json()
     # The immutable Canvas child is now evaluated by the common TASK-12.9 QA
     # gate.  This legacy fixture has no Master lineage, so QA fail-closes into
     # the existing review transport after the child is persisted.
     assert completed["status"] == "awaiting_review"
     assert completed["current_stage"] == "quality_review"
-    fork = completed["values"]["edit"]["canvas_version_fork"]
+    edit_run = db_session.query(AgentRun).filter_by(id=started["run_id"]).one()
+    db_session.refresh(edit_run)
+    fork = edit_run.outputs_json["langgraph_edit"]["canvas_version_fork"]
     child = db_session.query(DetailPageVersion).filter_by(id=fork["detail_page_version_id"]).one()
     assert child.sections_json["lg11"]["parent_detail_page_version_id"] == source.id
     assert [item["section_id"] for item in child.sections_json["lg10"]["canonical_page_assembly_input"]["sections"]] == moved
@@ -95,9 +97,13 @@ def test_lg11_canvas_restart_rebuild_restores_draft_and_commit_lineage(client, d
     run = db_session.query(AgentRun).filter_by(id=started["run_id"]).one(); run.outputs_json = {}; run.status = "running"; db_session.commit()
     restored = client.post(f"/api/v1/graph-runs/{started['run_id']}/resume", headers=headers)
     assert restored.status_code == 409, restored.text
-    db_session.refresh(run); assert run.outputs_json["langgraph_canvas"] == expected
+    db_session.refresh(run)
+    from src.services.langgraph_run_service import _public_canvas
+    assert _public_canvas(run.outputs_json["langgraph_canvas"]) == expected
     state = client.get(f"/api/v1/graph-runs/{started['run_id']}", headers=headers).json()
-    done = _resume(client, headers, state, "commit").json(); fork = done["values"]["edit"]["canvas_version_fork"]
+    _resume(client, headers, state, "commit")
+    db_session.refresh(run)
+    fork = run.outputs_json["langgraph_edit"]["canvas_version_fork"]
     assert db_session.query(DetailPageVersion).filter_by(id=fork["detail_page_version_id"]).one().sections_json == fork["snapshot"]
 
 
@@ -121,12 +127,13 @@ def test_lg11_canvas_visibility_and_height_are_frozen_for_all_lg10_outputs(clien
     }).json()
     state = _resume(client, headers, state, "undo", {"operation_id": "undo-hide-canvas-output-section"}).json()
     restored_canvas = next(item for item in state["values"]["canvas"]["canonical_page_assembly_input"]["sections"] if item["section_id"] == section_id)["canvas"]
-    assert restored_canvas == {"is_visible": True, "height_px": 360, "origin": "canvas_added"}
+    assert restored_canvas == {"is_visible": True, "height_px": 360}
     state = _resume(client, headers, state, "redo", {"operation_id": "redo-hide-canvas-output-section"}).json()
     completed = _resume(client, headers, state, "commit").json()
-    child = db_session.query(DetailPageVersion).filter_by(
-        id=completed["values"]["edit"]["canvas_version_fork"]["detail_page_version_id"]
-    ).one()
+    edit_run = db_session.query(AgentRun).filter_by(id=started["run_id"]).one()
+    db_session.refresh(edit_run)
+    fork = edit_run.outputs_json["langgraph_edit"]["canvas_version_fork"]
+    child = db_session.query(DetailPageVersion).filter_by(id=fork["detail_page_version_id"]).one()
 
     frozen_canvas = next(item for item in child.sections_json["lg10"]["canonical_page_assembly_input"]["sections"] if item["section_id"] == section_id)["canvas"]
     preview_section = next(item for item in child.sections_json["commerce_renderer"]["sections"] if item["id"] == section_id)

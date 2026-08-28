@@ -73,6 +73,10 @@ def _start_and_approve_copy_edit(client, headers, run, version, *, copy_changes)
     return started.json(), response.json()
 
 
+def _persisted_edit(db_session, run_id):
+    return db_session.query(AgentRun).filter_by(id=run_id).one().outputs_json["langgraph_edit"]
+
+
 def test_lg11_copy_edit_forks_frozen_version_without_provider_or_asset_changes(
     client, auth_headers, db_session, tmp_path, lg11_runtime
 ):
@@ -94,7 +98,7 @@ def test_lg11_copy_edit_forks_frozen_version_without_provider_or_asset_changes(
     # stops at the bounded review gate rather than bypassing QA.
     assert state["status"] == "awaiting_review"
     assert state["current_stage"] == "quality_review"
-    fork = state["values"]["edit"]["copy_version_fork"]
+    fork = _persisted_edit(db_session, started["run_id"])["copy_version_fork"]
     assert fork["source_detail_page_version_id"] == source.id
     assert fork["parent_detail_page_version_id"] == source.id
     assert fork["edit_run_id"] == started["run_id"]
@@ -167,7 +171,7 @@ def test_lg11_copy_fork_rebuilds_checkpointed_result_without_duplicate_version(
         copy_changes={"hero": {"hero_subtitle": "제품을 더 간결하게 소개합니다"}},
     )
     edit_run = db_session.query(AgentRun).filter_by(id=started["run_id"]).one()
-    expected_fork = deepcopy(completed["values"]["edit"]["copy_version_fork"])
+    expected_fork = deepcopy(_persisted_edit(db_session, started["run_id"])["copy_version_fork"])
     version_count = db_session.query(DetailPageVersion).filter_by(project_id=source_run.project_id).count()
 
     # Simulate a process stopping after the final checkpoint but before the
@@ -216,7 +220,7 @@ def test_lg11_copy_fork_rejects_invalid_field_and_rejected_confirmation_does_not
     )
     assert rejected.status_code == 200, rejected.text
     assert rejected.json()["current_stage"] == "edit_rejected"
-    assert rejected.json()["values"]["edit"]["next_action"] == "none"
+    assert _persisted_edit(db_session, started.json()["run_id"])["next_action"] == "none"
     assert db_session.query(DetailPageVersion).filter_by(project_id=source_run.project_id).count() == before_versions
 
 
@@ -253,7 +257,7 @@ def test_lg11_fact_sensitive_direct_copy_is_not_forked_before_evidence_review(
     assert approved.json()["current_stage"] == "evidence_review"
     pending = approved.json()["values"]["review"]["pending"]
     assert pending["review_stage"] == "evidence_review"
-    assert approved.json()["values"]["edit"]["next_action"] == "fact_evidence_review"
+    assert _persisted_edit(db_session, started.json()["run_id"])["next_action"] == "fact_evidence_review"
     assert db_session.query(DetailPageVersion).filter_by(project_id=source_run.project_id).count() == before_versions
 
 
@@ -262,7 +266,7 @@ def test_lg11_existing_fact_rewrite_keeps_only_verified_field_provenance(
 ):
     source_run = _create_run(client, auth_headers, db_session, tmp_path)
     source, fact, _ = _frozen_lg10_version(db_session, source_run)
-    _, state = _start_and_approve_copy_edit(
+    started, state = _start_and_approve_copy_edit(
         client,
         auth_headers,
         source_run,
@@ -270,7 +274,7 @@ def test_lg11_existing_fact_rewrite_keeps_only_verified_field_provenance(
         copy_changes={"hero": {"hero_title": "저소음 모터를 강조한 선풍기"}},
     )
     assert state["current_stage"] == "quality_review"
-    fork = state["values"]["edit"]["copy_version_fork"]
+    fork = _persisted_edit(db_session, started["run_id"])["copy_version_fork"]
     edited = db_session.query(DetailPageVersion).filter_by(id=fork["detail_page_version_id"]).one()
     copy_ref = edited.sections_json["lg10"]["canonical_page_assembly_input"]["sections"][0]["copy_ref"]
     field_provenance = copy_ref["lg11_copy_overlay"]["field_provenance"]["hero_title"]
@@ -315,5 +319,5 @@ def test_lg11_new_nonnumeric_product_claim_requires_evidence_review_without_fork
     assert approved.status_code == 200, approved.text
     assert approved.json()["current_stage"] == "evidence_review"
     assert approved.json()["values"]["review"]["pending"]["review_stage"] == "evidence_review"
-    assert approved.json()["values"]["edit"]["next_action"] == "fact_evidence_review"
+    assert _persisted_edit(db_session, started.json()["run_id"])["next_action"] == "fact_evidence_review"
     assert db_session.query(DetailPageVersion).filter_by(project_id=source_run.project_id).count() == before_versions

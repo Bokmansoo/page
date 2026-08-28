@@ -116,7 +116,8 @@ def test_lg11_fact_change_requires_evidence_review_then_records_only_frozen_depe
     assert evidence_wait.status_code == 200, evidence_wait.text
     evidence_state = evidence_wait.json()
     assert evidence_state["current_stage"] == "evidence_review"
-    pending = evidence_state["values"]["review"]["pending"]
+    edit_run = db_session.query(AgentRun).filter_by(id=run_id).one()
+    pending = edit_run.outputs_json["langgraph_review"]["pending"]
     assert pending["context"]["fact_evidence"][0]["fact_id"] == fact.id
     assert pending["context"]["affected_section_ids"] == ["hero"]
     assert pending["context"]["affected_scene_ids"] == ["hero-scene"]
@@ -126,7 +127,8 @@ def test_lg11_fact_change_requires_evidence_review_then_records_only_frozen_depe
     completed = approved.json()
     assert completed["status"] == "completed"
     assert completed["current_stage"] == "fact_selective_stale"
-    stale = completed["values"]["edit"]["selective_stale"]
+    db_session.refresh(edit_run)
+    stale = edit_run.outputs_json["langgraph_edit"]["selective_stale"]
     assert stale["status"] == "stale"
     assert stale["fact_evidence"][0]["fact_id"] == fact.id
     assert stale["affected"]["section_ids"] == ["hero"]
@@ -142,7 +144,6 @@ def test_lg11_fact_change_requires_evidence_review_then_records_only_frozen_depe
     db_session.refresh(version)
     assert version.sections_json == source_snapshot
 
-    edit_run = db_session.query(AgentRun).filter_by(id=run_id).one()
     assert edit_run.outputs_json["langgraph_edit"]["selective_stale"] == stale
 
     duplicate = _resume(client, auth_headers, evidence_state, "approve")
@@ -178,7 +179,8 @@ def test_lg11_fact_evidence_reject_keeps_frozen_version_and_rebuilds_pending_rev
     result = rejected.json()
     assert result["status"] == "completed"
     assert result["current_stage"] == "fact_evidence_rejected"
-    assert result["values"]["edit"]["selective_stale"] == {
+    edit_run = db_session.query(AgentRun).filter_by(id=run_id).one()
+    assert edit_run.outputs_json["langgraph_edit"]["selective_stale"] == {
         "status": "not_applied", "reason": "evidence_review_rejected",
     }
     assert db_session.query(ImageGenerationOutboxRecord).filter_by(run_id=run_id).count() == 0

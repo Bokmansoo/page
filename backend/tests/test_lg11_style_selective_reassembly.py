@@ -124,14 +124,17 @@ def test_lg11_style_reassembly_reuses_frozen_product_contract_without_provider_w
     completed = result.json()
     assert completed["status"] == "awaiting_review"
     assert completed["current_stage"] == "quality_review"
-    assert completed["values"]["edit"]["impact_preview"]["expected_provider_cost"] == {
+    edit_run = db_session.query(AgentRun).filter_by(id=started["run_id"]).one()
+    db_session.refresh(edit_run)
+    persisted_edit = edit_run.outputs_json["langgraph_edit"]
+    assert persisted_edit["impact_preview"]["expected_provider_cost"] == {
         "status": "not_required",
         "source": "lg11_style_selective_reassembly",
         "currency": "credits",
         "total": 0,
         "scenes": [],
     }
-    fork = completed["values"]["edit"]["style_version_fork"]
+    fork = persisted_edit["style_version_fork"]
     assert fork["source_detail_page_version_id"] == source.id
     assert fork["parent_detail_page_version_id"] == source.id
     assert fork["snapshot"]["lg11"]["retained"]["scene_ids"] == ["hero-scene"]
@@ -166,7 +169,7 @@ def test_lg11_brand_kit_reassembly_pins_approved_brand_assets_and_rejects_unsafe
     db_session.commit()
     approved_kit = _brand_version(db_session, source_run, product)
 
-    _, state = _start(
+    started, state = _start(
         client,
         auth_headers,
         source_run,
@@ -175,7 +178,9 @@ def test_lg11_brand_kit_reassembly_pins_approved_brand_assets_and_rejects_unsafe
     )
     completed = _resume(client, auth_headers, state)
     assert completed.status_code == 200, completed.text
-    fork = completed.json()["values"]["edit"]["style_version_fork"]
+    edit_run = db_session.query(AgentRun).filter_by(id=started["run_id"]).one()
+    db_session.refresh(edit_run)
+    fork = edit_run.outputs_json["langgraph_edit"]["style_version_fork"]
     child = db_session.query(DetailPageVersion).filter_by(id=fork["detail_page_version_id"]).one()
     rendering = child.sections_json["lg10"]["canonical_rendering"]
     assert rendering["brand_tokens"]["brand_kit_version_id"] == approved_kit.id
@@ -209,7 +214,7 @@ def test_lg11_brand_kit_reassembly_pins_approved_brand_assets_and_rejects_unsafe
         unsafe_kit = _brand_version(db_session, source_run, unsafe, primary="#7C3AED")
         # The unsafe logo is excluded by the existing rights resolver.  Each
         # completed child remains the final immutable source for the next edit.
-        _, unsafe_state = _start(
+        unsafe_started, unsafe_state = _start(
             client,
             auth_headers,
             source_run,
@@ -218,7 +223,9 @@ def test_lg11_brand_kit_reassembly_pins_approved_brand_assets_and_rejects_unsafe
         )
         unsafe_result = _resume(client, auth_headers, unsafe_state)
         assert unsafe_result.status_code == 200, unsafe_result.text
-        unsafe_fork = unsafe_result.json()["values"]["edit"]["style_version_fork"]
+        unsafe_edit_run = db_session.query(AgentRun).filter_by(id=unsafe_started["run_id"]).one()
+        db_session.refresh(unsafe_edit_run)
+        unsafe_fork = unsafe_edit_run.outputs_json["langgraph_edit"]["style_version_fork"]
         unsafe_child = db_session.query(DetailPageVersion).filter_by(id=unsafe_fork["detail_page_version_id"]).one()
         layer = unsafe_child.sections_json["lg10"]["canonical_rendering"]["brand_tokens"]["asset_layer"]
         assert layer == {"logo": None, "watermark": None, "font_assets": []}
@@ -240,7 +247,9 @@ def test_lg11_style_reassembly_public_resume_rebuilds_checkpointed_child_lineage
     )
     completed = _resume(client, auth_headers, state)
     assert completed.status_code == 200, completed.text
-    fork = completed.json()["values"]["edit"]["style_version_fork"]
+    edit_run = db_session.query(AgentRun).filter_by(id=started["run_id"]).one()
+    db_session.refresh(edit_run)
+    fork = edit_run.outputs_json["langgraph_edit"]["style_version_fork"]
     child = db_session.query(DetailPageVersion).filter_by(id=fork["detail_page_version_id"]).one()
 
     # Simulate a process crash after the immutable checkpoint committed but

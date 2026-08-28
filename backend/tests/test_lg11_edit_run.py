@@ -77,7 +77,8 @@ def test_lg11_edit_run_uses_final_frozen_version_and_keeps_preview_read_only(
     assert payload["source_detail_page_version_id"] == version.id
     assert payload["parent_detail_page_version_id"] == version.id
     assert payload["state"]["status"] == "awaiting_review"
-    edit = payload["state"]["values"]["edit"]
+    persisted = db_session.query(AgentRun).filter_by(id=payload["run_id"]).one()
+    edit = persisted.outputs_json["langgraph_edit"]
     assert edit["base_version"] == {
         "id": version.id,
         "snapshot_hash": version.sections_json["snapshot_hash"],
@@ -90,7 +91,7 @@ def test_lg11_edit_run_uses_final_frozen_version_and_keeps_preview_read_only(
     assert edit["intent_id"] == payload["intent_id"]
     assert edit["impact_preview"] == preview.json()["impact_preview"]
 
-    persisted = db_session.query(AgentRun).filter_by(id=payload["run_id"]).one()
+    db_session.refresh(persisted)
     assert persisted.mode == "lg11_edit"
     assert persisted.outputs_json["langgraph_edit"] == edit
     assert persisted.outputs_json["langgraph_review"]["pending"]["review_stage"] == "edit_confirmation"
@@ -139,10 +140,12 @@ def test_lg11_edit_run_public_resume_rebuild_restores_lineage_and_confirmation_t
     assert resumed.status_code == 200, resumed.text
     state = resumed.json()
     assert state["status"] == "completed"
-    assert state["values"]["edit"]["confirmation"] == {"status": "confirmed", "decision": "approve"}
-    assert state["values"]["edit"]["lineage"] == expected_edit["lineage"]
-    assert state["values"]["edit"]["base_version"] == expected_edit["base_version"]
-    assert state["values"]["edit"]["next_action"] == "task_11_3_edit_execution"
+    db_session.refresh(edit_run)
+    persisted_edit = edit_run.outputs_json["langgraph_edit"]
+    assert persisted_edit["confirmation"] == {"status": "confirmed", "decision": "approve"}
+    assert persisted_edit["lineage"] == expected_edit["lineage"]
+    assert persisted_edit["base_version"] == expected_edit["base_version"]
+    assert persisted_edit["next_action"] == "task_11_3_edit_execution"
 
     # A browser retry after a completed confirmation is a read: no new step,
     # checkpoint lineage, or edit run is created.
@@ -211,8 +214,11 @@ def test_lg11_rejected_confirmation_is_not_an_edit_execution_candidate(
     state = response.json()
     assert state["status"] == "completed"
     assert state["current_stage"] == "edit_rejected"
-    assert state["values"]["edit"]["confirmation"] == {"status": "rejected", "decision": "reject"}
-    assert state["values"]["edit"]["next_action"] == "none"
+    edit_run = db_session.query(AgentRun).filter_by(id=started["run_id"]).one()
+    db_session.refresh(edit_run)
+    persisted_edit = edit_run.outputs_json["langgraph_edit"]
+    assert persisted_edit["confirmation"] == {"status": "rejected", "decision": "reject"}
+    assert persisted_edit["next_action"] == "none"
 
 
 def test_lg11_edit_run_rejects_non_final_and_cross_project_versions(

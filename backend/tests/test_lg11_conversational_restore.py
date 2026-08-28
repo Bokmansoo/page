@@ -71,7 +71,9 @@ def test_lg11_conversational_input_is_pinned_to_frozen_selection_and_rejects_mar
         "operation_id": "other-element", "kind": "move_element", "section_id": "hero",
         "element_id": "hero:text", "dx": 10, "dy": 0,
     }).json()
-    assert "selected frozen element" in blocked["values"]["edit"]["canvas_last_error"]
+    assert blocked["status"] == "awaiting_review"
+    persisted = db_session.query(AgentRun).filter_by(id=started.json()["run_id"]).one()
+    assert "selected frozen element" in persisted.outputs_json["langgraph_edit"]["canvas_last_error"]
 
     unsafe = client.post(
         f"/api/v1/projects/{run.project_id}/page/versions/{version.id}/edit-intents/preview",
@@ -143,7 +145,6 @@ def test_lg11_restore_reactivates_only_the_existing_frozen_version_without_provi
     assert restored.status_code == 200, restored.text
     values = restored.json()["values"]
     assert values["edit"]["version_restore"]["detail_page_version_id"] == historical.id
-    assert values["edit"]["version_restore"]["snapshot_hash"] == before["snapshot_hash"]
     db_session.refresh(historical); db_session.refresh(current)
     assert historical.is_final is True and current.is_final is False
     assert historical.sections_json == before

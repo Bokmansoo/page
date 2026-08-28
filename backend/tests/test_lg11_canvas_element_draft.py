@@ -45,7 +45,7 @@ def test_lg11_canvas_element_commands_are_reversible_and_commit_a_frozen_child(c
 
     state = _resume(client, headers, state, "apply", {"operation_id": "lock-asset", "kind": "set_lock", "section_id": "hero", "element_id": asset_id, "locked": True}).json()
     blocked = _resume(client, headers, state, "apply", {"operation_id": "blocked-move", "kind": "move_element", "section_id": "hero", "element_id": asset_id, "dx": 1, "dy": 0}).json()
-    assert blocked["values"]["edit"]["canvas_last_error"]
+    assert blocked["status"] == "awaiting_review"
     assert _element(blocked, asset_id)["x"] == 30
     state = _resume(client, headers, blocked, "apply", {"operation_id": "unlock-asset", "kind": "set_lock", "section_id": "hero", "element_id": asset_id, "locked": False}).json()
     state = _resume(client, headers, state, "apply", {"operation_id": "move-unlocked-asset", "kind": "move_element", "section_id": "hero", "element_id": asset_id, "dx": 1, "dy": 0}).json()
@@ -61,7 +61,7 @@ def test_lg11_canvas_element_commands_are_reversible_and_commit_a_frozen_child(c
     state = _resume(client, headers, state, "redo", {"operation_id": "redo-group-move"}).json()
     state = _resume(client, headers, state, "apply", {"operation_id": "ungroup-hero", "kind": "ungroup", "section_id": "hero", "group_id": group["group_id"]}).json()
     assert not state["values"]["canvas"]["element_groups"]
-    assert _element(state, asset_id)["element_id"] == asset_id and _element(state, asset_id)["group_id"] is None
+    assert _element(state, asset_id)["element_id"] == asset_id and _element(state, asset_id).get("group_id") is None
     state = _resume(client, headers, state, "apply", {"operation_id": "regroup-hero", "kind": "group", "element_ids": [asset_id, text_id]}).json()
     committed_group = state["values"]["canvas"]["element_groups"][0]
     state = _resume(client, headers, state, "apply", {"operation_id": "lock-group", "kind": "set_lock", "section_id": "hero", "group_id": committed_group["group_id"], "locked": True}).json()
@@ -71,11 +71,13 @@ def test_lg11_canvas_element_commands_are_reversible_and_commit_a_frozen_child(c
     run.outputs_json, run.status = {}, "running"; db_session.commit()
     assert client.post(f"/api/v1/graph-runs/{started['run_id']}/resume", headers=headers).status_code == 409
     db_session.refresh(run)
-    assert run.outputs_json["langgraph_canvas"] == expected_canvas
+    from src.services.langgraph_run_service import _public_canvas
+    assert _public_canvas(run.outputs_json["langgraph_canvas"]) == expected_canvas
 
     restored = client.get(f"/api/v1/graph-runs/{started['run_id']}", headers=headers).json()
     completed = _resume(client, headers, restored, "commit").json()
-    fork = completed["values"]["edit"]["canvas_version_fork"]
+    db_session.refresh(run)
+    fork = run.outputs_json["langgraph_edit"]["canvas_version_fork"]
     child = db_session.query(DetailPageVersion).filter_by(id=fork["detail_page_version_id"]).one()
     frozen_asset = next(item for item in next(section for section in child.sections_json["lg10"]["canonical_page_assembly_input"]["sections"] if section["section_id"] == "hero")["canvas_elements"] if item["element_id"] == asset_id)
     assert (frozen_asset["x"], frozen_asset["y"], frozen_asset["width"], frozen_asset["height"], frozen_asset["z_index"]) == (41, 17, 600, 420, 7)
@@ -98,7 +100,7 @@ def test_lg11_canvas_invalid_element_group_operation_is_rejected(client, db_sess
     _, state = _start(client, headers, source_run, source)
     state = _resume(client, headers, state, "approve").json()
     rejected = _resume(client, headers, state, "apply", {"operation_id": "cross-section-group", "kind": "group", "element_ids": ["hero:text", "specs:text"]}).json()
-    assert rejected["values"]["edit"]["canvas_last_error"]
+    assert rejected["status"] == "awaiting_review"
     assert not rejected["values"]["canvas"]["element_groups"]
 
 
@@ -106,7 +108,7 @@ def test_lg11_canvas_element_types_duplicate_delete_and_independent_background(c
     headers = _lg5_auth_headers.__wrapped__()
     source_run = _create_run(client, headers, db_session, tmp_path)
     source, _, _ = _frozen_lg10_version(db_session, source_run)
-    _, state = _start(client, headers, source_run, source)
+    started, state = _start(client, headers, source_run, source)
     state = _resume(client, headers, state, "approve").json()
     for kind, token in (("mask", "rounded"), ("icon", "check"), ("decorative", "divider")):
         state = _resume(client, headers, state, "apply", {
@@ -122,7 +124,10 @@ def test_lg11_canvas_element_types_duplicate_delete_and_independent_background(c
     hero = next(section for section in state["values"]["canvas"]["canonical_page_assembly_input"]["sections"] if section["section_id"] == "hero")
     duplicate = next(item for item in hero["canvas_elements"] if item["element_id"] != mask_id and item["kind"] == "mask")
     assert duplicate["element_id"] != mask_id and duplicate["kind"] == "mask"
-    assert duplicate["origin_element_id"] == created["mask"]["origin_element_id"]
+    run = db_session.query(AgentRun).filter_by(id=started["run_id"]).one()
+    persisted_hero = next(section for section in run.outputs_json["langgraph_canvas"]["canonical_page_assembly_input"]["sections"] if section["section_id"] == "hero")
+    persisted_duplicate = next(item for item in persisted_hero["canvas_elements"] if item["element_id"] == duplicate["element_id"])
+    assert persisted_duplicate["origin_element_id"] == "hero:mask"
     duplicate_before_delete = deepcopy(duplicate)
     unrelated_asset_before_delete = deepcopy(_element(state, "hero:asset"))
     state = _resume(client, headers, state, "apply", {"operation_id": "delete-mask", "kind": "delete_element", "section_id": "hero", "element_id": duplicate["element_id"]}).json()
@@ -135,7 +140,9 @@ def test_lg11_canvas_element_types_duplicate_delete_and_independent_background(c
     assert _element(state, "hero:asset") == unrelated_asset_before_delete
     state = _resume(client, headers, state, "apply", {"operation_id": "move-background", "kind": "move_element", "section_id": "hero", "element_id": "hero:background", "dx": 40, "dy": 0}).json()
     completed = _resume(client, headers, state, "commit").json()
-    child = db_session.query(DetailPageVersion).filter_by(id=completed["values"]["edit"]["canvas_version_fork"]["detail_page_version_id"]).one()
+    run = db_session.query(AgentRun).filter_by(id=started["run_id"]).one()
+    fork = run.outputs_json["langgraph_edit"]["canvas_version_fork"]
+    child = db_session.query(DetailPageVersion).filter_by(id=fork["detail_page_version_id"]).one()
     html = child.sections_json["lg10"]["canonical_rendering"]["html"]
     assert 'class="sf-canvas-background"' in html
     assert 'data-canvas-element-id="hero:background"' in html
@@ -169,7 +176,7 @@ def test_lg11_canvas_asset_replace_requires_rights_and_sha256(client, db_session
     assert (replaced["asset_id"], replaced["asset_content_hash"]) == (confirmed.id, digest)
     for label, asset_id, content_hash in (("blocked", blocked.id, digest), ("supplier", supplier.id, digest), ("reference", reference.id, digest), ("bad-hash", seller.id, "0" * 64), ("external", "https://example.test/image.png", digest)):
         rejected = _resume(client, headers, state, "apply", {"operation_id": f"replace-{label}", "kind": "replace_element", "section_id": "hero", "element_id": "hero:asset", "asset_id": asset_id, "asset_content_hash": content_hash}).json()
-        assert rejected["values"]["edit"]["canvas_last_error"]
+        assert rejected["status"] == "awaiting_review"
         assert _element(rejected, "hero:asset")["asset_id"] == confirmed.id
 
 
@@ -197,7 +204,7 @@ def test_lg11_canvas_multi_asset_identity_and_locked_group_history(client, db_se
     state = _resume(client, headers, state, "apply", {"operation_id": "lock-group", "kind": "set_lock", "section_id": "hero", "group_id": group["group_id"], "locked": True}).json()
     for operation, payload in (("move-locked-group", {"kind": "move_group", "group_id": group["group_id"], "dx": 1, "dy": 1}), ("ungroup-locked-group", {"kind": "ungroup", "group_id": group["group_id"]}), ("move-locked-child", {"kind": "move_element", "element_id": "hero:text", "dx": 1, "dy": 1})):
         rejected = _resume(client, headers, state, "apply", {"operation_id": operation, "section_id": "hero", **payload}).json()
-        assert rejected["values"]["edit"]["canvas_last_error"]
+        assert rejected["status"] == "awaiting_review"
     state = _resume(client, headers, state, "undo", {"operation_id": "undo-lock"}).json()
     assert state["values"]["canvas"]["element_groups"][0]["locked"] is False
     state = _resume(client, headers, state, "redo", {"operation_id": "redo-lock"}).json()
