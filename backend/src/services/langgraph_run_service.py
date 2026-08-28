@@ -740,6 +740,8 @@ class AgentRunEventJournal:
                     allowed_decisions.update({"regenerate", "upload"})
                 if payload["stage"] == "seller_confirmation":
                     allowed_decisions.add("submit")
+                if payload["stage"] == "canvas_edit":
+                    allowed_decisions.update({"apply", "undo", "redo", "commit"})
                 if lifecycle["decision"] not in allowed_decisions:
                     raise ValueError("Seller review decision is not allowlisted.")
         if "identity" in payload:
