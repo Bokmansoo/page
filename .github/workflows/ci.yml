@@ -46,6 +46,11 @@ jobs:
           cd backend
           uv sync --dev
 
+      - name: Install Playwright Chromium
+        run: |
+          cd backend
+          uv run playwright install --with-deps chromium
+
       - name: Prepare PostgreSQL test schema
         run: |
           cd backend
