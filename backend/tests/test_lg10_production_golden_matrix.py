@@ -130,20 +130,26 @@ def test_lg10_production_completes_without_required_image_jobs(
     assert state["values"]["quality"]["seller_review_required"] is True
     generation = state["values"]["generation"]
     assert generation["image_generation_required"] is False
-    assert generation["completion_basis"] == "no_required_image_scenes"
     assert generation["required_scene_count"] == 0
     assert generation["all_required_scenes_approved"] is True
     assert generation.get("jobs", []) == []
+    # Canonical assembly inputs are persisted on the immutable page version,
+    # not exposed through the bounded seller-facing generation projection.
+    assert "completion_basis" not in generation
+    assert "canonical_page_assembly_input" not in generation
     assert db_session.query(ImageGenerationJobRecord).filter_by(project_id=run.project_id).count() == 0
 
-    canonical_input = generation["canonical_page_assembly_input"]
+    version_id = state["values"]["rendering"]["detail_page_version"]["id"]
+    version = db_session.query(DetailPageVersion).filter_by(id=version_id, project_id=run.project_id).one()
+    snapshot = version.sections_json
+    canonical_input = snapshot["lg10"]["canonical_page_assembly_input"]
     assert canonical_input["approved_asset_manifest"] is None
     assert canonical_input["image_generation_contract"] == {
         "required_scene_count": 0,
         "completion_basis": "no_required_image_scenes",
     }
-    assembly = state["values"]["page_assembly"]
-    rendering = state["values"]["rendering"]
+    assembly = snapshot["lg10"]["page_assembly"]
+    rendering = snapshot["lg10"]["canonical_rendering"]
     assert assembly["page_asset_manifest_ref"] == {
         "manifest_hash": canonical_input["page_asset_manifest"]["manifest_hash"]
     }
@@ -171,9 +177,6 @@ def test_lg10_production_completes_without_required_image_jobs(
         }
         assert {asset_id for asset_id, _ in manifest_assets} <= allowed_assets
 
-    version_id = rendering["detail_page_version"]["id"]
-    version = db_session.query(DetailPageVersion).filter_by(id=version_id).one()
-    assert version.sections_json["lg10"]["canonical_page_assembly_input"] == canonical_input
     bundle = build_lg10_standalone_export_bundle(
         db=db_session,
         project_id=run.project_id,
@@ -272,9 +275,13 @@ def test_lg10_fake_provider_production_golden_matrix(
     assert state["values"]["quality"]["quality_bar_verdict"] == "NEEDS_REVIEW"
 
     generation = state["values"]["generation"]
-    manifest = generation["approved_asset_manifest"]
-    assembly = state["values"]["page_assembly"]
-    rendering = state["values"]["rendering"]
+    version_ref = state["values"]["rendering"]["detail_page_version"]
+    version = db_session.query(DetailPageVersion).filter_by(id=version_ref["id"], project_id=run.project_id).one()
+    snapshot = deepcopy(version.sections_json)
+    canonical_input = snapshot["lg10"]["canonical_page_assembly_input"]
+    manifest = canonical_input["approved_asset_manifest"]
+    assembly = snapshot["lg10"]["page_assembly"]
+    rendering = snapshot["lg10"]["canonical_rendering"]
     assert all(job["status"] == "approved" for job in generation["jobs"])
     assert all(re.fullmatch(r"[0-9a-f]{64}", asset["asset_content_hash"]) for asset in manifest["assets"])
     assert assembly["design_direction"] == rendering["design_direction"] == direction
@@ -286,12 +293,10 @@ def test_lg10_fake_provider_production_golden_matrix(
     assert re.search(r"max-width\s*:\s*760px(?:;|$)", page_rule["declarations"])
     assert re.search(r"position\s*:\s*relative(?:;|$)", page_rule["declarations"])
     assert re.fullmatch(r"[0-9a-f]{64}", rendering["render_hash"])
-    assert rendering["canonical_input_ref"]["input_hash"] == generation["canonical_page_assembly_input"]["input_hash"]
+    assert rendering["canonical_input_ref"]["input_hash"] == canonical_input["input_hash"]
     assert rendering["page_assembly_ref"]["assembly_hash"] == assembly["assembly_hash"]
 
-    version_id = rendering["detail_page_version"]["id"]
-    version = db_session.query(DetailPageVersion).filter_by(id=version_id, project_id=run.project_id).one()
-    snapshot = deepcopy(version.sections_json)
+    version_id = version.id
     assert version.is_final is True
     assert snapshot["lg10"]["canonical_page_assembly_input"]["approved_asset_manifest"] == manifest
     assert snapshot["lg10"]["page_assembly"] == assembly
