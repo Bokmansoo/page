@@ -78,6 +78,20 @@ def lg5_runtime(monkeypatch):
     return saver
 
 
+@pytest.fixture
+def lg5_subgraph_runtime(monkeypatch, lg5_runtime):
+    """Select the LG-5 graph for tests that assert its terminal route."""
+
+    from src.agents.langgraph_runtime import build_lg5_compiled_graph
+    from src.services import langgraph_run_service
+
+    def build_test_lg5_compiled_graph(*, checkpointer):
+        return build_lg5_compiled_graph(checkpointer=checkpointer)
+
+    monkeypatch.setattr(langgraph_run_service, "build_lg5_compiled_graph", build_test_lg5_compiled_graph)
+    return lg5_runtime
+
+
 def _create_run(client, headers, db_session, tmp_path, *, mode: str = "mock") -> AgentRun:
     response = client.post("/api/agent-runs", headers=headers, json={
         "product_name": "LG-5 image workflow pillow",
@@ -469,7 +483,9 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
         brand_kit_id=kit.id, workspace_id=run.workspace_id, version=1, status="active",
         scope="workspace", logo_asset_ids=[brand_logo.id],
         color_tokens={"primary": "#2563EB", "secondary": "#EFF6FF"},
-        typography={"font_family": "Arial"}, watermark_policy={"mode": "logo_subtle"},
+        # Keep this workflow fixture within LG-11's safe export geometry;
+        # branded watermark geometry is covered by the LG-10 safety tests.
+        typography={"font_family": "Arial"}, watermark_policy={"mode": "none"},
         content_hash="e" * 64, created_by=run.created_by,
     )
     db_session.add(brand_version)
@@ -550,7 +566,10 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
     # Approving one scene must keep the same graph in image_review. Completion
     # happens only after every required scene has an explicit seller decision.
     required_count = generation["required_scene_count"]
-    while image_review["status"] != "completed":
+    while (
+        image_review["status"] == "awaiting_review"
+        and image_review["values"]["review"]["pending"]["review_stage"] == "image_review"
+    ):
         pending = image_review["values"]["review"]["pending"]
         review_jobs = pending["context"]["generation"]["jobs"]
         target = next(item for item in review_jobs if item["status"] == "needs_review")
@@ -560,23 +579,31 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
         approved_asset = db_session.query(Asset).filter(Asset.id == target["output_asset_id"]).one()
         assert is_asset_final_output_eligible(approved_asset)
         image_review = response.json()
-        if image_review["status"] != "completed":
-            assert image_review["current_stage"] == "image_review"
+
+    assert image_review["status"] == "awaiting_review"
+    assert image_review["values"]["review"]["pending"]["review_stage"] == "quality_review"
+    approved_generation = db_session.query(AgentRun).filter(AgentRun.id == run.id).one().outputs_json[
+        "langgraph_generation"
+    ]
+    quality_response = _resume(client, auth_headers, image_review, "approve")
+    assert quality_response.status_code == 200, quality_response.text
+    image_review = quality_response.json()
+    assert image_review["status"] == "completed"
 
     assert required_count == len(jobs)
     assert image_review["values"]["review"]["pending"] is None
-    assert image_review["values"]["generation"]["all_required_scenes_approved"] is True
-    assert all(item["status"] == "approved" for item in image_review["values"]["generation"]["jobs"])
-    manifest = image_review["values"]["generation"]["approved_asset_manifest"]
+    assert approved_generation["all_required_scenes_approved"] is True
+    assert all(item["status"] == "approved" for item in approved_generation["jobs"])
+    manifest = approved_generation["approved_asset_manifest"]
     assert manifest["schema_version"] == "lg9-approved-asset-manifest-v1"
     assert manifest["run_id"] == run.id
     assert manifest["project_id"] == run.project_id
     assert {item["asset_id"] for item in manifest["assets"]} == set(
-        image_review["values"]["generation"]["approved_asset_ids"]
+        approved_generation["approved_asset_ids"]
     )
     assert all(re.fullmatch(r"[0-9a-f]{64}", item["asset_content_hash"]) for item in manifest["assets"])
     assert manifest["manifest_hash"]
-    canonical_input = image_review["values"]["generation"]["canonical_page_assembly_input"]
+    canonical_input = approved_generation["canonical_page_assembly_input"]
     assert canonical_input["schema_version"] == "lg10-canonical-page-assembly-input-v1"
     assert canonical_input["approved_asset_manifest"] == manifest
     assert canonical_input["design_direction"] == "image_centric"
@@ -596,7 +623,8 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
         for section in canonical_input["sections"]
         for asset in section["approved_assets"]
     } == {asset["asset_id"] for asset in manifest["assets"]}
-    assembly = image_review["values"]["page_assembly"]
+    persisted_outputs = db_session.query(AgentRun).filter(AgentRun.id == run.id).one().outputs_json
+    assembly = persisted_outputs["langgraph_page_assembly"]
     assert assembly["schema_version"] == "lg10-page-assembly-v1"
     assert assembly["canonical_input_ref"] == {
         "schema_version": canonical_input["schema_version"],
@@ -614,7 +642,10 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
         for section in assembly["sections"]
     )
     assert "html" not in repr(assembly).lower()
-    rendering = image_review["values"]["rendering"]
+    rendering = db_session.query(DetailPageVersion).filter(
+        DetailPageVersion.project_id == run.project_id,
+        DetailPageVersion.id == image_review["values"]["rendering"]["detail_page_version"]["id"],
+    ).one().sections_json["lg10"]["canonical_rendering"]
     assert rendering["schema_version"] == "lg10-canonical-render-v1"
     assert rendering["design_direction"] == "image_centric"
     assert rendering["renderer_tokens"]["renderer_token"] == "image_centric_v1"
@@ -623,10 +654,8 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
     assert rendering["brand_tokens"]["asset_layer"]["logo"] == {
         "asset_id": brand_logo.id, "asset_content_hash": brand_logo.content_hash,
     }
-    assert rendering["brand_tokens"]["asset_layer"]["watermark"] == rendering["brand_tokens"]["asset_layer"]["logo"]
     assert f'data-asset-id="{brand_logo.id}"' in rendering["html"]
     assert 'data-brand-placement="header"' in rendering["html"]
-    assert 'data-brand-placement="watermark"' in rendering["html"]
     assert rendering["canonical_input_ref"]["input_hash"] == canonical_input["input_hash"]
     assert rendering["page_assembly_ref"]["assembly_hash"] == assembly["assembly_hash"]
     assert re.fullmatch(r"[0-9a-f]{64}", rendering["render_hash"])
@@ -652,28 +681,31 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
             for field in canonical_section["copy_ref"]["fields"]
         ]
     assert all(escape(item["text"]) in rendering["html"] for section in rendering["sections"] for item in section["text_layer"])
-    version_ref = rendering["detail_page_version"]
-    assert version_ref["schema_version"] == "lg10-detail-page-version-v1"
+    version_id = image_review["values"]["rendering"]["detail_page_version"]["id"]
     version = db_session.query(DetailPageVersion).filter(
-        DetailPageVersion.id == version_ref["id"],
+        DetailPageVersion.id == version_id,
         DetailPageVersion.project_id == run.project_id,
     ).one()
     assert version.is_final is True
     assert version.style_key == "image_centric"
     version_snapshot = deepcopy(version.sections_json)
+    version_ref = {
+        "id": version.id,
+        "schema_version": version_snapshot["schema_version"],
+        "snapshot_hash": version_snapshot["snapshot_hash"],
+    }
+    assert version_ref["schema_version"] == "lg10-detail-page-version-v1"
     assert version_snapshot["schema_version"] == "lg10-detail-page-version-v1"
     assert version_snapshot["snapshot_hash"] == version_ref["snapshot_hash"]
     assert version_snapshot["lg10"]["canonical_page_assembly_input"] == canonical_input
     assert version_snapshot["lg10"]["page_assembly"] == assembly
-    assert version_snapshot["lg10"]["canonical_rendering"] == {
-        key: value for key, value in rendering.items() if key != "detail_page_version"
-    }
+    assert version_snapshot["lg10"]["canonical_rendering"] == rendering
     assert [section["section_type"] for section in version_snapshot["commerce_renderer"]["sections"]] == [
         section["section_id"] for section in rendering["sections"]
     ]
     assert version_snapshot["commerce_renderer"]["brand_assets"] == {
         "logo": {"asset_id": brand_logo.id, "asset_content_hash": brand_logo.content_hash},
-        "watermark": {"asset_id": brand_logo.id, "asset_content_hash": brand_logo.content_hash},
+        "watermark": None,
     }
     brand_logo_path = Path(brand_logo.file_path)
     original_brand_logo_bytes = brand_logo_path.read_bytes()
@@ -785,7 +817,11 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
     assert completed_run.outputs_json["langgraph_generation"]["approved_asset_manifest"] == manifest
     assert completed_run.outputs_json["langgraph_generation"]["canonical_page_assembly_input"] == canonical_input
     assert completed_run.outputs_json["langgraph_page_assembly"] == assembly
-    assert completed_run.outputs_json["langgraph_page_rendering"] == rendering
+    assert {
+        key: value
+        for key, value in completed_run.outputs_json["langgraph_page_rendering"].items()
+        if key != "detail_page_version"
+    } == rendering
 
     from src.services.page_finalization_service import build_canonical_page_assembly_input
     invalid_manifest = deepcopy(manifest)
@@ -893,10 +929,15 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
     assert refreshed_state["values"]["review"]["pending"] is None
     assert refreshed_state["values"]["generation"]["all_required_scenes_approved"] is True
     assert all(item["status"] == "approved" for item in refreshed_state["values"]["generation"]["jobs"])
-    assert refreshed_state["values"]["generation"]["approved_asset_manifest"] == manifest
-    assert refreshed_state["values"]["generation"]["canonical_page_assembly_input"] == canonical_input
-    assert refreshed_state["values"]["page_assembly"] == assembly
-    assert refreshed_state["values"]["rendering"] == rendering
+    refreshed_outputs = db_session.query(AgentRun).filter(AgentRun.id == run.id).one().outputs_json
+    assert refreshed_outputs["langgraph_generation"]["approved_asset_manifest"] == manifest
+    assert refreshed_outputs["langgraph_generation"]["canonical_page_assembly_input"] == canonical_input
+    assert refreshed_outputs["langgraph_page_assembly"] == assembly
+    assert {
+        key: value
+        for key, value in refreshed_outputs["langgraph_page_rendering"].items()
+        if key != "detail_page_version"
+    } == rendering
 
     # Simulate a process stopping after the LangGraph checkpoint commit but
     # before the AgentRun SQL projection was written. History replay must use
@@ -921,7 +962,11 @@ def test_lg5r_cost_outbox_worker_checkpoint_resume_and_per_scene_review(
     assert rebuilt.outputs_json["langgraph_generation"]["approved_asset_manifest"] == manifest
     assert rebuilt.outputs_json["langgraph_generation"]["canonical_page_assembly_input"] == canonical_input
     assert rebuilt.outputs_json["langgraph_page_assembly"] == assembly
-    assert rebuilt.outputs_json["langgraph_page_rendering"] == rendering
+    assert {
+        key: value
+        for key, value in rebuilt.outputs_json["langgraph_page_rendering"].items()
+        if key != "detail_page_version"
+    } == rendering
     rebuilt_version = db_session.query(DetailPageVersion).filter(DetailPageVersion.id == version.id).one()
     assert rebuilt_version.sections_json == version_snapshot
 
@@ -1551,11 +1596,15 @@ def test_lg5r_real_provider_failure_dead_letters_one_scene_and_enters_review(
     assert successful_job["output_asset_id"] is not None
 
 
-def test_lg5r_planning_reference_and_attempt_change_idempotency(client, auth_headers, db_session, lg5_runtime, tmp_path):
+def test_lg5r_planning_reference_and_attempt_change_idempotency(
+    client, auth_headers, db_session, lg5_subgraph_runtime, tmp_path
+):
     from src.services import langgraph_image_generation_service as image_graph
 
     run = _create_run(client, auth_headers, db_session, tmp_path)
-    generation_wait = _to_generation_pending(client, auth_headers, run.id)
+    generation_wait = _to_generation_pending(
+        client, auth_headers, run.id, db_session, minimum_generation_scenes=2
+    )
     first_plan = generation_wait["values"]["review"]["pending"]["context"]["generation"]["cost_plan"]
 
     project = db_session.query(ProductProject).filter(ProductProject.id == run.project_id).one()
