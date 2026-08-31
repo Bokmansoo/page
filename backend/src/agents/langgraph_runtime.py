@@ -128,6 +128,24 @@ class SellformGraphState(TypedDict, total=False):
     quality: Annotated[dict[str, Any], _merge_discovery]
 
 
+class SocialKitGraphState(TypedDict, total=False):
+    """Reference-only state for the LG-15 deterministic social planner."""
+
+    run_id: str
+    thread_id: str
+    workspace_id: str
+    project_id: str
+    mode: str
+    current_stage: str
+    status: str
+    events: Annotated[list[dict[str, Any]], add]
+    social_request: dict[str, Any]
+    social: Annotated[dict[str, Any], _merge_discovery]
+    quality: Annotated[dict[str, Any], _merge_discovery]
+    render: Annotated[dict[str, Any], _merge_discovery]
+    generation: Annotated[dict[str, Any], _merge_discovery]
+
+
 class LG11EditGraphState(TypedDict, total=False):
     """Durable LG-11 edit-run state, isolated from the LG-1 through LG-10 graph.
 
@@ -296,6 +314,30 @@ def build_lg11_edit_graph_input(
         "status": "created",
         "events": [],
         "edit": copy.deepcopy(edit),
+    }
+
+
+def build_lg15_social_kit_graph_input(
+    *,
+    run_id: str,
+    workspace_id: str,
+    project_id: str,
+    social_request: dict[str, Any],
+) -> SocialKitGraphState:
+    """Build the narrow, checkpoint-safe social planning input."""
+
+    from src.services.social_kit_version_service import validate_social_kit_request
+
+    return {
+        "run_id": run_id,
+        "thread_id": run_id,
+        "workspace_id": workspace_id,
+        "project_id": project_id,
+        "mode": "lg15_social_kit",
+        "current_stage": "social_kit_requested",
+        "status": "created",
+        "events": [],
+        "social_request": validate_social_kit_request(social_request),
     }
 
 
@@ -3582,6 +3624,303 @@ def _lg12i_creative_brief_route(state: SellformGraphState) -> str:
     """A blocked Brief is a terminal recovery state, never a Master input."""
 
     return "commerce_creative_master" if str(state.get("current_stage") or "") == "product_creative_brief" else "finish"
+
+
+def _social_node_event(stage: str, status: str, *, node_status: str = "completed") -> dict[str, Any]:
+    return {
+        "stage": stage,
+        "status": status,
+        "node_status": node_status,
+        "event_type": "node_completed" if node_status == "completed" else "node_failed",
+    }
+
+
+def _social_run(state: SocialKitGraphState, db: Any):
+    from src.db.models import AgentRun
+
+    return db.query(AgentRun).filter_by(
+        id=state["run_id"],
+        workspace_id=state["workspace_id"],
+        project_id=state["project_id"],
+    ).one()
+
+
+def _social_source_guard(state: SocialKitGraphState) -> dict[str, Any]:
+    from src.services.langgraph_discovery_service import current_langgraph_session
+    from src.services.langgraph_run_service import AgentRunEventJournal
+    from src.services.social_kit_version_service import resolve_current_social_master
+
+    db = current_langgraph_session()
+    if db is None:
+        raise RuntimeError("SocialKit graph node requires the graph database session.")
+    run = _social_run(state, db)
+    request = dict(state.get("social_request") or {})
+    master = resolve_current_social_master(
+        db,
+        workspace_id=run.workspace_id,
+        project_id=run.project_id,
+        source_master_reference=request["source_master_reference"],
+    )
+    master_ref = {"id": master.id, "version": master.version, "hash": master.canonical_hash}
+    AgentRunEventJournal.append_social_lifecycle(
+        run,
+        db,
+        event_type="social_kit_requested",
+        transition="requested",
+        master_ref=master_ref,
+        channel=request["target_channel"],
+        target_format=request["target_format"],
+        card_count=0,
+        status="requested",
+        template_version=request["template_version"],
+        evaluator_version=request["evaluator_version"],
+    )
+    return {
+        "current_stage": "social_planning",
+        "status": "running",
+        "events": [_social_node_event("social_source_guard", "running")],
+        "social": {"master_ref": master_ref, "channel": request["target_channel"], "format": request["target_format"]},
+    }
+
+
+def _social_card_planner(state: SocialKitGraphState) -> dict[str, Any]:
+    from src.services.langgraph_discovery_service import current_langgraph_session
+    from src.services.langgraph_run_service import AgentRunEventJournal
+    from src.services.social_kit_version_service import evaluate_social_card_quality, plan_social_kit_version
+
+    db = current_langgraph_session()
+    if db is None:
+        raise RuntimeError("SocialKit graph node requires the graph database session.")
+    run = _social_run(state, db)
+    request = dict(state.get("social_request") or {})
+    kit = plan_social_kit_version(db, run=run, request=request)
+    quality = evaluate_social_card_quality(db, kit)
+    master_ref = dict((state.get("social") or {}).get("master_ref") or {})
+    kit_ref = {"id": kit.id, "version": kit.version, "hash": kit.canonical_hash}
+    manifest = dict(kit.card_manifest_json or {})
+    card_count = len(manifest.get("cards") or [])
+    event_kwargs = {
+        "run": run,
+        "db": db,
+        "master_ref": master_ref,
+        "social_kit_ref": kit_ref,
+        "channel": kit.target_channel,
+        "target_format": kit.target_format,
+        "card_count": card_count,
+        "template_version": kit.template_version,
+        "evaluator_version": kit.evaluator_version,
+    }
+    AgentRunEventJournal.append_social_lifecycle(
+        event_type="social_planning_completed", transition="completed", status="planned", **event_kwargs,
+    )
+    AgentRunEventJournal.append_social_lifecycle(
+        event_type="social_kit_version_created", transition="completed", status="created", **event_kwargs,
+    )
+    AgentRunEventJournal.append_social_quality(run, db, quality=quality)
+    # The immutable kit and its bounded lifecycle journal are durable before
+    # the outer SQL projection runs, so a transport crash can replay only the
+    # projection without recreating the kit.
+    db.commit()
+    return {
+        "current_stage": "social_review_ready",
+        "status": "running",
+        "events": [_social_node_event("social_review_ready", "running")],
+        "social": {
+            "master_ref": master_ref,
+            "social_kit_ref": kit_ref,
+            "channel": kit.target_channel,
+            "format": kit.target_format,
+            "card_count": card_count,
+            "manifest_schema_version": manifest.get("manifest_schema_version"),
+            "manifest_hash": kit.output_hash,
+            "status": "review_ready",
+            "execution_mode": kit.execution_mode,
+            "template_version": kit.template_version,
+            "evaluator_version": kit.evaluator_version,
+        },
+        "quality": quality,
+    }
+
+
+def _social_card_renderer(state: SocialKitGraphState) -> dict[str, Any]:
+    from src.services.langgraph_discovery_service import current_langgraph_session
+    from src.services.langgraph_run_service import AgentRunEventJournal
+    from src.services.social_kit_version_service import (
+        deterministic_social_render_profile,
+        evaluate_social_platform_quality,
+    )
+    from src.services.langgraph_image_generation_service import prepare_social_card_generation_jobs
+    from src.services.image_generation_worker import claim_image_delivery, process_image_delivery, worker_identity
+
+    db = current_langgraph_session()
+    if db is None:
+        raise RuntimeError("SocialKit graph node requires the graph database session.")
+    run = _social_run(state, db)
+    social = dict(state.get("social") or {})
+    kit_ref = dict(social.get("social_kit_ref") or {})
+    from src.db.models import SocialKitVersion
+
+    kit = db.query(SocialKitVersion).filter_by(
+        id=kit_ref.get("id"), workspace_id=run.workspace_id, project_id=run.project_id,
+    ).one_or_none()
+    if kit is None:
+        raise ValueError("SocialKit render source is missing or out of scope.")
+    master_ref = dict(social.get("master_ref") or {})
+    event_kwargs = {
+        "run": run,
+        "db": db,
+        "master_ref": master_ref,
+        "social_kit_ref": kit_ref,
+        "channel": kit.target_channel,
+        "target_format": kit.target_format,
+        "card_count": len(list((kit.card_manifest_json or {}).get("cards") or [])),
+        "template_version": kit.template_version,
+        "evaluator_version": kit.evaluator_version,
+    }
+    profile = deterministic_social_render_profile(kit)
+    generation = prepare_social_card_generation_jobs(
+        run_id=run.id, project_id=run.project_id, kit_id=kit.id, render_profile=profile, db=db,
+    )
+    generation_payload = {
+        **generation,
+        "cards": [
+            {
+                "card_id": card["card_id"],
+                "role": card["role"],
+                "job_ref": card["job_ref"],
+                "asset_ref": None,
+                "semantic_hash": card["semantic_hash"],
+                # The request event is a semantic intent, so its card state
+                # must not vary when a replay observes an already-processed
+                # outbox row.
+                "status": "queued",
+            }
+            for card in generation["cards"]
+        ],
+    }
+    from src.services.prompt_intelligence_service import canonical_hash
+    generation_payload["canonical_hash"] = canonical_hash(
+        {key: value for key, value in generation_payload.items() if key != "canonical_hash"}
+    )
+    AgentRunEventJournal.append_social_generation_lifecycle(
+        event_type="social_card_generation_requested", generation=generation_payload,
+        **event_kwargs,
+    )
+    owner = worker_identity()
+    for _ in generation["cards"]:
+        delivery = claim_image_delivery(db, owner=owner, run_id=run.id)
+        if delivery is None:
+            continue
+        process_image_delivery(delivery.id, owner, db)
+    db.expire_all()
+    generated_cards: list[dict[str, Any]] = []
+    for card in generation["cards"]:
+        from src.db.models import Asset, ImageGenerationJobRecord
+
+        job = db.query(ImageGenerationJobRecord).filter_by(
+            job_id=card["job_id"], project_id=run.project_id,
+        ).one()
+        asset = db.get(Asset, job.output_asset_id) if job.output_asset_id else None
+        asset_ref = None
+        if asset is not None and asset.content_hash:
+            asset_ref = {"id": str(asset.id), "version": 1, "hash": str(asset.content_hash)}
+        generated_cards.append({**card, "asset_ref": asset_ref, "status": str(job.status)})
+    generation_result = {
+        **generation,
+        "cards": [
+            {
+                "card_id": card["card_id"],
+                "role": card["role"],
+                "job_ref": card["job_ref"],
+                "asset_ref": card["asset_ref"],
+                "semantic_hash": card["semantic_hash"],
+                "status": card["status"],
+            }
+            for card in generated_cards
+        ],
+        "status": "completed" if all(card["asset_ref"] for card in generated_cards) else "failed",
+    }
+    generation_result["canonical_hash"] = canonical_hash(
+        {key: value for key, value in generation_result.items() if key != "canonical_hash"}
+    )
+    AgentRunEventJournal.append_social_generation_lifecycle(
+        event_type="social_card_generation_completed", generation=generation_result,
+        **event_kwargs,
+    )
+    render_cards = [
+        {
+            "card_id": card["card_id"],
+            "role": card["role"],
+            "asset_ref": card["asset_ref"],
+            "semantic_hash": card["semantic_hash"],
+            "status": "rendered",
+        }
+        for card in generated_cards if card["asset_ref"]
+    ]
+    render = {
+        "schema_version": "lg15-social-render-v1",
+        "execution_mode": "deterministic_fake",
+        "social_kit_ref": kit_ref,
+        "source_master_ref": master_ref,
+        "render_profile": profile,
+        "cards": render_cards,
+        "status": "completed",
+    }
+    render["canonical_hash"] = canonical_hash(render)
+    render_started = {
+        "schema_version": "lg15-social-render-v1",
+        "execution_mode": "deterministic_fake",
+        "social_kit_ref": kit_ref,
+        "source_master_ref": master_ref,
+        "render_profile": profile,
+        "cards": [],
+        "status": "running",
+    }
+    render_started["canonical_hash"] = canonical_hash(render_started)
+    AgentRunEventJournal.append_social_render_lifecycle(
+        event_type="social_render_started", transition="started", status="running",
+        render=render_started, **event_kwargs,
+    )
+    for card in render["cards"]:
+        card_render = {**render, "cards": [card]}
+        card_render["canonical_hash"] = canonical_hash({key: value for key, value in card_render.items() if key != "canonical_hash"})
+        AgentRunEventJournal.append_social_render_lifecycle(
+            event_type="social_card_rendered", transition="completed", status="rendered",
+            render=card_render, **event_kwargs,
+        )
+    platform_quality = evaluate_social_platform_quality(db, kit, render)
+    if platform_quality["verdict"] != "PASS":
+        raise ValueError(f"SocialKit platform validation failed: {','.join(platform_quality['reasons'])}")
+    AgentRunEventJournal.append_social_render_lifecycle(
+        event_type="social_render_completed", transition="completed", status="completed",
+        render=render, **event_kwargs,
+    )
+    AgentRunEventJournal.append_social_lifecycle(
+        event_type="social_review_ready", transition="completed", status="review_ready", **event_kwargs,
+    )
+    db.commit()
+    return {
+        "current_stage": "social_review_ready",
+        "status": "completed",
+        "events": [_social_node_event("social_review_ready", "completed")],
+        "render": render,
+        "generation": generation_result,
+        "social": {"status": "rendered", "render_status": "completed", "generation_status": generation_result["status"]},
+    }
+
+
+def build_lg15_social_kit_compiled_graph(*, checkpointer: BaseCheckpointSaver[Any]):
+    """Compile the minimal deterministic SocialKit subgraph in LG runtime."""
+
+    graph = StateGraph(SocialKitGraphState)
+    graph.add_node("social_source_guard", _social_source_guard)
+    graph.add_node("social_card_planner", _social_card_planner)
+    graph.add_node("social_card_renderer", _social_card_renderer)
+    graph.add_edge(START, "social_source_guard")
+    graph.add_edge("social_source_guard", "social_card_planner")
+    graph.add_edge("social_card_planner", "social_card_renderer")
+    graph.add_edge("social_card_renderer", END)
+    return graph.compile(checkpointer=checkpointer)
 
 
 def build_lg12i_intake_compiled_graph(*, checkpointer: BaseCheckpointSaver[Any]):

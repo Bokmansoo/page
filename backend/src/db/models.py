@@ -931,6 +931,84 @@ class CommerceCreativeMasterVersion(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
 
 
+class SocialKitVersion(Base):
+    """Immutable, reference-only Social Creative Kit frozen from one Master."""
+
+    __tablename__ = "social_kit_versions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "version", name="uq_social_kit_project_version"),
+        UniqueConstraint("project_id", "canonical_hash", name="uq_social_kit_project_hash"),
+        UniqueConstraint("project_id", "idempotency_key", name="uq_social_kit_project_idempotency"),
+        CheckConstraint("version > 0", name="ck_social_kit_version_positive"),
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    workspace_id = Column(String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    creator_run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="RESTRICT"), nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    schema_version = Column(String(80), nullable=False)
+    parent_version_id = Column(String(36), ForeignKey("social_kit_versions.id", ondelete="RESTRICT"), nullable=True)
+    parent_version = Column(Integer, nullable=True)
+    parent_version_hash = Column(String(64), nullable=True)
+    source_master_id = Column(String(36), ForeignKey("commerce_creative_master_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    source_master_version = Column(Integer, nullable=False)
+    source_master_hash = Column(String(64), nullable=False)
+    approved_fact_snapshot_ref_json = Column(JSON, nullable=False, default=dict)
+    creative_brief_ref_json = Column(JSON, nullable=False, default=dict)
+    brand_kit_ref_json = Column(JSON, nullable=False, default=dict)
+    rights_asset_refs_json = Column(JSON, nullable=False, default=list)
+    target_channel = Column(String(80), nullable=False)
+    target_format = Column(String(80), nullable=False)
+    channel_contract_ref_json = Column(JSON, nullable=False, default=dict)
+    execution_mode = Column(String(40), nullable=False)
+    template_version = Column(String(100), nullable=False)
+    evaluator_version = Column(String(100), nullable=False)
+    card_manifest_json = Column(JSON, nullable=False, default=list)
+    output_hash = Column(String(64), nullable=False, index=True)
+    idempotency_key = Column(String(64), nullable=False)
+    canonical_hash = Column(String(64), nullable=False, index=True)
+    created_by = Column(String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+
+class SocialCardCopyVersion(Base):
+    """Immutable seller-editable copy body; kits retain only its reference."""
+
+    __tablename__ = "social_card_copy_versions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "card_id", "version", name="uq_social_copy_project_card_version"),
+        UniqueConstraint("project_id", "idempotency_key", name="uq_social_copy_project_idempotency"),
+        CheckConstraint("version > 0", name="ck_social_copy_version_positive"),
+        CheckConstraint("char_length(body_text) BETWEEN 1 AND 2000", name="ck_social_copy_body_bounded"),
+        CheckConstraint("body_hash ~ '^[0-9a-f]{64}$'", name="ck_social_copy_body_hash"),
+        CheckConstraint("canonical_hash ~ '^[0-9a-f]{64}$'", name="ck_social_copy_canonical_hash"),
+        CheckConstraint("idempotency_key ~ '^[0-9a-f]{64}$'", name="ck_social_copy_idempotency_key"),
+        CheckConstraint("validation_status IN ('PASS','REVIEW_REQUIRED','FAIL')", name="ck_social_copy_validation_status"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    workspace_id = Column(String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_social_kit_id = Column(String(36), ForeignKey("social_kit_versions.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_social_kit_version = Column(Integer, nullable=False)
+    card_id = Column(String(100), nullable=False)
+    source_master_id = Column(String(36), ForeignKey("commerce_creative_master_versions.id", ondelete="RESTRICT"), nullable=False)
+    source_master_version = Column(Integer, nullable=False)
+    version = Column(Integer, nullable=False)
+    parent_version_id = Column(String(36), ForeignKey("social_card_copy_versions.id", ondelete="RESTRICT"), nullable=True)
+    parent_version = Column(Integer, nullable=True)
+    parent_version_hash = Column(String(64), nullable=True)
+    body_text = Column(Text, nullable=False)
+    body_hash = Column(String(64), nullable=False)
+    validation_status = Column(String(32), nullable=False)
+    validation_result_json = Column(JSON, nullable=False, default=dict)
+    author_id = Column(String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    idempotency_key = Column(String(64), nullable=False)
+    canonical_hash = Column(String(64), nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+
 class QualityThresholdProfileVersion(Base):
     """Immutable, project-scoped threshold contract for frozen DetailPage QA."""
 
@@ -1679,6 +1757,8 @@ _LG12I_IMMUTABLE_VERSION_MODELS = (
     ProductTruthVersion,
     SellerConfirmationVersion,
     CommerceCreativeMasterVersion,
+    SocialKitVersion,
+    SocialCardCopyVersion,
     ProductCreativeBriefVersion,
     QualityThresholdProfileVersion,
     QualityAssessmentReportVersion,

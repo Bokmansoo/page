@@ -75,10 +75,17 @@ class DurableFakeImageProvider:
         # Keep the product silhouette/color family while deliberately changing
         # the commercial composition. This lets the normal identity validator
         # prove both preservation and non-reproduction in the fake-provider E2E.
-        image = Image.new("RGB", (512, 512), color=(224, 232, 238))
+        try:
+            width, height = (int(part) for part in request.size.lower().split("x", 1))
+            if width <= 0 or height <= 0 or width > 4096 or height > 4096:
+                raise ValueError
+        except (TypeError, ValueError):
+            width, height = 512, 512
+        image = Image.new("RGB", (width, height), color=(224, 232, 238))
         draw = ImageDraw.Draw(image)
-        draw.ellipse((188, 116, 324, 228), fill=(138, 148, 158))
-        draw.rounded_rectangle((112, 210, 400, 354), radius=44, fill=(128, 139, 150))
+        scale = min(width, height) / 512
+        draw.ellipse((188 * scale, 116 * scale, 324 * scale, 228 * scale), fill=(138, 148, 158))
+        draw.rounded_rectangle((112 * scale, 210 * scale, 400 * scale, 354 * scale), radius=int(44 * scale), fill=(128, 139, 150))
         buffer = BytesIO()
         image.save(buffer, format="PNG")
         return ImageGenerationResult(
@@ -239,15 +246,19 @@ def recover_expired_image_work(
 
 
 def claim_image_delivery(
-    db: Session, *, owner: str, lease_seconds: int | None = None, now: datetime.datetime | None = None
+    db: Session, *, owner: str, lease_seconds: int | None = None, now: datetime.datetime | None = None,
+    run_id: str | None = None,
 ) -> ImageGenerationOutboxRecord | None:
     now = now or datetime.datetime.utcnow()
     lease_seconds = lease_seconds or settings.SELLFORM_IMAGE_WORKER_LEASE_SECONDS
     recover_expired_image_work(db, now=now)
-    candidates = db.query(ImageGenerationOutboxRecord).filter(
+    candidate_query = db.query(ImageGenerationOutboxRecord).filter(
         ImageGenerationOutboxRecord.status.in_(["queued", "retry_wait"]),
         ImageGenerationOutboxRecord.available_at <= now,
-    ).order_by(ImageGenerationOutboxRecord.created_at.asc()).limit(10).all()
+    )
+    if run_id:
+        candidate_query = candidate_query.filter(ImageGenerationOutboxRecord.run_id == run_id)
+    candidates = candidate_query.order_by(ImageGenerationOutboxRecord.created_at.asc()).limit(10).all()
     for candidate in candidates:
         if _scoped_delivery(candidate, db) is None:
             db.commit()

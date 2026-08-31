@@ -23,6 +23,7 @@ from src.api.prompt_intelligence import router as prompt_intelligence_router
 from src.api.brand_kits import router as brand_kits_router
 from src.api.creative_briefs import router as creative_briefs_router
 from src.api.quality_promotion import router as quality_promotion_router
+from src.api.social_kit import router as social_kit_router
 
 
 
@@ -115,6 +116,7 @@ app.include_router(prompt_intelligence_router, prefix="/api/v1")
 app.include_router(brand_kits_router, prefix="/api/v1")
 app.include_router(creative_briefs_router, prefix="/api/v1")
 app.include_router(quality_promotion_router, prefix="/api/v1")
+app.include_router(social_kit_router, prefix="/api/v1")
 
 
 # Mount Static Uploads Folder

@@ -10,6 +10,7 @@ import datetime
 import hashlib
 import json
 import re
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from typing import Any
 
@@ -623,6 +624,152 @@ def dispatch_graph_image_jobs(*, run_id: str, project_id: str, mode: str, db: Se
             )
     db.commit()
     return _summary(_owned_jobs(project_id, run_id, db))
+
+
+SOCIAL_GENERATION_SCHEMA_VERSION = "lg15-social-generation-v1"
+SOCIAL_GENERATION_CONTRACT_VERSION = "lg15-social-generation-contract-v1"
+
+
+def prepare_social_card_generation_jobs(
+    *, run_id: str, project_id: str, kit_id: str, render_profile: dict[str, Any], db: Session,
+    card_ids: Sequence[str] | None = None,
+    variant_ref_overrides: Mapping[str, Mapping[str, Any]] | None = None,
+    commit: bool = True,
+) -> dict[str, Any]:
+    """Pin one deterministic fake-provider job per frozen SocialKit card."""
+
+    from src.services.prompt_intelligence_service import canonical_hash
+    from src.services.social_kit_version_service import (
+        SocialKitContractError,
+        evaluate_social_card_quality,
+        validate_social_kit_version,
+    )
+    from src.db.models import SocialKitVersion
+
+    run = _run(run_id, project_id, db)
+    kit = db.query(SocialKitVersion).filter_by(
+        id=kit_id, workspace_id=run.workspace_id, project_id=project_id,
+    ).with_for_update().one_or_none()
+    if kit is None:
+        raise SocialKitContractError("SocialKit generation source is missing or out of scope.")
+    validate_social_kit_version(db, kit)
+    if evaluate_social_card_quality(db, kit).get("verdict") != "PASS":
+        raise SocialKitContractError("SocialKit content quality must pass before generation.")
+    profile_hash = str(render_profile.get("canonical_hash") or "")
+    if len(profile_hash) != 64:
+        raise SocialKitContractError("SocialKit generation profile hash is invalid.")
+    canvas = dict(render_profile.get("canvas") or {})
+    output_size = f"{int(canvas.get('width') or 0)}x{int(canvas.get('height') or 0)}"
+    if render_profile.get("schema_version") == "lg15-social-render-profile-v2" and output_size != "1080x1350":
+        raise SocialKitContractError("SocialKit generation requires the canonical Instagram canvas.")
+    if render_profile.get("schema_version") != "lg15-social-render-profile-v2":
+        output_size = "512x512"
+    cards = list((kit.card_manifest_json or {}).get("cards") or [])
+    selected_card_ids = (
+        {str(card.get("card_id") or "") for card in cards}
+        if card_ids is None
+        else {str(value) for value in card_ids}
+    )
+    if not selected_card_ids or not selected_card_ids.issubset({str(card.get("card_id") or "") for card in cards}):
+        raise SocialKitContractError("SocialKit generation target card is missing or out of scope.")
+    jobs: list[dict[str, Any]] = []
+    for card in cards:
+        card_id = str(card.get("card_id") or "")
+        if card_id not in selected_card_ids:
+            continue
+        source_ref = dict(card.get("asset_ref") or {})
+        source_asset = db.query(Asset).filter_by(
+            id=source_ref.get("id"), project_id=project_id,
+        ).one_or_none()
+        if source_asset is None or str(source_asset.content_hash or "") != str(source_ref.get("hash") or ""):
+            raise SocialKitContractError("SocialKit card source asset is stale or out of scope.")
+        identity = {
+            "social_kit": {"id": kit.id, "version": int(kit.version), "hash": str(kit.canonical_hash)},
+            "card_id": card_id,
+            "selected_variant_ref": dict((variant_ref_overrides or {}).get(card_id) or card.get("selected_variant_ref") or {}),
+            "copy_ref": dict(card.get("copy_ref") or {}),
+            "generation_contract_version": SOCIAL_GENERATION_CONTRACT_VERSION,
+            "render_profile_hash": profile_hash,
+        }
+        semantic_hash = canonical_hash(identity)
+        job = db.query(ImageGenerationJobRecord).filter_by(idempotency_key=semantic_hash).one_or_none()
+        if job is None:
+            prompt = f"social-card:{card_id}:{str(card.get('role') or '')}"
+            job = ImageGenerationJobRecord(
+                project_id=project_id,
+                job_id=f"lg15-{semantic_hash[:24]}",
+                section_id=card_id,
+                scene_id=card_id,
+                role=str(card.get("role") or "social_card"),
+                source_asset_ids=[str(source_asset.id)],
+                prompt=prompt,
+                negative_prompt="no text, logos, watermarks, prices, or invented product features",
+                preserve_product_identity=True,
+                output_size=output_size,
+                cost_tier="standard",
+                status="queued",
+                provider="fake_provider",
+                model="fake-image-lg15-v1",
+                input_snapshot={
+                    "scene_prompt": {
+                        "id": semantic_hash,
+                        "scene_id": card_id,
+                        "prompt_version": SOCIAL_GENERATION_CONTRACT_VERSION,
+                        "prompt_hash": canonical_hash({"prompt": prompt}),
+                        "reference_hash": str(kit.source_master_hash),
+                        "input_hash": semantic_hash,
+                        "identity_constraints": {},
+                    },
+                    "social_generation": identity,
+                },
+                validation_result={"status": "pending"},
+                estimated_cost=0.0,
+                usage_metadata={
+                    "langgraph_run_id": run.id,
+                    "langgraph_thread_id": run.graph_thread_id or run.id,
+                    "langgraph_mode": "lg15_social_kit",
+                    "social_generation": identity,
+                },
+                prompt_version=SOCIAL_GENERATION_CONTRACT_VERSION,
+                prompt_hash=canonical_hash({"prompt": prompt}),
+                reference_hash=str(kit.source_master_hash),
+                planning_hash=str(kit.canonical_hash),
+                input_hash=semantic_hash,
+                generation_attempt=1,
+                idempotency_key=semantic_hash,
+                required_for_completion=True,
+            )
+            db.add(job)
+            db.flush()
+            db.add(ImageGenerationOutboxRecord(
+                workspace_id=run.workspace_id,
+                project_id=project_id,
+                run_id=run.id,
+                thread_id=run.graph_thread_id or run.id,
+                image_job_id=job.id,
+                job_id=job.job_id,
+                idempotency_key=semantic_hash,
+                provider_mode="mock",
+                status="queued",
+            ))
+        jobs.append({
+            "card_id": card_id,
+            "role": str(card.get("role") or "social_card"),
+            "job_id": str(job.job_id),
+            "job_ref": {"id": str(job.id), "version": 1, "hash": semantic_hash},
+            "semantic_hash": semantic_hash,
+            "status": str(job.status),
+        })
+    if commit:
+        db.commit()
+    return {
+        "schema_version": SOCIAL_GENERATION_SCHEMA_VERSION,
+        "generation_contract_version": SOCIAL_GENERATION_CONTRACT_VERSION,
+        "social_kit_ref": {"id": kit.id, "version": int(kit.version), "hash": str(kit.canonical_hash)},
+        "render_profile_hash": profile_hash,
+        "cards": jobs,
+        "status": "queued",
+    }
 
 
 def collect_graph_image_results(*, run_id: str, project_id: str, db: Session) -> dict[str, Any]:

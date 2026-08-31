@@ -37,6 +37,8 @@ from src.agents.langgraph_runtime import (
     build_lg12i_intake_compiled_graph,
     build_lg12i_intake_graph_input,
     build_lg11_edit_graph_input,
+    build_lg15_social_kit_compiled_graph,
+    build_lg15_social_kit_graph_input,
     langgraph_runtime_enabled,
     open_postgres_checkpointer,
 )
@@ -134,8 +136,19 @@ _EVENT_TYPES = frozenset({
     "quality_re_evaluated",
     "quality_blocked",
     "quality_stale",
+    "social_kit_requested",
+    "social_planning_completed",
+    "social_kit_version_created",
+    "social_review_ready",
+    "social_render_started",
+    "social_card_rendered",
+    "social_render_completed",
+    "social_card_generation_requested",
+    "social_card_generation_completed",
+    "social_card_action_submitted",
+    "social_kit_version_forked",
 })
-_EVENT_REFERENCE_NAMES = ("source_snapshot", "truth", "confirmation", "creative_brief", "commerce_creative_master")
+_EVENT_REFERENCE_NAMES = ("source_snapshot", "truth", "confirmation", "creative_brief", "commerce_creative_master", "social_kit")
 _SOURCE_FIDELITY_STATES = frozenset({"unknown", "seller_entered", "captured", "ready", "partial_observation_ready", "recovery"})
 _RECOVERY_EVENT_TYPES = frozenset({
     "lease_expired_requeued",
@@ -203,7 +216,20 @@ _REVIEW_LIFECYCLE_EVENT_TYPES = frozenset({"seller_choice_submitted", "review_re
 _QUALITY_LIFECYCLE_EVENT_TYPES = frozenset({
     "quality_evaluated", "quality_rework_required", "quality_re_evaluated", "quality_blocked", "quality_stale",
 })
-_LIFECYCLE_TRANSITIONS = frozenset({"started", "completed", "skipped", "failed", "cancelled", "blocked", "reentered", "recovered", "rebuilt", "checkpointed", "submitted", "resumed"})
+_SOCIAL_EVENT_TYPES = frozenset({
+    "social_kit_requested",
+    "social_planning_completed",
+    "social_kit_version_created",
+    "social_review_ready",
+})
+_SOCIAL_RENDER_EVENT_TYPES = frozenset({"social_render_started", "social_card_rendered", "social_render_completed"})
+_SOCIAL_GENERATION_EVENT_TYPES = frozenset({"social_card_generation_requested", "social_card_generation_completed"})
+_SOCIAL_ACTION_EVENT_TYPES = frozenset({"social_card_action_submitted", "social_kit_version_forked"})
+_SOCIAL_STATUSES = frozenset({"requested", "planned", "created", "review_ready"})
+_SOCIAL_RENDER_STATUSES = frozenset({"running", "rendered", "completed"})
+_SOCIAL_QUALITY_DIMENSION_STATUSES = frozenset({"PASS", "FAIL", "DEFERRED"})
+_SOCIAL_QUALITY_VERDICTS = frozenset({"PASS", "REVIEW_REQUIRED", "FAIL"})
+_LIFECYCLE_TRANSITIONS = frozenset({"started", "requested", "completed", "skipped", "failed", "cancelled", "blocked", "reentered", "recovered", "rebuilt", "checkpointed", "submitted", "resumed"})
 _SLO_EXECUTION_PROFILES = frozenset({"production", "test", "mock"})
 _SLO_MINIMUM_SAMPLES = 30
 _SLO_WINDOW_DAYS = 30
@@ -646,8 +672,20 @@ class AgentRunEventJournal:
             expected_fields.add("failure")
         if event_type in _TIMING_EVENT_TYPES:
             expected_fields.add("timing")
-        if event_type in _STAGE_LIFECYCLE_EVENT_TYPES or event_type in _RUN_LIFECYCLE_EVENT_TYPES or event_type in _REVIEW_LIFECYCLE_EVENT_TYPES or event_type in _QUALITY_LIFECYCLE_EVENT_TYPES:
+        if event_type in _STAGE_LIFECYCLE_EVENT_TYPES or event_type in _RUN_LIFECYCLE_EVENT_TYPES or event_type in _REVIEW_LIFECYCLE_EVENT_TYPES or event_type in _QUALITY_LIFECYCLE_EVENT_TYPES or event_type in _SOCIAL_EVENT_TYPES or event_type in _SOCIAL_RENDER_EVENT_TYPES or event_type in _SOCIAL_GENERATION_EVENT_TYPES or event_type in _SOCIAL_ACTION_EVENT_TYPES:
             expected_fields.add("lifecycle")
+        if event_type in _SOCIAL_EVENT_TYPES:
+            expected_fields.add("social")
+        if event_type in _SOCIAL_RENDER_EVENT_TYPES:
+            expected_fields.add("social")
+            expected_fields.add("render")
+        if event_type in _SOCIAL_GENERATION_EVENT_TYPES:
+            expected_fields.add("social")
+            expected_fields.add("generation")
+        if event_type in _SOCIAL_ACTION_EVENT_TYPES:
+            expected_fields.add("action")
+        if event_type in _QUALITY_LIFECYCLE_EVENT_TYPES and "quality" in payload:
+            expected_fields.add("quality")
         # Identity was added after the initial journal rollout.  Older rows
         # remain replayable, while every new append receives this bounded
         # authority record in ``append`` below.
@@ -723,7 +761,7 @@ class AgentRunEventJournal:
                     raise ValueError("AgentRun delivery timing reference is invalid.")
                 if not isinstance(timing["attempt"], int) or not 0 <= timing["attempt"] <= 1000:
                     raise ValueError("AgentRun delivery timing attempt is invalid.")
-        if event_type in _STAGE_LIFECYCLE_EVENT_TYPES or event_type in _RUN_LIFECYCLE_EVENT_TYPES or event_type in _REVIEW_LIFECYCLE_EVENT_TYPES or event_type in _QUALITY_LIFECYCLE_EVENT_TYPES:
+        if event_type in _STAGE_LIFECYCLE_EVENT_TYPES or event_type in _RUN_LIFECYCLE_EVENT_TYPES or event_type in _REVIEW_LIFECYCLE_EVENT_TYPES or event_type in _QUALITY_LIFECYCLE_EVENT_TYPES or event_type in _SOCIAL_EVENT_TYPES or event_type in _SOCIAL_RENDER_EVENT_TYPES or event_type in _SOCIAL_GENERATION_EVENT_TYPES or event_type in _SOCIAL_ACTION_EVENT_TYPES:
             lifecycle = payload["lifecycle"]
             lifecycle_keys = {"transition", "checkpoint_id"}
             if event_type == "seller_choice_submitted":
@@ -744,6 +782,197 @@ class AgentRunEventJournal:
                     allowed_decisions.update({"apply", "undo", "redo", "commit"})
                 if lifecycle["decision"] not in allowed_decisions:
                     raise ValueError("Seller review decision is not allowlisted.")
+        if event_type in _SOCIAL_ACTION_EVENT_TYPES:
+            action = payload["action"]
+            if not isinstance(action, dict) or set(action) != {
+                "action", "action_idempotency_key", "parent_social_kit_ref", "successor_social_kit_ref",
+                "card_ref", "variant_ref", "copy_ref", "preserved_card_count",
+            }:
+                raise ValueError("Social card action payload is not allowlisted.")
+            if action["action"] not in {"reorder", "delete", "regenerate", "request_alternative", "select_alternative", "edit_copy"}:
+                raise ValueError("Social card action is not allowlisted.")
+            if not isinstance(action["action_idempotency_key"], str) or not re.fullmatch(r"[0-9a-f]{64}", action["action_idempotency_key"]):
+                raise ValueError("Social card action idempotency key is invalid.")
+            for name in ("parent_social_kit_ref", "successor_social_kit_ref"):
+                if AgentRunEventJournal._reference(action[name]) != action[name]:
+                    raise ValueError("Social card action kit reference is invalid.")
+            if action["card_ref"] is not None and AgentRunEventJournal._reference(action["card_ref"]) != action["card_ref"]:
+                raise ValueError("Social card action card reference is invalid.")
+            if action["variant_ref"] is not None and AgentRunEventJournal._reference(action["variant_ref"]) != action["variant_ref"]:
+                raise ValueError("Social card action variant reference is invalid.")
+            if action["copy_ref"] is not None and AgentRunEventJournal._reference(action["copy_ref"]) != action["copy_ref"]:
+                raise ValueError("Social card action copy reference is invalid.")
+            if not isinstance(action["preserved_card_count"], int) or not 0 <= action["preserved_card_count"] <= 100:
+                raise ValueError("Social card preserved count is invalid.")
+        if event_type in _SOCIAL_EVENT_TYPES:
+            social = payload["social"]
+            if not isinstance(social, dict) or set(social) != {
+                "channel", "format", "execution_mode", "template_version", "evaluator_version", "card_count", "status",
+            }:
+                raise ValueError("SocialKit event payload is not an allowlisted shape.")
+            for key, limit in (("channel", 80), ("format", 80), ("execution_mode", 40), ("template_version", 100), ("evaluator_version", 100)):
+                if not isinstance(social[key], str) or not 0 < len(social[key]) <= limit:
+                    raise ValueError("SocialKit event scalar is invalid.")
+            if social["execution_mode"] != "deterministic_fake" or not isinstance(social["card_count"], int) or not 0 <= social["card_count"] <= 100:
+                raise ValueError("SocialKit event metadata is invalid.")
+            if social["status"] not in _SOCIAL_STATUSES:
+                raise ValueError("SocialKit event status is invalid.")
+        if event_type in _SOCIAL_RENDER_EVENT_TYPES:
+            render = payload.get("render")
+            if not isinstance(render, dict) or set(render) != {
+                "schema_version", "execution_mode", "social_kit_ref", "source_master_ref",
+                "render_profile", "cards", "status", "canonical_hash",
+            }:
+                raise ValueError("Social render event payload is not an allowlisted shape.")
+            if render["schema_version"] != "lg15-social-render-v1" or render["execution_mode"] != "deterministic_fake":
+                raise ValueError("Social render event schema is invalid.")
+            for name in ("social_kit_ref", "source_master_ref"):
+                if AgentRunEventJournal._reference(render[name]) != render[name]:
+                    raise ValueError("Social render event reference is invalid.")
+            profile = render["render_profile"]
+            if not isinstance(profile, dict):
+                raise ValueError("Social render profile is not allowlisted.")
+            if profile.get("schema_version") == "lg15-social-render-profile-v1":
+                if set(profile) != {
+                    "schema_version", "profile_id", "version", "target_platform", "target_format",
+                    "canvas", "layout_template", "brand_kit_ref", "output_type", "production_compliance", "canonical_hash",
+                } or profile["production_compliance"] != "unresolved":
+                    raise ValueError("Social render profile is invalid.")
+                if profile["version"] != 1 or profile["output_type"] != "image/png":
+                    raise ValueError("Social render profile metadata is invalid.")
+            elif profile.get("schema_version") == "lg15-social-render-profile-v2":
+                if set(profile) != {
+                    "schema_version", "profile_id", "profile_version", "target_platform", "target_format",
+                    "canvas", "aspect_ratio", "safe_area_policy", "copy_policy", "exports",
+                    "classification", "layout_template", "brand_kit_ref", "output_type", "production_compliance", "canonical_hash",
+                } or profile.get("profile_id") != "instagram_feed_portrait" or profile.get("profile_version") != 1:
+                    raise ValueError("Social render profile is invalid.")
+                if profile["target_platform"] != "instagram" or profile["target_format"] != "feed_portrait":
+                    raise ValueError("Social render profile metadata is invalid.")
+                if profile["canvas"] != {"width": 1080, "height": 1350} or profile["aspect_ratio"] != "4:5":
+                    raise ValueError("Social render profile canvas is invalid.")
+                if profile["safe_area_policy"] != "none_v1" or profile["copy_policy"] != "existing_content_quality":
+                    raise ValueError("Social render profile policy is invalid.")
+                if profile["exports"] != ["png", "jpg", "zip"] or profile["classification"] != "SELLFORM_PRODUCT_DECISION":
+                    raise ValueError("Social render profile export contract is invalid.")
+                if profile["output_type"] != "image/png" or profile["production_compliance"] != "production":
+                    raise ValueError("Social render profile metadata is invalid.")
+            else:
+                raise ValueError("Social render profile schema is invalid.")
+            if any(
+                not isinstance(profile[key], str) or not 0 < len(profile[key]) <= 100
+                for key in ("profile_id", "target_platform", "target_format", "layout_template")
+            ):
+                raise ValueError("Social render profile metadata is invalid.")
+            if AgentRunEventJournal._reference(profile["brand_kit_ref"]) != profile["brand_kit_ref"]:
+                raise ValueError("Social render Brand Kit reference is invalid.")
+            if not isinstance(profile["canvas"], dict) or set(profile["canvas"]) != {"width", "height"}:
+                raise ValueError("Social render canvas is invalid.")
+            if any(not isinstance(profile["canvas"][key], int) or profile["canvas"][key] <= 0 for key in ("width", "height")):
+                raise ValueError("Social render canvas dimensions are invalid.")
+            cards = render["cards"]
+            if not isinstance(cards, list) or len(cards) > 100 or (not cards and event_type != "social_render_started"):
+                raise ValueError("Social render cards are invalid.")
+            for card in cards:
+                if not isinstance(card, dict) or set(card) != {"card_id", "role", "asset_ref", "semantic_hash", "status"}:
+                    raise ValueError("Social render card is not allowlisted.")
+                if AgentRunEventJournal._reference(card["asset_ref"]) != card["asset_ref"]:
+                    raise ValueError("Social render asset reference is invalid.")
+                if any(not isinstance(card[key], str) or not 0 < len(card[key]) <= 100 for key in ("card_id", "role")):
+                    raise ValueError("Social render card identity is invalid.")
+                if card["status"] != "rendered" or not re.fullmatch(r"[0-9a-f]{64}", str(card["semantic_hash"])):
+                    raise ValueError("Social render card metadata is invalid.")
+            if render["status"] not in _SOCIAL_RENDER_STATUSES:
+                raise ValueError("Social render status is invalid.")
+            if not re.fullmatch(r"[0-9a-f]{64}", str(render["canonical_hash"])):
+                raise ValueError("Social render hash is invalid.")
+            from src.services.prompt_intelligence_service import canonical_hash
+            if canonical_hash({key: value for key, value in render.items() if key != "canonical_hash"}) != render["canonical_hash"]:
+                raise ValueError("Social render hash does not match its bounded result.")
+        if event_type in _SOCIAL_GENERATION_EVENT_TYPES:
+            generation = payload.get("generation")
+            if not isinstance(generation, dict) or set(generation) != {
+                "schema_version", "generation_contract_version", "social_kit_ref",
+                "render_profile_hash", "cards", "status", "canonical_hash",
+            }:
+                raise ValueError("Social generation event payload is not allowlisted.")
+            if generation["schema_version"] != "lg15-social-generation-v1":
+                raise ValueError("Social generation event schema is invalid.")
+            if not isinstance(generation["generation_contract_version"], str) or len(generation["generation_contract_version"]) > 100:
+                raise ValueError("Social generation contract version is invalid.")
+            if not re.fullmatch(r"[0-9a-f]{64}", str(generation["render_profile_hash"])):
+                raise ValueError("Social generation profile hash is invalid.")
+            if AgentRunEventJournal._reference(generation["social_kit_ref"]) != generation["social_kit_ref"]:
+                raise ValueError("Social generation kit reference is invalid.")
+            cards = generation["cards"]
+            if not isinstance(cards, list) or len(cards) > 100 or (not cards and event_type != "social_card_generation_requested"):
+                raise ValueError("Social generation cards are invalid.")
+            for card in cards:
+                if not isinstance(card, dict) or set(card) != {"card_id", "role", "job_ref", "asset_ref", "semantic_hash", "status"}:
+                    raise ValueError("Social generation card is not allowlisted.")
+                if AgentRunEventJournal._reference(card["job_ref"]) != card["job_ref"]:
+                    raise ValueError("Social generation job reference is invalid.")
+                if card["asset_ref"] is not None and AgentRunEventJournal._reference(card["asset_ref"]) != card["asset_ref"]:
+                    raise ValueError("Social generation asset reference is invalid.")
+                if any(not isinstance(card[key], str) or not 0 < len(card[key]) <= 100 for key in ("card_id", "role", "status")):
+                    raise ValueError("Social generation card identity is invalid.")
+                if not re.fullmatch(r"[0-9a-f]{64}", str(card["semantic_hash"])):
+                    raise ValueError("Social generation semantic hash is invalid.")
+            if generation["status"] not in {"queued", "completed", "failed"} or not re.fullmatch(r"[0-9a-f]{64}", str(generation["canonical_hash"])):
+                raise ValueError("Social generation status/hash is invalid.")
+            from src.services.prompt_intelligence_service import canonical_hash
+            if canonical_hash({key: value for key, value in generation.items() if key != "canonical_hash"}) != generation["canonical_hash"]:
+                raise ValueError("Social generation hash does not match its bounded result.")
+        if event_type in _QUALITY_LIFECYCLE_EVENT_TYPES and "quality" in payload:
+            quality = payload["quality"]
+            if not isinstance(quality, dict) or set(quality) != {
+                "schema_version", "quality_stage", "social_kit_ref", "verdict",
+                "dimension_results", "reason_codes", "rework_targets", "evaluator_version", "canonical_hash",
+            }:
+                raise ValueError("Social quality event payload is not an allowlisted shape.")
+            if quality["schema_version"] != "lg15-social-quality-v1" or quality["quality_stage"] != "content":
+                raise ValueError("Social quality event schema is invalid.")
+            if AgentRunEventJournal._reference(quality["social_kit_ref"]) != quality["social_kit_ref"]:
+                raise ValueError("Social quality kit reference is invalid.")
+            if quality["verdict"] not in _SOCIAL_QUALITY_VERDICTS:
+                raise ValueError("Social quality verdict is invalid.")
+            if not isinstance(quality["evaluator_version"], str) or not 0 < len(quality["evaluator_version"]) <= 100:
+                raise ValueError("Social quality evaluator version is invalid.")
+            if not isinstance(quality["canonical_hash"], str) or len(quality["canonical_hash"]) != 64:
+                raise ValueError("Social quality hash is invalid.")
+            from src.services.prompt_intelligence_service import canonical_hash
+            if canonical_hash({key: value for key, value in quality.items() if key != "canonical_hash"}) != quality["canonical_hash"]:
+                raise ValueError("Social quality hash does not match its bounded result.")
+            dimensions = quality["dimension_results"]
+            if not isinstance(dimensions, list) or not dimensions or len(dimensions) > 32:
+                raise ValueError("Social quality dimensions are invalid.")
+            seen_dimensions = set()
+            for dimension in dimensions:
+                if not isinstance(dimension, dict) or set(dimension) != {"dimension_id", "status", "reason_codes"}:
+                    raise ValueError("Social quality dimension is not allowlisted.")
+                if not isinstance(dimension["dimension_id"], str) or not re.fullmatch(r"[a-z0-9_]{1,80}", dimension["dimension_id"]):
+                    raise ValueError("Social quality dimension identity is invalid.")
+                if dimension["dimension_id"] in seen_dimensions or dimension["status"] not in _SOCIAL_QUALITY_DIMENSION_STATUSES:
+                    raise ValueError("Social quality dimension status is invalid.")
+                seen_dimensions.add(dimension["dimension_id"])
+                if not isinstance(dimension["reason_codes"], list) or len(dimension["reason_codes"]) > 8 or any(
+                    not isinstance(code, str) or not re.fullmatch(r"[a-z0-9_]{1,80}", code)
+                    for code in dimension["reason_codes"]
+                ):
+                    raise ValueError("Social quality dimension reasons are invalid.")
+            if not isinstance(quality["reason_codes"], list) or len(quality["reason_codes"]) > 32 or any(
+                not isinstance(code, str) or not re.fullmatch(r"[a-z0-9_]{1,80}", code)
+                for code in quality["reason_codes"]
+            ):
+                raise ValueError("Social quality reason codes are invalid.")
+            targets = quality["rework_targets"]
+            if not isinstance(targets, list) or len(targets) > 16:
+                raise ValueError("Social quality rework targets are invalid.")
+            for target in targets:
+                if not isinstance(target, dict) or set(target) != {"card_id", "logical_target", "role", "reason_code", "action_type"}:
+                    raise ValueError("Social quality rework target is not allowlisted.")
+                if any(not isinstance(target[name], str) or len(target[name]) > 100 for name in target):
+                    raise ValueError("Social quality rework target scalar is invalid.")
         if "identity" in payload:
             identity = payload["identity"]
             if not isinstance(identity, dict) or set(identity) != {
@@ -1260,6 +1489,8 @@ class AgentRunEventJournal:
 
     @staticmethod
     def quality_lifecycle_event(stage: str, node_status: str, quality: dict[str, Any]) -> tuple[str, str] | None:
+        if stage == "social_review_ready" and quality.get("quality_stage") == "content":
+            return None
         if not quality and "quality" not in stage:
             return None
         lowered = stage.lower()
@@ -1274,6 +1505,229 @@ class AgentRunEventJournal:
         if "rework" in lowered or node_status == "needs_review":
             return "quality_rework_required", "blocked"
         return "quality_evaluated", "completed"
+
+    @classmethod
+    def append_social_lifecycle(
+        cls,
+        run: AgentRun,
+        db: Session,
+        *,
+        event_type: str,
+        transition: str,
+        master_ref: dict[str, Any],
+        channel: str,
+        target_format: str,
+        card_count: int,
+        status: str,
+        template_version: str,
+        evaluator_version: str,
+        social_kit_ref: dict[str, Any] | None = None,
+    ) -> tuple[AgentRunEvent, bool, AgentRun]:
+        """Append one bounded SocialKit lifecycle event."""
+
+        if event_type not in _SOCIAL_EVENT_TYPES:
+            raise ValueError("Unsupported SocialKit lifecycle event type.")
+        references = {"commerce_creative_master": cls._reference(master_ref)}
+        if social_kit_ref is not None:
+            references["social_kit"] = cls._reference(social_kit_ref)
+        payload = {
+            "stage": {
+                "social_kit_requested": "social_kit_requested",
+                "social_planning_completed": "social_planning",
+                "social_kit_version_created": "social_kit_persist",
+                "social_review_ready": "social_review_ready",
+            }[event_type],
+            "status": "completed" if event_type == "social_review_ready" else "running",
+            "node_status": "completed",
+            "input_mode": "",
+            "source_fidelity": "ready",
+            "references": references,
+            "metrics": {"unknown_fact_count": 0, "prohibited_inference_count": 0, "clarification_count": 0},
+            "lifecycle": {"transition": transition, "checkpoint_id": ""},
+            "social": {
+                "channel": channel,
+                "format": target_format,
+                "execution_mode": "deterministic_fake",
+                "template_version": template_version,
+                "evaluator_version": evaluator_version,
+                "card_count": card_count,
+                "status": status,
+            },
+        }
+        return cls.append(
+            run,
+            db,
+            event_type=event_type,
+            payload=payload,
+            thread_id=run.graph_thread_id or run.id,
+            workspace_id=run.workspace_id,
+            project_id=run.project_id,
+        )
+
+    @classmethod
+    def append_social_render_lifecycle(
+        cls,
+        run: AgentRun,
+        db: Session,
+        *,
+        event_type: str,
+        transition: str,
+        master_ref: dict[str, Any],
+        social_kit_ref: dict[str, Any],
+        channel: str,
+        target_format: str,
+        card_count: int,
+        status: str,
+        template_version: str,
+        evaluator_version: str,
+        render: dict[str, Any] | None = None,
+    ) -> tuple[AgentRunEvent, bool, AgentRun]:
+        if event_type not in _SOCIAL_RENDER_EVENT_TYPES:
+            raise ValueError("Unsupported Social render lifecycle event type.")
+        if render is None:
+            raise ValueError("Social render lifecycle events require a bounded render result.")
+        payload = {
+            "stage": "social_rendering" if event_type == "social_render_started" else "social_review_ready",
+            "status": "running" if event_type == "social_render_started" else "completed",
+            "node_status": "completed",
+            "input_mode": "",
+            "source_fidelity": "ready",
+            "references": {"commerce_creative_master": cls._reference(master_ref), "social_kit": cls._reference(social_kit_ref)},
+            "metrics": {"unknown_fact_count": 0, "prohibited_inference_count": 0, "clarification_count": 0},
+            "lifecycle": {"transition": transition, "checkpoint_id": ""},
+            "social": {
+                "channel": channel,
+                "format": target_format,
+                "execution_mode": "deterministic_fake",
+                "template_version": template_version,
+                "evaluator_version": evaluator_version,
+                "card_count": card_count,
+                "status": "review_ready" if event_type == "social_render_completed" else "created",
+            },
+            "render": render,
+        }
+        return cls.append(
+            run, db, event_type=event_type, payload=payload,
+            thread_id=run.graph_thread_id or run.id,
+            workspace_id=run.workspace_id, project_id=run.project_id,
+        )
+
+    @classmethod
+    def append_social_generation_lifecycle(
+        cls,
+        run: AgentRun,
+        db: Session,
+        *,
+        event_type: str,
+        generation: dict[str, Any],
+        master_ref: dict[str, Any],
+        social_kit_ref: dict[str, Any],
+        channel: str,
+        target_format: str,
+        template_version: str,
+        evaluator_version: str,
+        card_count: int,
+    ) -> tuple[AgentRunEvent, bool, AgentRun]:
+        if event_type not in _SOCIAL_GENERATION_EVENT_TYPES:
+            raise ValueError("Unsupported Social generation lifecycle event type.")
+        status = "requested" if event_type.endswith("requested") else "completed"
+        payload = {
+            "stage": "social_generation",
+            "status": "running" if status == "requested" else "completed",
+            "node_status": "completed",
+            "input_mode": "",
+            "source_fidelity": "ready",
+            "references": {
+                "commerce_creative_master": cls._reference(master_ref),
+                "social_kit": cls._reference(social_kit_ref),
+            },
+            "metrics": {"unknown_fact_count": 0, "prohibited_inference_count": 0, "clarification_count": 0},
+            "lifecycle": {"transition": "requested" if status == "requested" else "completed", "checkpoint_id": ""},
+            "social": {
+                "channel": channel,
+                "format": target_format,
+                "execution_mode": "deterministic_fake_provider",
+                "template_version": template_version,
+                "evaluator_version": evaluator_version,
+                "card_count": card_count,
+                "status": "requested" if status == "requested" else "review_ready",
+            },
+            "generation": generation,
+        }
+        return cls.append(
+            run, db, event_type=event_type, payload=payload,
+            thread_id=run.graph_thread_id or run.id,
+            workspace_id=run.workspace_id, project_id=run.project_id,
+        )
+
+    @classmethod
+    def append_social_action_lifecycle(
+        cls,
+        run: AgentRun,
+        db: Session,
+        *,
+        event_type: str,
+        action: dict[str, Any],
+        master_ref: dict[str, Any],
+        parent_social_kit_ref: dict[str, Any],
+        successor_social_kit_ref: dict[str, Any],
+    ) -> tuple[AgentRunEvent, bool, AgentRun]:
+        if event_type not in _SOCIAL_ACTION_EVENT_TYPES:
+            raise ValueError("Unsupported Social card action lifecycle event type.")
+        payload = {
+            "stage": "social_card_edit",
+            "status": "completed",
+            "node_status": "completed",
+            "input_mode": "",
+            "source_fidelity": "ready",
+            "references": {
+                "commerce_creative_master": cls._reference(master_ref),
+                "social_kit": cls._reference(successor_social_kit_ref),
+            },
+            "metrics": {"unknown_fact_count": 0, "prohibited_inference_count": 0, "clarification_count": 0},
+            "lifecycle": {"transition": "completed", "checkpoint_id": ""},
+            "action": {
+                **action,
+                "parent_social_kit_ref": cls._reference(parent_social_kit_ref),
+                "successor_social_kit_ref": cls._reference(successor_social_kit_ref),
+            },
+        }
+        return cls.append(
+            run, db, event_type=event_type, payload=payload,
+            thread_id=run.graph_thread_id or run.id,
+            workspace_id=run.workspace_id, project_id=run.project_id,
+        )
+
+    @classmethod
+    def append_social_quality(
+        cls,
+        run: AgentRun,
+        db: Session,
+        *,
+        quality: dict[str, Any],
+    ) -> tuple[AgentRunEvent, bool, AgentRun]:
+        """Persist one bounded deterministic SocialKit quality result."""
+
+        payload = {
+            "stage": "social_quality",
+            "status": "completed" if quality.get("verdict") == "PASS" else "needs_review",
+            "node_status": "completed",
+            "input_mode": "",
+            "source_fidelity": "ready",
+            "references": {"social_kit": dict(quality["social_kit_ref"])},
+            "metrics": {"unknown_fact_count": 0, "prohibited_inference_count": 0, "clarification_count": 0},
+            "lifecycle": {"transition": "completed", "checkpoint_id": ""},
+            "quality": quality,
+        }
+        return cls.append(
+            run,
+            db,
+            event_type="quality_evaluated",
+            payload=payload,
+            thread_id=run.graph_thread_id or run.id,
+            workspace_id=run.workspace_id,
+            project_id=run.project_id,
+        )
 
     @classmethod
     def append(
@@ -1336,6 +1790,7 @@ class AgentRunEventJournal:
             outputs = dict(locked.outputs_json or {})
             outputs.pop("langgraph_event_projection", None)
             outputs.pop("provider_cost_projection", None)
+            outputs.pop("langgraph_social", None)
             locked.outputs_json = outputs
             locked.last_applied_event_sequence = 0
             locked.actual_cost = 0.0
@@ -1378,6 +1833,66 @@ class AgentRunEventJournal:
             run.last_applied_event_sequence = record.sequence
             return
         outputs = dict(run.outputs_json or {})
+        if record.event_type in _SOCIAL_EVENT_TYPES:
+            social_payload = dict(payload.get("social") or {})
+            refs = dict(payload.get("references") or {})
+            social = dict(outputs.get("langgraph_social") or {})
+            social.update({
+                "channel": social_payload.get("channel"),
+                "format": social_payload.get("format"),
+                "execution_mode": social_payload.get("execution_mode"),
+                "status": social_payload.get("status"),
+                "card_count": social_payload.get("card_count"),
+            })
+            if refs.get("commerce_creative_master"):
+                social["master_ref"] = refs["commerce_creative_master"]
+            if refs.get("social_kit"):
+                social["social_kit_ref"] = refs["social_kit"]
+            outputs["langgraph_social"] = social
+            run.outputs_json = outputs
+            run.current_stage = payload["stage"] or run.current_stage
+            run.status = payload["status"] or run.status
+            run.last_applied_event_sequence = record.sequence
+            return
+        if record.event_type in _SOCIAL_RENDER_EVENT_TYPES:
+            social = dict(outputs.get("langgraph_social") or {})
+            render = dict(payload.get("render") or {})
+            if render.get("status") in {"completed", "rendered"}:
+                social["render"] = render
+                social["render_status"] = render.get("status")
+            outputs["langgraph_social"] = social
+            run.outputs_json = outputs
+            run.last_applied_event_sequence = record.sequence
+            return
+        if record.event_type in _SOCIAL_GENERATION_EVENT_TYPES:
+            social = dict(outputs.get("langgraph_social") or {})
+            generation = dict(payload.get("generation") or {})
+            if generation:
+                social["generation"] = generation
+                social["generation_status"] = generation.get("status")
+            outputs["langgraph_social"] = social
+            run.outputs_json = outputs
+            run.last_applied_event_sequence = record.sequence
+            return
+        if record.event_type in _SOCIAL_ACTION_EVENT_TYPES:
+            social = dict(outputs.get("langgraph_social") or {})
+            action = dict(payload.get("action") or {})
+            social["last_action"] = {
+                "action": action.get("action"),
+                "action_idempotency_key": action.get("action_idempotency_key"),
+                "parent_social_kit_ref": action.get("parent_social_kit_ref"),
+                "successor_social_kit_ref": action.get("successor_social_kit_ref"),
+                "card_ref": action.get("card_ref"),
+                "variant_ref": action.get("variant_ref"),
+                "preserved_card_count": action.get("preserved_card_count"),
+            }
+            social["social_kit_ref"] = action.get("successor_social_kit_ref")
+            outputs["langgraph_social"] = social
+            run.outputs_json = outputs
+            run.current_stage = payload["stage"] or run.current_stage
+            run.status = payload["status"] or run.status
+            run.last_applied_event_sequence = record.sequence
+            return
         if record.event_type in _COST_EVENT_TYPES:
             prior = dict(outputs.get("provider_cost_projection") or {})
             cost = payload["cost"]
@@ -1716,6 +2231,21 @@ def _public_generation(value: Any) -> dict[str, Any]:
         if job:
             jobs.append(job)
     result["jobs"] = jobs
+    return result
+
+
+def _public_social(value: Any) -> dict[str, Any]:
+    source = dict(value or {}) if isinstance(value, dict) else {}
+    result: dict[str, Any] = {}
+    for key in ("channel", "format", "status", "execution_mode"):
+        item = _public_id(source.get(key))
+        if item:
+            result[key] = item
+    for key in ("social_kit_ref", "master_ref"):
+        if reference := _public_ref(source.get(key)):
+            result[key] = reference
+    if isinstance(source.get("card_count"), int) and 0 <= source["card_count"] <= 100:
+        result["card_count"] = source["card_count"]
     return result
 
 
@@ -2191,7 +2721,7 @@ def _browser_checkpoint_values(
         **(dict(snapshot_values.get("generation") or {}) if isinstance(snapshot_values.get("generation"), dict) else {}),
         **(dict(pending_context.get("generation") or {}) if isinstance(pending_context.get("generation"), dict) else {}),
     }
-    return {
+    values = {
         "progress": {"status": run.status, "stage": run.current_stage},
         "review": {"pending": pending_view, "next_action": "respond" if pending else None},
         "execution": _execution_view(run, delay_context, progress_preview),
@@ -2202,6 +2732,13 @@ def _browser_checkpoint_values(
         "canvas": _public_canvas(snapshot_values.get("canvas")),
         "edit": _public_edit(snapshot_values.get("edit")),
     }
+    social = _public_social(
+        snapshot_values.get("social")
+        or (run.outputs_json or {}).get("langgraph_social")
+    )
+    if social or getattr(run, "mode", "") == "lg15_social_kit":
+        values["social"] = social
+    return values
 
 
 class AgentRunGraphProjector:
@@ -2300,13 +2837,32 @@ class AgentRunGraphProjector:
                     **intake_delta,
                 },
             }
+        social_delta = update.get("social")
+        if isinstance(social_delta, dict) and social_delta:
+            projected_run.outputs_json = {
+                **projected_run.outputs_json,
+                "langgraph_social": {
+                    **((projected_run.outputs_json or {}).get("langgraph_social") or {}),
+                    **social_delta,
+                },
+            }
+        render_delta = update.get("render")
+        if isinstance(render_delta, dict) and render_delta:
+            projected_run.outputs_json = {
+                **projected_run.outputs_json,
+                "langgraph_social": {
+                    **((projected_run.outputs_json or {}).get("langgraph_social") or {}),
+                    "render": render_delta,
+                },
+            }
         generation_delta = update.get("generation")
         if isinstance(generation_delta, dict):
             projected_run.outputs_json = {
                 **projected_run.outputs_json,
-                "langgraph_generation": {
-                    **((projected_run.outputs_json or {}).get("langgraph_generation") or {}),
-                    **generation_delta,
+                "langgraph_social": {
+                    **((projected_run.outputs_json or {}).get("langgraph_social") or {}),
+                    "generation": generation_delta,
+                    "generation_status": generation_delta.get("status"),
                 },
             }
         assembly_delta = update.get("page_assembly")
@@ -2628,6 +3184,8 @@ class LangGraphRunService:
     @staticmethod
     def _compiled_graph(checkpointer: Any, *, run: AgentRun | None = None) -> Any:
         """Use the migrated graph for the explicit LangGraph rollout."""
+        if run is not None and run.mode == "lg15_social_kit":
+            return build_lg15_social_kit_compiled_graph(checkpointer=checkpointer)
         if run is not None and run.mode == "lg12i_intake":
             if str(run.current_stage or "") in {
                 "sales_strategy", "page_planning", "copywriting", "visual_planning",
@@ -2787,6 +3345,8 @@ class LangGraphRunService:
                         "discovery": dict((snapshot.values or {}).get("discovery") or {}),
                         "commerce": dict((snapshot.values or {}).get("commerce") or {}),
                         "intake": dict((snapshot.values or {}).get("intake") or {}),
+                        "social": dict((snapshot.values or {}).get("social") or {}),
+                        "render": dict((snapshot.values or {}).get("render") or {}),
                         "generation": dict((snapshot.values or {}).get("generation") or {}),
                         "page_assembly": dict((snapshot.values or {}).get("page_assembly") or {}),
                         "rendering": dict((snapshot.values or {}).get("rendering") or {}),
@@ -3057,6 +3617,28 @@ class LangGraphRunService:
             return cls._recover_running_lg11_projection(run, db)
         if run.mode == "lg12i_intake":
             return cls._recover_running_lg12i_projection(run, db)
+        if run.mode == "lg15_social_kit" and run.graph_thread_id:
+            config = cls._config(cls._thread_id(run))
+            with open_postgres_checkpointer() as checkpointer:
+                graph = cls._compiled_graph(checkpointer, run=run)
+                snapshot = graph.get_state(config)
+                checkpoint_social = dict((snapshot.values or {}).get("social") or {})
+                projected_social = dict((run.outputs_json or {}).get("langgraph_social") or {})
+                checkpoint_quality = dict((snapshot.values or {}).get("quality") or {})
+                projected_quality = dict((run.outputs_json or {}).get("langgraph_quality") or {})
+                checkpoint_render = dict((snapshot.values or {}).get("render") or {})
+                projected_render = dict((run.outputs_json or {}).get("langgraph_social") or {}).get("render") or {}
+                checkpoint_generation = dict((snapshot.values or {}).get("generation") or {})
+                projected_generation = dict((run.outputs_json or {}).get("langgraph_social") or {}).get("generation") or {}
+                if (checkpoint_social and checkpoint_social != projected_social) or (
+                    checkpoint_quality and checkpoint_quality != projected_quality
+                ) or (
+                    checkpoint_render and checkpoint_render != projected_render
+                ) or (
+                    checkpoint_generation and checkpoint_generation != projected_generation
+                ):
+                    return cls._rebuild_projection_from_history(run, db, graph, config)
+            return run
         # TASK-12.9 extends the ordinary production LG-10 graph.  When a
         # process stops between checkpoint commit and SQL projection, recover
         # the compact QA route/attempt state from history before returning a
@@ -3095,7 +3677,7 @@ class LangGraphRunService:
         """
 
         return bool(run.graph_thread_id) and str(run.mode or "") in {
-            "mock", "real", "lg11_edit", "lg12i_intake",
+            "mock", "real", "lg11_edit", "lg12i_intake", "lg15_social_kit",
         }
 
     @classmethod
@@ -3321,6 +3903,13 @@ class LangGraphRunService:
                 project_id=run.project_id,
                 intake_envelope=dict((run.input_snapshot or {}).get("unified_product_intake") or {}),
             )
+        elif run.mode == "lg15_social_kit":
+            initial_state = build_lg15_social_kit_graph_input(
+                run_id=run.id,
+                workspace_id=run.workspace_id,
+                project_id=run.project_id,
+                social_request=dict((run.input_snapshot or {}).get("social_request") or {}),
+            )
         else:
             initial_state = build_lg1_graph_input(
                 run_id=run.id,
@@ -3459,6 +4048,76 @@ class LangGraphRunService:
         db.add(run)
         db.commit()
         return cls._handoff_master_to_planning(cls.start(run.id, workspace_id, db), db)
+
+    @classmethod
+    def start_social_kit(
+        cls,
+        *,
+        project_id: str,
+        workspace_id: str,
+        actor_id: str,
+        request: dict[str, Any],
+        db: Session,
+    ) -> AgentRun:
+        """Start or replay one server-authoritative deterministic SocialKit run."""
+
+        from src.services.prompt_intelligence_service import canonical_hash
+        from src.services.social_kit_version_service import (
+            resolve_current_social_master,
+            validate_social_kit_request,
+        )
+
+        project = (
+            db.query(ProductProject)
+            .filter(ProductProject.id == project_id, ProductProject.workspace_id == workspace_id)
+            .with_for_update()
+            .one_or_none()
+        )
+        if project is None:
+            raise GraphRunNotFound("Product project was not found in this workspace.")
+        normalized = validate_social_kit_request(request)
+        master = resolve_current_social_master(
+            db,
+            workspace_id=workspace_id,
+            project_id=project_id,
+            source_master_reference=normalized["source_master_reference"],
+        )
+        request_hash = canonical_hash(normalized)
+        existing_runs = (
+            db.query(AgentRun)
+            .filter(
+                AgentRun.workspace_id == workspace_id,
+                AgentRun.project_id == project_id,
+                AgentRun.mode == "lg15_social_kit",
+                AgentRun.created_by == actor_id,
+            )
+            .order_by(AgentRun.created_at.desc())
+            .all()
+        )
+        for existing in existing_runs:
+            if dict(existing.input_snapshot or {}).get("social_request_hash") != request_hash:
+                continue
+            if existing.status == "created":
+                return cls.start(existing.id, workspace_id, db)
+            if existing.status == "failed":
+                return cls.resume(existing.id, workspace_id, db)
+            return existing
+
+        run = AgentRun(
+            id=str(uuid.uuid4()),
+            workspace_id=workspace_id,
+            project_id=project_id,
+            mode="lg15_social_kit",
+            status="created",
+            current_stage="social_kit_requested",
+            input_snapshot={"social_request": normalized, "social_request_hash": request_hash},
+            outputs_json={"social_master": {"id": master.id, "version": master.version, "hash": master.canonical_hash}},
+            cost_approval_status="not_required",
+            created_by=actor_id,
+        )
+        db.add(run)
+        db.commit()
+        return cls.start(run.id, workspace_id, db)
 
     @classmethod
     def get_state(cls, run_id: str, workspace_id: str, db: Session) -> GraphRunStateView:

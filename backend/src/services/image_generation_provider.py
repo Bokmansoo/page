@@ -83,10 +83,16 @@ class MockImageGenerationProvider:
                 status="blocked_cost_approval"
             )
             
-        # Draw a simple 512x512 dummy image using PIL
+        # Draw a deterministic image at the requested bounded canvas.
         from PIL import Image, ImageDraw
         import io
-        img = Image.new("RGB", (512, 512), color="red")
+        try:
+            width, height = (int(part) for part in request.size.lower().split("x", 1))
+            if width <= 0 or height <= 0 or width > 4096 or height > 4096:
+                raise ValueError
+        except (TypeError, ValueError):
+            width, height = 512, 512
+        img = Image.new("RGB", (width, height), color="red")
         draw = ImageDraw.Draw(img)
         draw.rectangle([10, 10, 100, 100], fill="blue")
         buf = io.BytesIO()
@@ -125,7 +131,13 @@ class ImageGenerationProviderRouter:
             # Return dummy mock placeholder image
             from PIL import Image, ImageDraw
             import io
-            img = Image.new("RGB", (512, 512), color="red")
+            try:
+                width, height = (int(part) for part in request.size.lower().split("x", 1))
+                if width <= 0 or height <= 0 or width > 4096 or height > 4096:
+                    raise ValueError
+            except (TypeError, ValueError):
+                width, height = 512, 512
+            img = Image.new("RGB", (width, height), color="red")
             draw = ImageDraw.Draw(img)
             draw.rectangle([10, 10, 100, 100], fill="blue")
             buf = io.BytesIO()

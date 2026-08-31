@@ -43,6 +43,28 @@ LG11_BRAND_WATERMARK_SIZE = {"width": 132, "height": 64, "right": 18, "bottom": 
 LG12_LAYOUT_EVIDENCE_SCHEMA_VERSION = "lg12-frozen-layout-evidence-v1"
 
 
+def render_deterministic_social_card(
+    output_path: str,
+    *,
+    role: str,
+    card_id: str,
+    semantic_hash: str,
+    background: str = "#F3F4F6",
+    accent: str = "#2563EB",
+    width: int = 640,
+    height: int = 360,
+) -> None:
+    """Write a stable local fixture image for the SocialKit fake renderer."""
+
+    image = Image.new("RGB", (width, height), background)
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, width, 84), fill=accent)
+    draw.text((24, 26), f"Sellform {role} card", fill="#FFFFFF")
+    draw.text((24, 118), f"card:{card_id}", fill="#111827")
+    draw.text((24, 154), f"render:{semantic_hash[:24]}", fill="#374151")
+    image.save(output_path, format="PNG", optimize=False)
+
+
 def lg12_renderer_typography_role_tokens(
     *,
     field: str,
