@@ -205,7 +205,7 @@ def recover_expired_image_work(
         # Fake work is free and deterministic. A paid synchronous request that
         # died after dispatch has an unknowable billing outcome, so retrying it
         # would violate OPS-03; an operator must reconcile it first.
-        if delivery.provider_mode != "mock" and delivery.provider_dispatch_count > 0:
+        if delivery.provider_mode not in {"mock", "video_mock"} and delivery.provider_dispatch_count > 0:
             delivery.status = "dead_letter"
             delivery.dead_lettered_at = now
             delivery.last_error_code = "PROVIDER_OUTCOME_UNKNOWN"
@@ -505,14 +505,19 @@ def process_image_delivery(delivery_id: str, owner: str, db: Session) -> dict[st
     db.add_all([delivery, job])
     db.commit()
     try:
-        provider = DurableFakeImageProvider() if delivery.provider_mode == "mock" else None
-        result = execute_image_generation(
-            delivery.project_id,
-            delivery.job_id,
-            db,
-            cost_approved=True,
-            provider_override=provider,
-        )
+        if delivery.provider_mode == "video_mock":
+            from src.services.video_scene_generation_service import execute_video_scene_generation
+
+            result = execute_video_scene_generation(job, db)
+        else:
+            provider = DurableFakeImageProvider() if delivery.provider_mode == "mock" else None
+            result = execute_image_generation(
+                delivery.project_id,
+                delivery.job_id,
+                db,
+                cost_approved=True,
+                provider_override=provider,
+            )
         if result.error_code:
             code, detail, action = normalize_image_error(result.error_code, result.error_code)
             result.error_code = code
@@ -535,13 +540,33 @@ def process_image_delivery(delivery_id: str, owner: str, db: Session) -> dict[st
         delivery.lease_expires_at = None
         job.error_code = code
         job.warnings = [action, *(job.warnings or [])]
+        if delivery.provider_mode == "video_mock":
+            from src.services.image_generation_service import _append_provider_attempt
+
+            now = datetime.datetime.utcnow()
+            _append_provider_attempt(
+                job,
+                db,
+                provider_adapter_attempt=max(int(job.attempt_count or 1), 1),
+                provider=str(job.provider or "fake_video_provider"),
+                model=str(job.model or "fake-video-lg16-v1"),
+                dispatch_state="DISPATCHED",
+                cost_state="EXPLICIT_ZERO",
+                actual_cost=0.0,
+                currency="credit",
+                usage={"availability": "missing", "media_type": "video"},
+                outcome_code=code,
+                started_at=now,
+                completed_at=now,
+                latency_ms=None,
+            )
         # A paid request that timed out may already have been billed. Never
         # redispatch it automatically; the seller can create a new, explicitly
         # cost-approved scene attempt after reconciliation. Free deterministic
         # fake work may be retried safely for E2E/recovery testing.
         if (
             code in RETRYABLE_CODES
-            and delivery.provider_mode == "mock"
+            and delivery.provider_mode in {"mock", "video_mock"}
             and delivery.delivery_attempts < delivery.max_delivery_attempts
         ):
             delivery.status = "retry_wait"
@@ -552,6 +577,23 @@ def process_image_delivery(delivery_id: str, owner: str, db: Session) -> dict[st
             delivery.status = "dead_letter"
             delivery.dead_lettered_at = datetime.datetime.utcnow()
             job.status = "failed"
+        if delivery.provider_mode == "video_mock" and delivery.status == "dead_letter":
+            from src.services.langgraph_run_service import AgentRunEventJournal
+            from src.services.video_scene_generation_service import collect_video_scene_results
+
+            video_snapshot = dict((job.input_snapshot or {}).get("video_generation") or {})
+            generation = collect_video_scene_results(run_id=run.id, project_id=run.project_id, db=db)
+            AgentRunEventJournal.append_video_generation(
+                run,
+                db,
+                event_type="video_scene_generation_failed",
+                video={
+                    "video_project_ref": video_snapshot.get("video_project_ref"),
+                    "storyboard_ref": video_snapshot.get("storyboard_ref"),
+                    "scene_count": generation.get("scene_count", 0),
+                },
+                generation=generation,
+            )
         db.add_all([delivery, job])
         db.commit()
     if delivery.status in {"completed", "dead_letter"}:
@@ -596,7 +638,7 @@ def retry_dead_letter(delivery_id: str, db: Session) -> ImageGenerationOutboxRec
     # the provider returned a concrete error. They must return through
     # scene-level cost approval or a seller-owned upload instead of bypassing
     # that gate through the worker retry endpoint.
-    if delivery.provider_mode != "mock":
+    if delivery.provider_mode not in {"mock", "video_mock"}:
         raise ValueError("유료 provider 작업은 worker 재시도를 지원하지 않습니다. 장면 재생성 또는 판매자 사진 업로드를 사용해 주세요.")
     delivery.status = "queued"
     delivery.available_at = datetime.datetime.utcnow()

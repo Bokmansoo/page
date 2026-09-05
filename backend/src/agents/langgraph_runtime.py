@@ -146,6 +146,22 @@ class SocialKitGraphState(TypedDict, total=False):
     generation: Annotated[dict[str, Any], _merge_discovery]
 
 
+class VideoProjectGraphState(TypedDict, total=False):
+    """Reference-only LG-16 planning state; scene bodies stay in SQL."""
+
+    run_id: str
+    thread_id: str
+    workspace_id: str
+    project_id: str
+    mode: str
+    current_stage: str
+    status: str
+    events: Annotated[list[dict[str, Any]], add]
+    video_request: dict[str, Any]
+    video: Annotated[dict[str, Any], _merge_discovery]
+    quality: Annotated[dict[str, Any], _merge_discovery]
+
+
 class LG11EditGraphState(TypedDict, total=False):
     """Durable LG-11 edit-run state, isolated from the LG-1 through LG-10 graph.
 
@@ -338,6 +354,29 @@ def build_lg15_social_kit_graph_input(
         "status": "created",
         "events": [],
         "social_request": validate_social_kit_request(social_request),
+    }
+
+
+def build_lg16_video_graph_input(
+    *, run_id: str, workspace_id: str, project_id: str,
+    source_video_project_ref: dict[str, Any], creative_intent: str,
+    request_hash: str,
+) -> VideoProjectGraphState:
+    """Build checkpoint-safe input; planner resolves semantic scenes from SQL."""
+    return {
+        "run_id": run_id,
+        "thread_id": run_id,
+        "workspace_id": workspace_id,
+        "project_id": project_id,
+        "mode": "lg16_video_project",
+        "current_stage": "video_requested",
+        "status": "created",
+        "events": [],
+        "video_request": {
+            "source_video_project_ref": copy.deepcopy(source_video_project_ref),
+            "creative_intent": creative_intent,
+            "request_hash": request_hash,
+        },
     }
 
 
@@ -3907,6 +3946,146 @@ def _social_card_renderer(state: SocialKitGraphState) -> dict[str, Any]:
         "generation": generation_result,
         "social": {"status": "rendered", "render_status": "completed", "generation_status": generation_result["status"]},
     }
+
+
+def _video_node_event(stage: str, status: str, event_type: str) -> dict[str, Any]:
+    return {
+        "stage": stage,
+        "status": status,
+        "node_status": "completed",
+        "event_type": "node_completed",
+        "video_event_type": event_type,
+    }
+
+
+def _video_run(state: VideoProjectGraphState, db: Any):
+    from src.db.models import AgentRun
+
+    return db.query(AgentRun).filter_by(
+        id=state["run_id"], workspace_id=state["workspace_id"], project_id=state["project_id"],
+    ).one()
+
+
+def _video_source_guard(state: VideoProjectGraphState) -> dict[str, Any]:
+    from src.services.langgraph_discovery_service import current_langgraph_session
+    from src.services.video_project_version_service import validate_video_project_version, VideoProjectContractError
+
+    db = current_langgraph_session()
+    if db is None:
+        raise RuntimeError("Video graph node requires the graph database session.")
+    run = _video_run(state, db)
+    request = dict(state.get("video_request") or {})
+    ref = dict(request.get("source_video_project_ref") or {})
+    from src.db.models import VideoProjectVersion
+
+    source = db.query(VideoProjectVersion).filter_by(
+        id=ref.get("id"), workspace_id=run.workspace_id, project_id=run.project_id,
+    ).one_or_none()
+    if source is None or {"id": source.id, "version": source.version, "hash": source.canonical_hash} != ref:
+        raise VideoProjectContractError("VideoProject source reference is out of scope or stale.")
+    validate_video_project_version(db, source)
+    return {
+        "current_stage": "video_storyboard_planner",
+        "status": "running",
+        "events": [_video_node_event("video_source_guard", "running", "video_requested")],
+        "video": {
+            "video_project_ref": ref,
+            "source_master_ref": {"id": source.source_master_id, "version": source.source_master_version, "hash": source.source_master_hash},
+            "status": "requested",
+            "execution_mode": "deterministic_fake",
+        },
+    }
+
+
+def _video_storyboard_planner(state: VideoProjectGraphState) -> dict[str, Any]:
+    from src.services.langgraph_discovery_service import current_langgraph_session
+    from src.services.video_storyboard_service import create_video_storyboard_version, validate_video_graph_request
+    from src.db.models import VideoProjectVersion
+
+    db = current_langgraph_session()
+    if db is None:
+        raise RuntimeError("Video graph node requires the graph database session.")
+    run = _video_run(state, db)
+    stored_request = dict((run.input_snapshot or {}).get("video_request") or {})
+    request = validate_video_graph_request(stored_request)
+    source_ref = request["source_video_project_ref"]
+    source = db.query(VideoProjectVersion).filter_by(
+        id=source_ref["id"], workspace_id=run.workspace_id, project_id=run.project_id,
+    ).one_or_none()
+    if source is None:
+        raise ValueError("VideoProject source is missing or out of scope.")
+    successor = create_video_storyboard_version(
+        db,
+        video_project=source,
+        scenes=request["scenes"],
+        creative_intent=request["creative_intent"],
+        creator_run_id=run.id,
+        created_by=run.created_by,
+    )
+    storyboard = dict(successor.video_manifest_json or {}).get("storyboard") or {}
+    project_ref = {"id": successor.id, "version": successor.version, "hash": successor.canonical_hash}
+    storyboard_ref = {"id": storyboard["storyboard_id"], "version": 1, "hash": storyboard["canonical_hash"]}
+    return {
+        "current_stage": "video_storyboard_quality",
+        "status": "running",
+        "events": [_video_node_event("video_storyboard_planner", "running", "video_storyboard_planned")],
+        "video": {
+            "video_project_ref": project_ref,
+            "source_video_project_ref": source_ref,
+            "storyboard_ref": storyboard_ref,
+            "scene_count": int(storyboard.get("scene_count") or 0),
+            "status": "planned",
+            "execution_mode": "deterministic_fake",
+        },
+    }
+
+
+def _video_storyboard_quality(state: VideoProjectGraphState) -> dict[str, Any]:
+    from src.services.langgraph_discovery_service import current_langgraph_session
+    from src.services.video_storyboard_service import evaluate_video_storyboard_quality
+    from src.services.langgraph_run_service import AgentRunEventJournal
+    from src.db.models import VideoProjectVersion
+
+    db = current_langgraph_session()
+    if db is None:
+        raise RuntimeError("Video graph node requires the graph database session.")
+    run = _video_run(state, db)
+    ref = dict((state.get("video") or {}).get("video_project_ref") or {})
+    project = db.query(VideoProjectVersion).filter_by(
+        id=ref.get("id"), workspace_id=run.workspace_id, project_id=run.project_id,
+    ).one_or_none()
+    if project is None:
+        raise ValueError("Video storyboard successor is missing or out of scope.")
+    quality = evaluate_video_storyboard_quality(db, project)
+    AgentRunEventJournal.append_video_quality(run, db, quality=quality)
+    verdict = str(quality["verdict"])
+    status = {
+        "PASS": "completed",
+        "REVIEW_REQUIRED": "awaiting_review",
+        "FAIL": "failed",
+    }.get(verdict, "failed")
+    stage = "video_review_ready" if verdict == "PASS" else "video_storyboard_quality"
+    event_type = "video_review_ready" if verdict == "PASS" else "video_storyboard_quality_evaluated"
+    return {
+        "current_stage": stage,
+        "status": status,
+        "events": [{**_video_node_event(stage, status, event_type), "node_status": "failed" if verdict == "FAIL" else "awaiting_review" if verdict == "REVIEW_REQUIRED" else "completed"}],
+        "video": {**dict(state.get("video") or {}), "status": "review_ready" if verdict == "PASS" else "quality_review_required" if verdict == "REVIEW_REQUIRED" else "quality_failed"},
+        "quality": quality,
+    }
+
+
+def build_lg16_video_compiled_graph(*, checkpointer: BaseCheckpointSaver[Any]):
+    """Compile LG-16's provider-free storyboard/content subgraph."""
+    graph = StateGraph(VideoProjectGraphState)
+    graph.add_node("video_source_guard", _video_source_guard)
+    graph.add_node("video_storyboard_planner", _video_storyboard_planner)
+    graph.add_node("video_storyboard_quality", _video_storyboard_quality)
+    graph.add_edge(START, "video_source_guard")
+    graph.add_edge("video_source_guard", "video_storyboard_planner")
+    graph.add_edge("video_storyboard_planner", "video_storyboard_quality")
+    graph.add_edge("video_storyboard_quality", END)
+    return graph.compile(checkpointer=checkpointer)
 
 
 def build_lg15_social_kit_compiled_graph(*, checkpointer: BaseCheckpointSaver[Any]):

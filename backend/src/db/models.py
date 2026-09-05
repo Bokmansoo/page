@@ -1009,6 +1009,141 @@ class SocialCardCopyVersion(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
 
 
+class VideoProjectVersion(Base):
+    """Immutable LG-16 video project identity and frozen source references."""
+
+    __tablename__ = "video_project_versions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "version", name="uq_video_project_project_version"),
+        UniqueConstraint("project_id", "canonical_hash", name="uq_video_project_project_hash"),
+        UniqueConstraint("project_id", "idempotency_key", name="uq_video_project_project_idempotency"),
+        CheckConstraint("version > 0", name="ck_video_project_version_positive"),
+        CheckConstraint("source_master_version > 0", name="ck_video_project_source_master_version_positive"),
+        CheckConstraint(
+            "length(canonical_hash) = 64 AND canonical_hash = lower(canonical_hash)",
+            name="ck_video_project_canonical_hash",
+        ),
+        CheckConstraint(
+            "length(idempotency_key) = 64 AND idempotency_key = lower(idempotency_key)",
+            name="ck_video_project_idempotency_key",
+        ),
+        CheckConstraint(
+            "output_hash IS NULL OR (length(output_hash) = 64 AND output_hash = lower(output_hash))",
+            name="ck_video_project_output_hash",
+        ),
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    workspace_id = Column(String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    creator_run_id = Column(String(36), ForeignKey("agent_runs.id", ondelete="RESTRICT"), nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    schema_version = Column(String(80), nullable=False)
+    parent_video_project_version_id = Column(String(36), ForeignKey("video_project_versions.id", ondelete="RESTRICT"), nullable=True)
+    parent_version = Column(Integer, nullable=True)
+    parent_version_hash = Column(String(64), nullable=True)
+    source_master_id = Column(String(36), ForeignKey("commerce_creative_master_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    source_master_version = Column(Integer, nullable=False)
+    source_master_hash = Column(String(64), nullable=False)
+    approved_fact_snapshot_ref_json = Column(JSON, nullable=False, default=dict)
+    creative_brief_ref_json = Column(JSON, nullable=False, default=dict)
+    brand_kit_ref_json = Column(JSON, nullable=False, default=dict)
+    rights_asset_refs_json = Column(JSON, nullable=False, default=list)
+    planning_contract_ref_json = Column(JSON, nullable=False, default=dict)
+    video_manifest_json = Column(JSON, nullable=False, default=dict)
+    publishing_targets_json = Column(JSON, nullable=False, default=list)
+    execution_mode = Column(String(40), nullable=False, default="deterministic_fake")
+    output_hash = Column(String(64), nullable=True)
+    idempotency_key = Column(String(64), nullable=False)
+    canonical_hash = Column(String(64), nullable=False, index=True)
+    created_by = Column(String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+
+class VideoTextVersion(Base):
+    """Immutable, fact-bound editable text for one frozen video project."""
+
+    __tablename__ = "video_text_versions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "idempotency_key", name="uq_video_text_project_idempotency"),
+        UniqueConstraint("project_id", "video_project_version_id", "scene_id", "text_role", "version", name="uq_video_text_scene_version"),
+        CheckConstraint("version > 0", name="ck_video_text_version_positive"),
+        CheckConstraint("length(body_hash) = 64 AND body_hash = lower(body_hash)", name="ck_video_text_body_hash"),
+        CheckConstraint("length(canonical_hash) = 64 AND canonical_hash = lower(canonical_hash)", name="ck_video_text_canonical_hash"),
+        CheckConstraint("length(idempotency_key) = 64 AND idempotency_key = lower(idempotency_key)", name="ck_video_text_idempotency_key"),
+        CheckConstraint("validation_status IN ('PASS','REVIEW_REQUIRED','FAIL')", name="ck_video_text_validation_status"),
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    workspace_id = Column(String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    video_project_version_id = Column(String(36), ForeignKey("video_project_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    source_master_id = Column(String(36), ForeignKey("commerce_creative_master_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    schema_version = Column(String(80), nullable=False, default="lg16-video-text-v1")
+    scene_id = Column(String(100), nullable=False, index=True)
+    text_role = Column(String(40), nullable=False)
+    placement_role = Column(String(40), nullable=False)
+    visibility_status = Column(String(24), nullable=False, default="visible")
+    version = Column(Integer, nullable=False)
+    parent_text_version_id = Column(String(36), ForeignKey("video_text_versions.id", ondelete="RESTRICT"), nullable=True)
+    parent_text_version = Column(Integer, nullable=True)
+    parent_text_hash = Column(String(64), nullable=True)
+    body_text = Column(Text, nullable=False)
+    body_hash = Column(String(64), nullable=False)
+    source_fact_refs_json = Column(JSON, nullable=False, default=list)
+    provenance_refs_json = Column(JSON, nullable=False, default=list)
+    validation_status = Column(String(32), nullable=False)
+    validation_result_json = Column(JSON, nullable=False, default=dict)
+    author_id = Column(String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    idempotency_key = Column(String(64), nullable=False)
+    canonical_hash = Column(String(64), nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+
+class VideoPlatformMetadataVersion(Base):
+    """Immutable publishing metadata bound to one common final video."""
+
+    __tablename__ = "video_platform_metadata_versions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "platform", "idempotency_key", name="uq_video_platform_metadata_idempotency"),
+        UniqueConstraint("project_id", "platform", "version", name="uq_video_platform_metadata_version"),
+        CheckConstraint("version > 0", name="ck_video_platform_metadata_version_positive"),
+        CheckConstraint("platform IN ('reels','tiktok','youtube_shorts')", name="ck_video_platform_metadata_platform"),
+        CheckConstraint("length(final_asset_hash) = 64 AND final_asset_hash = lower(final_asset_hash)", name="ck_video_platform_metadata_asset_hash"),
+        CheckConstraint("length(canonical_hash) = 64 AND canonical_hash = lower(canonical_hash)", name="ck_video_platform_metadata_canonical_hash"),
+        CheckConstraint("length(idempotency_key) = 64 AND idempotency_key = lower(idempotency_key)", name="ck_video_platform_metadata_idempotency_key"),
+        CheckConstraint("validation_status IN ('PASS','REVIEW_REQUIRED','FAIL')", name="ck_video_platform_metadata_validation_status"),
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    workspace_id = Column(String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(String(36), ForeignKey("product_projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    video_project_version_id = Column(String(36), ForeignKey("video_project_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    source_master_id = Column(String(36), ForeignKey("commerce_creative_master_versions.id", ondelete="RESTRICT"), nullable=False, index=True)
+    final_asset_id = Column(String(36), ForeignKey("assets.id", ondelete="RESTRICT"), nullable=False, index=True)
+    final_asset_hash = Column(String(64), nullable=False)
+    schema_version = Column(String(80), nullable=False, default="lg16-video-platform-metadata-v1")
+    platform = Column(String(32), nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    parent_metadata_version_id = Column(String(36), ForeignKey("video_platform_metadata_versions.id", ondelete="RESTRICT"), nullable=True)
+    parent_metadata_version = Column(Integer, nullable=True)
+    parent_metadata_hash = Column(String(64), nullable=True)
+    title_text = Column(Text, nullable=True)
+    caption_text = Column(Text, nullable=True)
+    description_text = Column(Text, nullable=True)
+    cta_text = Column(Text, nullable=True)
+    hashtags_json = Column(JSON, nullable=False, default=list)
+    text_refs_json = Column(JSON, nullable=False, default=list)
+    source_fact_refs_json = Column(JSON, nullable=False, default=list)
+    provenance_refs_json = Column(JSON, nullable=False, default=list)
+    validation_status = Column(String(32), nullable=False)
+    validation_result_json = Column(JSON, nullable=False, default=dict)
+    author_id = Column(String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    idempotency_key = Column(String(64), nullable=False)
+    canonical_hash = Column(String(64), nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+
 class QualityThresholdProfileVersion(Base):
     """Immutable, project-scoped threshold contract for frozen DetailPage QA."""
 
@@ -1759,6 +1894,9 @@ _LG12I_IMMUTABLE_VERSION_MODELS = (
     CommerceCreativeMasterVersion,
     SocialKitVersion,
     SocialCardCopyVersion,
+    VideoProjectVersion,
+    VideoTextVersion,
+    VideoPlatformMetadataVersion,
     ProductCreativeBriefVersion,
     QualityThresholdProfileVersion,
     QualityAssessmentReportVersion,

@@ -39,6 +39,8 @@ from src.agents.langgraph_runtime import (
     build_lg11_edit_graph_input,
     build_lg15_social_kit_compiled_graph,
     build_lg15_social_kit_graph_input,
+    build_lg16_video_compiled_graph,
+    build_lg16_video_graph_input,
     langgraph_runtime_enabled,
     open_postgres_checkpointer,
 )
@@ -147,8 +149,20 @@ _EVENT_TYPES = frozenset({
     "social_card_generation_completed",
     "social_card_action_submitted",
     "social_kit_version_forked",
+    "video_requested",
+    "video_storyboard_planned",
+    "video_storyboard_quality_evaluated",
+    "video_review_ready",
+    "video_scene_generation_requested",
+    "video_scene_generation_completed",
+    "video_scene_generation_failed",
+    "video_assembly_started",
+    "video_assembly_completed",
+    "video_assembly_failed",
+    "video_text_version_created",
+    "video_platform_metadata_created",
 })
-_EVENT_REFERENCE_NAMES = ("source_snapshot", "truth", "confirmation", "creative_brief", "commerce_creative_master", "social_kit")
+_EVENT_REFERENCE_NAMES = ("source_snapshot", "truth", "confirmation", "creative_brief", "commerce_creative_master", "social_kit", "video_project", "storyboard")
 _SOURCE_FIDELITY_STATES = frozenset({"unknown", "seller_entered", "captured", "ready", "partial_observation_ready", "recovery"})
 _RECOVERY_EVENT_TYPES = frozenset({
     "lease_expired_requeued",
@@ -225,6 +239,11 @@ _SOCIAL_EVENT_TYPES = frozenset({
 _SOCIAL_RENDER_EVENT_TYPES = frozenset({"social_render_started", "social_card_rendered", "social_render_completed"})
 _SOCIAL_GENERATION_EVENT_TYPES = frozenset({"social_card_generation_requested", "social_card_generation_completed"})
 _SOCIAL_ACTION_EVENT_TYPES = frozenset({"social_card_action_submitted", "social_kit_version_forked"})
+_VIDEO_EVENT_TYPES = frozenset({"video_requested", "video_storyboard_planned", "video_storyboard_quality_evaluated", "video_review_ready"})
+_VIDEO_GENERATION_EVENT_TYPES = frozenset({"video_scene_generation_requested", "video_scene_generation_completed", "video_scene_generation_failed"})
+_VIDEO_ASSEMBLY_EVENT_TYPES = frozenset({"video_assembly_started", "video_assembly_completed", "video_assembly_failed"})
+_VIDEO_TEXT_EVENT_TYPES = frozenset({"video_text_version_created"})
+_VIDEO_METADATA_EVENT_TYPES = frozenset({"video_platform_metadata_created"})
 _SOCIAL_STATUSES = frozenset({"requested", "planned", "created", "review_ready"})
 _SOCIAL_RENDER_STATUSES = frozenset({"running", "rendered", "completed"})
 _SOCIAL_QUALITY_DIMENSION_STATUSES = frozenset({"PASS", "FAIL", "DEFERRED"})
@@ -606,6 +625,55 @@ class AgentRunEventJournal:
 
     @classmethod
     def _payload_for_update(cls, run: AgentRun, update: dict[str, Any], event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        video = dict(update.get("video") or {})
+        video_event_type = str(event.get("video_event_type") or "")
+        video_generation = dict(update.get("video_generation") or {})
+        if (video or video_generation) and video_event_type in (_VIDEO_EVENT_TYPES | _VIDEO_GENERATION_EVENT_TYPES):
+            references: dict[str, Any] = {}
+            if video.get("video_project_ref"):
+                references["video_project"] = cls._reference(video["video_project_ref"])
+            if video.get("storyboard_ref"):
+                references["storyboard"] = cls._reference(video["storyboard_ref"])
+            if video.get("source_master_ref"):
+                references["commerce_creative_master"] = cls._reference(video["source_master_ref"])
+            payload: dict[str, Any] = {
+                "stage": str(event.get("stage") or "video"),
+                "status": str(event.get("status") or "running"),
+                "node_status": str(event.get("node_status") or "completed"),
+                "input_mode": "",
+                "source_fidelity": "ready",
+                "references": {key: value for key, value in references.items() if value is not None},
+                "metrics": {"unknown_fact_count": 0, "prohibited_inference_count": 0, "clarification_count": 0},
+                "lifecycle": {"transition": "completed" if event.get("status") == "completed" else "blocked" if event.get("status") == "awaiting_review" else ("requested" if video_event_type == "video_requested" else "failed"), "checkpoint_id": ""},
+                "video": {
+                    key: value for key, value in {
+                        "video_project_ref": video.get("video_project_ref"),
+                        "source_video_project_ref": video.get("source_video_project_ref"),
+                        "storyboard_ref": video.get("storyboard_ref"),
+                        "scene_count": int(video.get("scene_count") or 0),
+                        "status": video.get("status") or "requested",
+                        "execution_mode": video.get("execution_mode") or "deterministic_fake",
+                    }.items() if value is not None
+                },
+            }
+            if video_event_type in {"video_storyboard_quality_evaluated", "video_review_ready"} and update.get("quality"):
+                payload["quality"] = dict(update.get("quality") or {})
+            if video_event_type in _VIDEO_GENERATION_EVENT_TYPES:
+                payload["generation"] = {
+                    "schema_version": str(video_generation.get("schema_version") or "lg16-video-generation-v1"),
+                    "generation_contract_version": str(video_generation.get("generation_contract_version") or "lg16-video-scene-generation-v1"),
+                    "status": str(video_generation.get("status") or "queued"),
+                    "scene_count": int(video_generation.get("scene_count") or 0),
+                    "completed_count": int(video_generation.get("completed_count") or 0),
+                    "pending_count": int(video_generation.get("pending_count") or 0),
+                    "failed_count": int(video_generation.get("failed_count") or 0),
+                    "jobs": [
+                        {key: item.get(key) for key in ("scene_id", "job_id", "status", "output_asset_id", "generation_attempt", "error_code") if item.get(key) is not None}
+                        for item in list(video_generation.get("jobs") or [])[:32] if isinstance(item, dict)
+                    ],
+                }
+            cls.validate_payload(video_event_type, payload)
+            return video_event_type, payload
         intake = dict(update.get("intake") or {})
         source_name, source = next(
             ((name, dict(intake.get(name) or {})) for name in ("manual_source", "owned_url_source", "photo_source") if isinstance(intake.get(name), dict)),
@@ -672,7 +740,7 @@ class AgentRunEventJournal:
             expected_fields.add("failure")
         if event_type in _TIMING_EVENT_TYPES:
             expected_fields.add("timing")
-        if event_type in _STAGE_LIFECYCLE_EVENT_TYPES or event_type in _RUN_LIFECYCLE_EVENT_TYPES or event_type in _REVIEW_LIFECYCLE_EVENT_TYPES or event_type in _QUALITY_LIFECYCLE_EVENT_TYPES or event_type in _SOCIAL_EVENT_TYPES or event_type in _SOCIAL_RENDER_EVENT_TYPES or event_type in _SOCIAL_GENERATION_EVENT_TYPES or event_type in _SOCIAL_ACTION_EVENT_TYPES:
+        if event_type in _STAGE_LIFECYCLE_EVENT_TYPES or event_type in _RUN_LIFECYCLE_EVENT_TYPES or event_type in _REVIEW_LIFECYCLE_EVENT_TYPES or event_type in _QUALITY_LIFECYCLE_EVENT_TYPES or event_type in _SOCIAL_EVENT_TYPES or event_type in _SOCIAL_RENDER_EVENT_TYPES or event_type in _SOCIAL_GENERATION_EVENT_TYPES or event_type in _SOCIAL_ACTION_EVENT_TYPES or event_type in _VIDEO_EVENT_TYPES or event_type in _VIDEO_GENERATION_EVENT_TYPES or event_type in _VIDEO_ASSEMBLY_EVENT_TYPES or event_type in _VIDEO_TEXT_EVENT_TYPES or event_type in _VIDEO_METADATA_EVENT_TYPES:
             expected_fields.add("lifecycle")
         if event_type in _SOCIAL_EVENT_TYPES:
             expected_fields.add("social")
@@ -686,6 +754,51 @@ class AgentRunEventJournal:
             expected_fields.add("action")
         if event_type in _QUALITY_LIFECYCLE_EVENT_TYPES and "quality" in payload:
             expected_fields.add("quality")
+        if event_type in _VIDEO_EVENT_TYPES or event_type in _VIDEO_ASSEMBLY_EVENT_TYPES or event_type in _VIDEO_TEXT_EVENT_TYPES or event_type in _VIDEO_METADATA_EVENT_TYPES:
+            expected_fields.add("video")
+            if event_type in {"video_storyboard_quality_evaluated", "video_review_ready"} and "quality" in payload:
+                expected_fields.add("quality")
+        if event_type in _VIDEO_TEXT_EVENT_TYPES:
+            text_layer = payload.get("text")
+            if not isinstance(text_layer, dict) or set(text_layer) != {"text_ref", "scene_id", "text_role", "validation_status", "body_hash"}:
+                raise ValueError("Video text event payload is not an allowlisted shape.")
+            if AgentRunEventJournal._reference(text_layer["text_ref"]) != text_layer["text_ref"]:
+                raise ValueError("Video text reference is invalid.")
+            if not isinstance(text_layer["scene_id"], str) or not 1 <= len(text_layer["scene_id"]) <= 100:
+                raise ValueError("Video text scene identity is invalid.")
+            if text_layer["text_role"] not in {"scene_copy", "overlay_text", "caption_text"}:
+                raise ValueError("Video text role is invalid.")
+            if text_layer["validation_status"] not in {"PASS", "REVIEW_REQUIRED", "FAIL"}:
+                raise ValueError("Video text validation status is invalid.")
+            if not re.fullmatch(r"[0-9a-f]{64}", str(text_layer["body_hash"])):
+                raise ValueError("Video text body hash is invalid.")
+        if event_type in _VIDEO_METADATA_EVENT_TYPES:
+            metadata = payload.get("metadata")
+            if not isinstance(metadata, dict) or set(metadata) != {"metadata_ref", "platform", "version", "validation_status", "canonical_hash", "final_asset_hash"}:
+                raise ValueError("Video platform metadata event payload is not an allowlisted shape.")
+            if AgentRunEventJournal._reference(metadata["metadata_ref"]) != metadata["metadata_ref"]:
+                raise ValueError("Video platform metadata reference is invalid.")
+            if metadata["platform"] not in {"reels", "tiktok", "youtube_shorts"}:
+                raise ValueError("Video platform metadata platform is invalid.")
+            if not isinstance(metadata["version"], int) or metadata["version"] < 1:
+                raise ValueError("Video platform metadata version is invalid.")
+            if metadata["validation_status"] not in {"PASS", "REVIEW_REQUIRED", "FAIL"}:
+                raise ValueError("Video platform metadata validation status is invalid.")
+            for key in ("canonical_hash", "final_asset_hash"):
+                if not re.fullmatch(r"[0-9a-f]{64}", str(metadata[key])):
+                    raise ValueError("Video platform metadata hash is invalid.")
+        if event_type in _VIDEO_GENERATION_EVENT_TYPES:
+            expected_fields.add("video")
+            expected_fields.add("generation")
+        if event_type in _VIDEO_ASSEMBLY_EVENT_TYPES:
+            expected_fields.add("video")
+            expected_fields.add("assembly")
+        if event_type in _VIDEO_TEXT_EVENT_TYPES:
+            expected_fields.add("video")
+            expected_fields.add("text")
+        if event_type in _VIDEO_METADATA_EVENT_TYPES:
+            expected_fields.add("video")
+            expected_fields.add("metadata")
         # Identity was added after the initial journal rollout.  Older rows
         # remain replayable, while every new append receives this bounded
         # authority record in ``append`` below.
@@ -761,7 +874,7 @@ class AgentRunEventJournal:
                     raise ValueError("AgentRun delivery timing reference is invalid.")
                 if not isinstance(timing["attempt"], int) or not 0 <= timing["attempt"] <= 1000:
                     raise ValueError("AgentRun delivery timing attempt is invalid.")
-        if event_type in _STAGE_LIFECYCLE_EVENT_TYPES or event_type in _RUN_LIFECYCLE_EVENT_TYPES or event_type in _REVIEW_LIFECYCLE_EVENT_TYPES or event_type in _QUALITY_LIFECYCLE_EVENT_TYPES or event_type in _SOCIAL_EVENT_TYPES or event_type in _SOCIAL_RENDER_EVENT_TYPES or event_type in _SOCIAL_GENERATION_EVENT_TYPES or event_type in _SOCIAL_ACTION_EVENT_TYPES:
+        if event_type in _STAGE_LIFECYCLE_EVENT_TYPES or event_type in _RUN_LIFECYCLE_EVENT_TYPES or event_type in _REVIEW_LIFECYCLE_EVENT_TYPES or event_type in _QUALITY_LIFECYCLE_EVENT_TYPES or event_type in _SOCIAL_EVENT_TYPES or event_type in _SOCIAL_RENDER_EVENT_TYPES or event_type in _SOCIAL_GENERATION_EVENT_TYPES or event_type in _SOCIAL_ACTION_EVENT_TYPES or event_type in _VIDEO_EVENT_TYPES or event_type in _VIDEO_GENERATION_EVENT_TYPES or event_type in _VIDEO_ASSEMBLY_EVENT_TYPES or event_type in _VIDEO_TEXT_EVENT_TYPES:
             lifecycle = payload["lifecycle"]
             lifecycle_keys = {"transition", "checkpoint_id"}
             if event_type == "seller_choice_submitted":
@@ -804,6 +917,114 @@ class AgentRunEventJournal:
                 raise ValueError("Social card action copy reference is invalid.")
             if not isinstance(action["preserved_card_count"], int) or not 0 <= action["preserved_card_count"] <= 100:
                 raise ValueError("Social card preserved count is invalid.")
+        if event_type in _VIDEO_EVENT_TYPES or event_type in _VIDEO_METADATA_EVENT_TYPES:
+            video = payload["video"]
+            if not isinstance(video, dict) or set(video) - {
+                "video_project_ref", "source_video_project_ref", "storyboard_ref",
+                "scene_count", "status", "execution_mode",
+            }:
+                raise ValueError("Video event payload is not an allowlisted shape.")
+            for name in ("video_project_ref", "source_video_project_ref"):
+                if name in video and AgentRunEventJournal._reference(video[name]) != video[name]:
+                    raise ValueError("Video event project reference is invalid.")
+            if video.get("storyboard_ref") is not None and AgentRunEventJournal._reference(video["storyboard_ref"]) != video["storyboard_ref"]:
+                raise ValueError("Video event storyboard reference is invalid.")
+            if not isinstance(video.get("scene_count", 0), int) or not 0 <= video.get("scene_count", 0) <= 32:
+                raise ValueError("Video event scene count is invalid.")
+            if video.get("status") not in {"requested", "planned", "review_ready", "quality_review_required", "quality_failed", "assembling", "assembly_completed", "assembly_failed", "text_updated", "text_review_required", "metadata_ready", "metadata_review_required", "metadata_failed"}:
+                raise ValueError("Video event status is invalid.")
+            if video.get("execution_mode") != "deterministic_fake":
+                raise ValueError("Video event execution mode is invalid.")
+            if event_type in {"video_storyboard_quality_evaluated", "video_review_ready"} and "quality" in payload:
+                quality = payload["quality"]
+                if not isinstance(quality, dict) or set(quality) != {
+                    "schema_version", "quality_stage", "video_project_ref", "storyboard_ref",
+                    "verdict", "dimension_results", "reason_codes", "rework_targets",
+                    "evaluator_version", "canonical_hash",
+                }:
+                    raise ValueError("Video quality payload is not allowlisted.")
+                if quality.get("schema_version") != "lg16-video-quality-v1" or quality.get("quality_stage") != "storyboard_content":
+                    raise ValueError("Video quality schema is invalid.")
+                if quality.get("verdict") not in {"PASS", "REVIEW_REQUIRED", "FAIL"}:
+                    raise ValueError("Video quality verdict is invalid.")
+                if AgentRunEventJournal._reference(quality.get("video_project_ref")) != quality.get("video_project_ref"):
+                    raise ValueError("Video quality project reference is invalid.")
+                if quality.get("storyboard_ref") is not None and AgentRunEventJournal._reference(quality["storyboard_ref"]) != quality["storyboard_ref"]:
+                    raise ValueError("Video quality storyboard reference is invalid.")
+                dimensions = quality.get("dimension_results")
+                if not isinstance(dimensions, dict) or len(dimensions) > 32 or any(value not in {"PASS", "FAIL", "DEFERRED"} for value in dimensions.values()):
+                    raise ValueError("Video quality dimensions are invalid.")
+                if not isinstance(quality.get("reason_codes"), list) or len(quality["reason_codes"]) > 10 or any(not _PUBLIC_CODE.fullmatch(str(item)) for item in quality["reason_codes"]):
+                    raise ValueError("Video quality reasons are invalid.")
+                if not isinstance(quality.get("rework_targets"), list) or len(quality["rework_targets"]) > 32:
+                    raise ValueError("Video quality rework targets are invalid.")
+        if event_type in _VIDEO_GENERATION_EVENT_TYPES:
+            generation = payload.get("generation")
+            if not isinstance(generation, dict) or set(generation) != {
+                "schema_version", "generation_contract_version", "status", "scene_count",
+                "completed_count", "pending_count", "failed_count", "jobs",
+            }:
+                raise ValueError("Video generation payload is not an allowlisted shape.")
+            if generation["schema_version"] != "lg16-video-generation-v1" or generation["generation_contract_version"] != "lg16-video-scene-generation-v1":
+                raise ValueError("Video generation schema is invalid.")
+            if generation["status"] not in {"queued", "completed", "failed"}:
+                raise ValueError("Video generation status is invalid.")
+            for name in ("scene_count", "completed_count", "pending_count", "failed_count"):
+                if not isinstance(generation[name], int) or not 0 <= generation[name] <= 32:
+                    raise ValueError("Video generation counts are invalid.")
+            if not isinstance(generation["jobs"], list) or len(generation["jobs"]) > 32:
+                raise ValueError("Video generation jobs are invalid.")
+            for job in generation["jobs"]:
+                if not isinstance(job, dict) or set(job) - {"scene_id", "job_id", "status", "output_asset_id", "generation_attempt", "error_code"}:
+                    raise ValueError("Video generation job payload is not allowlisted.")
+                for key in ("scene_id", "job_id", "output_asset_id", "error_code"):
+                    if key in job and (not isinstance(job[key], str) or len(job[key]) > 120):
+                        raise ValueError("Video generation job scalar is invalid.")
+                if job.get("status") not in {"queued", "running", "needs_review", "approved", "completed", "failed", "blocked"}:
+                    raise ValueError("Video generation job status is invalid.")
+                if not isinstance(job.get("generation_attempt", 1), int) or not 1 <= job.get("generation_attempt", 1) <= 1000:
+                    raise ValueError("Video generation attempt is invalid.")
+        if event_type in _VIDEO_ASSEMBLY_EVENT_TYPES:
+            assembly = payload.get("assembly")
+            if not isinstance(assembly, dict) or set(assembly) != {
+                "schema_version", "profile_id", "profile_version", "status", "assembly_hash",
+                "scene_count", "ordered_scene_ids", "selected_clip_refs", "final_asset_ref",
+                "duration_seconds", "geometry", "output_hash", "quality_verdict", "common_targets",
+            }:
+                raise ValueError("Video assembly payload is not an allowlisted shape.")
+            if assembly["schema_version"] != "lg16-video-assembly-v1" or assembly["profile_id"] != "common_shortform_mp4" or assembly["profile_version"] != 1:
+                raise ValueError("Video assembly profile is invalid.")
+            if assembly["status"] not in {"started", "completed", "failed"} or not re.fullmatch(r"[0-9a-f]{64}", str(assembly["assembly_hash"])):
+                raise ValueError("Video assembly identity is invalid.")
+            if not isinstance(assembly["scene_count"], int) or not 1 <= assembly["scene_count"] <= 32:
+                raise ValueError("Video assembly scene count is invalid.")
+            ids = assembly["ordered_scene_ids"]
+            if not isinstance(ids, list) or len(ids) != assembly["scene_count"] or any(not isinstance(item, str) or not 0 < len(item) <= 100 for item in ids):
+                raise ValueError("Video assembly scene order is invalid.")
+            clips = assembly["selected_clip_refs"]
+            if not isinstance(clips, list) or len(clips) != assembly["scene_count"]:
+                raise ValueError("Video assembly clip refs are invalid.")
+            for clip in clips:
+                if not isinstance(clip, dict) or set(clip) != {"scene_id", "asset_ref", "content_hash", "duration_seconds", "width", "height"}:
+                    raise ValueError("Video assembly clip metadata is not allowlisted.")
+                if clip["scene_id"] not in ids or AgentRunEventJournal._reference(clip["asset_ref"]) != clip["asset_ref"]:
+                    raise ValueError("Video assembly clip reference is invalid.")
+                if not re.fullmatch(r"[0-9a-f]{64}", str(clip["content_hash"])) or not isinstance(clip["duration_seconds"], (int, float)) or clip["duration_seconds"] <= 0:
+                    raise ValueError("Video assembly clip metadata is invalid.")
+                if any(not isinstance(clip[key], int) or clip[key] <= 0 or clip[key] > 10000 for key in ("width", "height")):
+                    raise ValueError("Video assembly geometry is invalid.")
+            if assembly["final_asset_ref"] is not None and AgentRunEventJournal._reference(assembly["final_asset_ref"]) != assembly["final_asset_ref"]:
+                raise ValueError("Video assembly final asset reference is invalid.")
+            duration = assembly["duration_seconds"]
+            if duration is not None and (not isinstance(duration, (int, float)) or duration <= 0 or duration > 86400):
+                raise ValueError("Video assembly duration is invalid.")
+            geometry = assembly["geometry"]
+            if geometry is not None and (not isinstance(geometry, dict) or set(geometry) != {"width", "height"} or any(not isinstance(geometry[key], int) or geometry[key] <= 0 for key in ("width", "height"))):
+                raise ValueError("Video assembly output geometry is invalid.")
+            if assembly["output_hash"] is not None and not re.fullmatch(r"[0-9a-f]{64}", str(assembly["output_hash"])):
+                raise ValueError("Video assembly output hash is invalid.")
+            if assembly["quality_verdict"] not in {"PASS", "FAIL", None} or not isinstance(assembly["common_targets"], list) or assembly["common_targets"] != ["reels", "tiktok", "youtube_shorts"]:
+                raise ValueError("Video assembly quality or common target contract is invalid.")
         if event_type in _SOCIAL_EVENT_TYPES:
             social = payload["social"]
             if not isinstance(social, dict) or set(social) != {
@@ -1489,6 +1710,8 @@ class AgentRunEventJournal:
 
     @staticmethod
     def quality_lifecycle_event(stage: str, node_status: str, quality: dict[str, Any]) -> tuple[str, str] | None:
+        if quality.get("quality_stage") == "storyboard_content":
+            return None
         if stage == "social_review_ready" and quality.get("quality_stage") == "content":
             return None
         if not quality and "quality" not in stage:
@@ -1730,6 +1953,233 @@ class AgentRunEventJournal:
         )
 
     @classmethod
+    def append_video_quality(cls, run: AgentRun, db: Session, *, quality: dict[str, Any]) -> tuple[AgentRunEvent, bool, AgentRun]:
+        """Persist one bounded LG-16 storyboard quality result."""
+        video_ref = dict(quality.get("video_project_ref") or {})
+        storyboard_ref = quality.get("storyboard_ref")
+        verdict = str(quality.get("verdict") or "FAIL")
+        video_status = {
+            "PASS": "review_ready",
+            "REVIEW_REQUIRED": "quality_review_required",
+            "FAIL": "quality_failed",
+        }.get(verdict, "quality_failed")
+        node_status = "completed" if verdict == "PASS" else "awaiting_review" if verdict == "REVIEW_REQUIRED" else "failed"
+        payload = {
+            "stage": "video_storyboard_quality",
+            "status": "completed" if verdict == "PASS" else "awaiting_review" if verdict == "REVIEW_REQUIRED" else "failed",
+            "node_status": node_status,
+            "input_mode": "",
+            "source_fidelity": "ready",
+            "references": {
+                "video_project": cls._reference(video_ref),
+                **({"storyboard": cls._reference(storyboard_ref)} if storyboard_ref else {}),
+            },
+            "metrics": {"unknown_fact_count": 0, "prohibited_inference_count": 0, "clarification_count": 0},
+            "lifecycle": {"transition": "blocked" if verdict == "REVIEW_REQUIRED" else "completed", "checkpoint_id": ""},
+            "video": {
+                "video_project_ref": video_ref,
+                "storyboard_ref": storyboard_ref,
+                "scene_count": len(list((dict((run.input_snapshot or {}).get("video_request") or {}).get("scenes") or []))),
+                "status": video_status,
+                "execution_mode": "deterministic_fake",
+            },
+            "quality": quality,
+        }
+        return cls.append(
+            run, db, event_type="video_storyboard_quality_evaluated", payload=payload,
+            thread_id=run.graph_thread_id or run.id, workspace_id=run.workspace_id, project_id=run.project_id,
+        )
+
+    @classmethod
+    def append_video_generation(
+        cls, run: AgentRun, db: Session, *, event_type: str, video: dict[str, Any], generation: dict[str, Any],
+    ) -> tuple[AgentRunEvent, bool, AgentRun]:
+        if event_type not in _VIDEO_GENERATION_EVENT_TYPES:
+            raise ValueError("Unsupported video generation lifecycle event type.")
+        status = "running" if event_type.endswith("requested") else "completed" if event_type.endswith("completed") else "failed"
+        safe_generation = {
+            "schema_version": str(generation.get("schema_version") or "lg16-video-generation-v1"),
+            "generation_contract_version": str(generation.get("generation_contract_version") or "lg16-video-scene-generation-v1"),
+            "status": str(generation.get("status") or "queued"),
+            "scene_count": int(generation.get("scene_count") or 0),
+            "completed_count": int(generation.get("completed_count") or 0),
+            "pending_count": int(generation.get("pending_count") or 0),
+            "failed_count": int(generation.get("failed_count") or 0),
+            "jobs": [
+                {key: item.get(key) for key in ("scene_id", "job_id", "status", "output_asset_id", "generation_attempt", "error_code") if item.get(key) is not None}
+                for item in list(generation.get("jobs") or [])[:32] if isinstance(item, dict)
+            ],
+        }
+        payload = {
+            "stage": "video_scene_generation",
+            "status": status,
+            "node_status": "completed" if status != "failed" else "failed",
+            "input_mode": "",
+            "source_fidelity": "ready",
+            "references": {
+                "video_project": cls._reference(video.get("video_project_ref")),
+                "storyboard": cls._reference(video.get("storyboard_ref")),
+            },
+            "metrics": {"unknown_fact_count": 0, "prohibited_inference_count": 0, "clarification_count": 0},
+            "lifecycle": {"transition": "requested" if status == "running" else "failed" if status == "failed" else "completed", "checkpoint_id": ""},
+            "video": {
+                "video_project_ref": cls._reference(video.get("video_project_ref")),
+                "storyboard_ref": cls._reference(video.get("storyboard_ref")),
+                "scene_count": int(video.get("scene_count") or generation.get("scene_count") or 0),
+                "status": "generating" if status == "running" else "generation_failed" if status == "failed" else "generation_completed",
+                "execution_mode": "deterministic_fake",
+            },
+            "generation": safe_generation,
+        }
+        payload["references"] = {key: value for key, value in payload["references"].items() if value is not None}
+        payload["video"] = {key: value for key, value in payload["video"].items() if value is not None}
+        return cls.append(
+            run, db, event_type=event_type, payload=payload,
+            thread_id=run.graph_thread_id or run.id, workspace_id=run.workspace_id, project_id=run.project_id,
+        )
+
+    @classmethod
+    def append_video_assembly(
+        cls, run: AgentRun, db: Session, *, event_type: str, video: dict[str, Any], assembly: dict[str, Any],
+    ) -> tuple[AgentRunEvent, bool, AgentRun]:
+        if event_type not in _VIDEO_ASSEMBLY_EVENT_TYPES:
+            raise ValueError("Unsupported video assembly lifecycle event type.")
+        status = {"video_assembly_started": "running", "video_assembly_completed": "completed", "video_assembly_failed": "failed"}[event_type]
+        safe = {
+            "schema_version": "lg16-video-assembly-v1",
+            "profile_id": "common_shortform_mp4",
+            "profile_version": 1,
+            "status": str(assembly.get("status") or ("started" if status == "running" else "completed" if status == "completed" else "failed")),
+            "assembly_hash": str(assembly.get("assembly_hash") or ""),
+            "scene_count": int(assembly.get("scene_count") or 0),
+            "ordered_scene_ids": [str(item) for item in list(assembly.get("ordered_scene_ids") or [])[:32]],
+            "selected_clip_refs": [
+                {
+                    "scene_id": str(item.get("scene_id") or ""),
+                    "asset_ref": cls._reference(item.get("asset_ref")),
+                    "content_hash": str(item.get("content_hash") or ""),
+                    "duration_seconds": float(item.get("duration_seconds") or 0),
+                    "width": int(item.get("width") or 0),
+                    "height": int(item.get("height") or 0),
+                }
+                for item in list(assembly.get("selected_clip_refs") or [])[:32] if isinstance(item, dict)
+            ],
+            "final_asset_ref": cls._reference(assembly.get("final_asset_ref")) if assembly.get("final_asset_ref") else None,
+            "duration_seconds": float(assembly["duration_seconds"]) if assembly.get("duration_seconds") is not None else None,
+            "geometry": dict(assembly.get("geometry") or {}) if assembly.get("geometry") else None,
+            "output_hash": str(assembly.get("output_hash")) if assembly.get("output_hash") else None,
+            "quality_verdict": str(assembly.get("quality_verdict")) if assembly.get("quality_verdict") else None,
+            "common_targets": ["reels", "tiktok", "youtube_shorts"],
+        }
+        payload = {
+            "stage": "video_assembly",
+            "status": status,
+            "node_status": "completed" if status != "failed" else "failed",
+            "input_mode": "",
+            "source_fidelity": "ready",
+            "references": {
+                "video_project": cls._reference(video.get("video_project_ref")),
+                "storyboard": cls._reference(video.get("storyboard_ref")),
+            },
+            "metrics": {"unknown_fact_count": 0, "prohibited_inference_count": 0, "clarification_count": 0},
+            "lifecycle": {"transition": "requested" if status == "running" else "failed" if status == "failed" else "completed", "checkpoint_id": ""},
+            "video": {
+                "video_project_ref": cls._reference(video.get("video_project_ref")),
+                "storyboard_ref": cls._reference(video.get("storyboard_ref")),
+                "scene_count": safe["scene_count"],
+                "status": "assembling" if status == "running" else "assembly_failed" if status == "failed" else "assembly_completed",
+                "execution_mode": "deterministic_fake",
+            },
+            "assembly": safe,
+        }
+        payload["references"] = {key: value for key, value in payload["references"].items() if value is not None}
+        payload["video"] = {key: value for key, value in payload["video"].items() if value is not None}
+        return cls.append(
+            run, db, event_type=event_type, payload=payload,
+            thread_id=run.graph_thread_id or run.id, workspace_id=run.workspace_id, project_id=run.project_id,
+        )
+
+    @classmethod
+    def append_video_text(
+        cls, run: AgentRun, db: Session, *, video: dict[str, Any], text_layer: dict[str, Any],
+    ) -> tuple[AgentRunEvent, bool, AgentRun]:
+        """Persist only bounded text identity; the exact body stays in VideoTextVersion."""
+        status = str(text_layer.get("validation_status") or "FAIL")
+        video_status = "text_updated" if status == "PASS" else "text_review_required" if status == "REVIEW_REQUIRED" else "quality_failed"
+        payload = {
+            "stage": "video_text",
+            "status": "completed" if status == "PASS" else "awaiting_review" if status == "REVIEW_REQUIRED" else "failed",
+            "node_status": "completed" if status == "PASS" else "awaiting_review" if status == "REVIEW_REQUIRED" else "failed",
+            "input_mode": "",
+            "source_fidelity": "ready",
+            "references": {
+                "video_project": cls._reference(video.get("video_project_ref")),
+                **({"storyboard": cls._reference(video.get("storyboard_ref"))} if video.get("storyboard_ref") else {}),
+            },
+            "metrics": {"unknown_fact_count": 0, "prohibited_inference_count": 0, "clarification_count": 0},
+            "lifecycle": {"transition": "completed" if status == "PASS" else "blocked" if status == "REVIEW_REQUIRED" else "failed", "checkpoint_id": ""},
+            "video": {
+                "video_project_ref": cls._reference(video.get("video_project_ref")),
+                "storyboard_ref": cls._reference(video.get("storyboard_ref")) if video.get("storyboard_ref") else None,
+                "scene_count": int(video.get("scene_count") or 0),
+                "status": video_status,
+                "execution_mode": "deterministic_fake",
+            },
+            "text": {
+                "text_ref": cls._reference(text_layer.get("text_ref")),
+                "scene_id": str(text_layer.get("scene_id") or ""),
+                "text_role": str(text_layer.get("text_role") or ""),
+                "validation_status": status,
+                "body_hash": str(text_layer.get("body_hash") or ""),
+            },
+        }
+        payload["references"] = {key: value for key, value in payload["references"].items() if value is not None}
+        payload["video"] = {key: value for key, value in payload["video"].items() if value is not None}
+        return cls.append(
+            run, db, event_type="video_text_version_created", payload=payload,
+            thread_id=run.graph_thread_id or run.id, workspace_id=run.workspace_id, project_id=run.project_id,
+        )
+
+    @classmethod
+    def append_video_platform_metadata(
+        cls, run: AgentRun, db: Session, *, video: dict[str, Any], metadata: dict[str, Any],
+    ) -> tuple[AgentRunEvent, bool, AgentRun]:
+        """Persist only platform metadata identity; exact bodies stay in the artifact."""
+        status = str(metadata.get("validation_status") or "FAIL")
+        payload = {
+            "stage": "video_platform_metadata",
+            "status": "completed" if status == "PASS" else "awaiting_review" if status == "REVIEW_REQUIRED" else "failed",
+            "node_status": "completed" if status == "PASS" else "awaiting_review" if status == "REVIEW_REQUIRED" else "failed",
+            "input_mode": "",
+            "source_fidelity": "ready",
+            "references": {
+                "video_project": cls._reference(video.get("video_project_ref")),
+                "commerce_creative_master": cls._reference(video.get("source_master_ref")),
+            },
+            "metrics": {"unknown_fact_count": 0, "prohibited_inference_count": 0, "clarification_count": 0},
+            "lifecycle": {"transition": "completed" if status == "PASS" else "blocked" if status == "REVIEW_REQUIRED" else "failed", "checkpoint_id": ""},
+            "video": {
+                "video_project_ref": cls._reference(video.get("video_project_ref")),
+                "scene_count": int(video.get("scene_count") or 0),
+                "status": "metadata_ready" if status == "PASS" else "metadata_review_required" if status == "REVIEW_REQUIRED" else "metadata_failed",
+                "execution_mode": "deterministic_fake",
+            },
+            "metadata": {
+                "metadata_ref": cls._reference(metadata.get("metadata_ref")),
+                "platform": str(metadata.get("platform") or ""),
+                "version": int(metadata.get("version") or 0),
+                "validation_status": status,
+                "canonical_hash": str(metadata.get("canonical_hash") or ""),
+                "final_asset_hash": str(metadata.get("final_asset_hash") or ""),
+            },
+        }
+        payload["references"] = {key: value for key, value in payload["references"].items() if value is not None}
+        return cls.append(
+            run, db, event_type="video_platform_metadata_created", payload=payload,
+            thread_id=run.graph_thread_id or run.id, workspace_id=run.workspace_id, project_id=run.project_id,
+        )
+
+    @classmethod
     def append(
         cls, run: AgentRun, db: Session, *, event_type: str, payload: dict[str, Any], thread_id: str | None = None,
         workspace_id: str | None = None, project_id: str | None = None, checkpoint_id: str | None = None,
@@ -1791,6 +2241,10 @@ class AgentRunEventJournal:
             outputs.pop("langgraph_event_projection", None)
             outputs.pop("provider_cost_projection", None)
             outputs.pop("langgraph_social", None)
+            outputs.pop("langgraph_video", None)
+            outputs.pop("langgraph_video_generation", None)
+            outputs.pop("langgraph_video_assembly", None)
+            outputs.pop("langgraph_video_platform_metadata", None)
             locked.outputs_json = outputs
             locked.last_applied_event_sequence = 0
             locked.actual_cost = 0.0
@@ -1833,6 +2287,75 @@ class AgentRunEventJournal:
             run.last_applied_event_sequence = record.sequence
             return
         outputs = dict(run.outputs_json or {})
+        if record.event_type in _VIDEO_EVENT_TYPES:
+            video_payload = dict(payload.get("video") or {})
+            video = dict(outputs.get("langgraph_video") or {})
+            video.update({key: value for key, value in video_payload.items() if value is not None})
+            refs = dict(payload.get("references") or {})
+            if refs.get("video_project"):
+                video["video_project_ref"] = refs["video_project"]
+            if refs.get("storyboard"):
+                video["storyboard_ref"] = refs["storyboard"]
+            outputs["langgraph_video"] = video
+            if payload.get("quality"):
+                outputs["langgraph_quality"] = dict(payload["quality"])
+            run.outputs_json = outputs
+            run.current_stage = payload["stage"] or run.current_stage
+            run.status = payload["status"] or run.status
+            run.last_applied_event_sequence = record.sequence
+            return
+        if record.event_type in _VIDEO_GENERATION_EVENT_TYPES:
+            generation = dict(payload.get("generation") or {})
+            video = dict(outputs.get("langgraph_video") or {})
+            if generation:
+                video["generation"] = generation
+                video["generation_status"] = generation.get("status")
+            outputs["langgraph_video"] = video
+            outputs["langgraph_video_generation"] = generation
+            run.outputs_json = outputs
+            run.current_stage = payload["stage"] or run.current_stage
+            run.status = payload["status"] or run.status
+            run.last_applied_event_sequence = record.sequence
+            return
+        if record.event_type in _VIDEO_ASSEMBLY_EVENT_TYPES:
+            assembly = dict(payload.get("assembly") or {})
+            video = dict(outputs.get("langgraph_video") or {})
+            video["assembly"] = assembly
+            video["assembly_status"] = assembly.get("status")
+            outputs["langgraph_video"] = video
+            outputs["langgraph_video_assembly"] = assembly
+            run.outputs_json = outputs
+            run.current_stage = payload["stage"] or run.current_stage
+            run.status = payload["status"] or run.status
+            run.last_applied_event_sequence = record.sequence
+            return
+        if record.event_type in _VIDEO_TEXT_EVENT_TYPES:
+            video_payload = dict(payload.get("video") or {})
+            video = dict(outputs.get("langgraph_video") or {})
+            video.update({key: value for key, value in video_payload.items() if value is not None})
+            refs = dict(payload.get("references") or {})
+            if refs.get("video_project"):
+                video["video_project_ref"] = refs["video_project"]
+            if refs.get("storyboard"):
+                video["storyboard_ref"] = refs["storyboard"]
+            video["text_layer"] = dict(payload.get("text") or {})
+            outputs["langgraph_video"] = video
+            run.outputs_json = outputs
+            run.current_stage = payload["stage"] or run.current_stage
+            run.status = payload["status"] or run.status
+            run.last_applied_event_sequence = record.sequence
+            return
+        if record.event_type in _VIDEO_METADATA_EVENT_TYPES:
+            metadata = dict(payload.get("metadata") or {})
+            video = dict(outputs.get("langgraph_video") or {})
+            video["platform_metadata"] = metadata
+            outputs["langgraph_video"] = video
+            outputs["langgraph_video_platform_metadata"] = metadata
+            run.outputs_json = outputs
+            run.current_stage = payload["stage"] or run.current_stage
+            run.status = payload["status"] or run.status
+            run.last_applied_event_sequence = record.sequence
+            return
         if record.event_type in _SOCIAL_EVENT_TYPES:
             social_payload = dict(payload.get("social") or {})
             refs = dict(payload.get("references") or {})
@@ -2246,6 +2769,48 @@ def _public_social(value: Any) -> dict[str, Any]:
             result[key] = reference
     if isinstance(source.get("card_count"), int) and 0 <= source["card_count"] <= 100:
         result["card_count"] = source["card_count"]
+    return result
+
+
+def _public_video(value: Any) -> dict[str, Any]:
+    source = dict(value or {}) if isinstance(value, dict) else {}
+    result: dict[str, Any] = {}
+    for key in ("video_project_ref", "source_video_project_ref", "storyboard_ref"):
+        if reference := _public_ref(source.get(key)):
+            result[key] = reference
+    for key in ("scene_count",):
+        if isinstance(source.get(key), int) and 0 <= source[key] <= 32:
+            result[key] = source[key]
+    for key in ("status", "execution_mode"):
+        if item := _public_id(source.get(key)):
+            result[key] = item
+    quality = source.get("quality")
+    if isinstance(quality, dict):
+        safe = {key: quality[key] for key in ("verdict", "quality_stage", "evaluator_version") if _public_id(quality.get(key))}
+        if isinstance(quality.get("reason_codes"), list):
+            safe["reason_codes"] = [item for item in quality["reason_codes"][:10] if _PUBLIC_CODE.fullmatch(str(item))]
+        if safe:
+            result["quality"] = safe
+    generation = source.get("generation")
+    if isinstance(generation, dict):
+        safe_generation: dict[str, Any] = {}
+        for key in ("status", "generation_contract_version"):
+            if item := _public_id(generation.get(key)):
+                safe_generation[key] = item
+        for key in ("scene_count", "completed_count", "pending_count", "failed_count"):
+            if isinstance(generation.get(key), int) and 0 <= generation[key] <= 32:
+                safe_generation[key] = generation[key]
+        safe_jobs = []
+        for row in list(generation.get("jobs") or [])[:32]:
+            if not isinstance(row, dict):
+                continue
+            item = {key: row[key] for key in ("scene_id", "status", "output_asset_id", "generation_attempt") if row.get(key) is not None}
+            if item:
+                safe_jobs.append(item)
+        if safe_jobs:
+            safe_generation["jobs"] = safe_jobs
+        if safe_generation:
+            result["generation"] = safe_generation
     return result
 
 
@@ -2732,6 +3297,14 @@ def _browser_checkpoint_values(
         "canvas": _public_canvas(snapshot_values.get("canvas")),
         "edit": _public_edit(snapshot_values.get("edit")),
     }
+    video_source = dict(snapshot_values.get("video") or {}) if isinstance(snapshot_values.get("video"), dict) else dict((run.outputs_json or {}).get("langgraph_video") or {})
+    if isinstance(snapshot_values.get("quality"), dict):
+        video_source["quality"] = snapshot_values["quality"]
+    elif isinstance((run.outputs_json or {}).get("langgraph_quality"), dict):
+        video_source["quality"] = (run.outputs_json or {}).get("langgraph_quality")
+    video = _public_video(video_source)
+    if video or getattr(run, "mode", "") == "lg16_video_project":
+        values["video"] = video
     social = _public_social(
         snapshot_values.get("social")
         or (run.outputs_json or {}).get("langgraph_social")
@@ -2752,7 +3325,7 @@ class AgentRunGraphProjector:
         event = events[-1]
         stage = str(event.get("stage") or "")
         status = str(event.get("status") or "")
-        if not stage or status not in {"running", "completed", "failed"}:
+        if not stage or status not in {"running", "completed", "awaiting_review", "failed"}:
             raise ValueError("LangGraph projection event has an invalid stage or status.")
 
         # Lock and refresh the projection before writing it. A cancel request
@@ -2775,10 +3348,14 @@ class AgentRunGraphProjector:
             workspace_id=projected_run.workspace_id,
             project_id=projected_run.project_id,
         )
+        stage_payload = (
+            {key: value for key, value in event_payload.items() if key not in {"video", "quality"}}
+            if event_type in _VIDEO_EVENT_TYPES else event_payload
+        )
         stage_lifecycle_events = AgentRunEventJournal.append_stage_lifecycle(
             projected_run,
             db,
-            payload=event_payload,
+            payload=stage_payload,
             stage=stage,
             node_status=str(event.get("node_status") or "completed"),
             status=status,
@@ -2844,6 +3421,15 @@ class AgentRunGraphProjector:
                 "langgraph_social": {
                     **((projected_run.outputs_json or {}).get("langgraph_social") or {}),
                     **social_delta,
+                },
+            }
+        video_delta = update.get("video")
+        if isinstance(video_delta, dict) and video_delta:
+            projected_run.outputs_json = {
+                **projected_run.outputs_json,
+                "langgraph_video": {
+                    **((projected_run.outputs_json or {}).get("langgraph_video") or {}),
+                    **video_delta,
                 },
             }
         render_delta = update.get("render")
@@ -3184,6 +3770,8 @@ class LangGraphRunService:
     @staticmethod
     def _compiled_graph(checkpointer: Any, *, run: AgentRun | None = None) -> Any:
         """Use the migrated graph for the explicit LangGraph rollout."""
+        if run is not None and run.mode == "lg16_video_project":
+            return build_lg16_video_compiled_graph(checkpointer=checkpointer)
         if run is not None and run.mode == "lg15_social_kit":
             return build_lg15_social_kit_compiled_graph(checkpointer=checkpointer)
         if run is not None and run.mode == "lg12i_intake":
@@ -3346,6 +3934,7 @@ class LangGraphRunService:
                         "commerce": dict((snapshot.values or {}).get("commerce") or {}),
                         "intake": dict((snapshot.values or {}).get("intake") or {}),
                         "social": dict((snapshot.values or {}).get("social") or {}),
+                        "video": dict((snapshot.values or {}).get("video") or {}),
                         "render": dict((snapshot.values or {}).get("render") or {}),
                         "generation": dict((snapshot.values or {}).get("generation") or {}),
                         "page_assembly": dict((snapshot.values or {}).get("page_assembly") or {}),
@@ -3617,6 +4206,18 @@ class LangGraphRunService:
             return cls._recover_running_lg11_projection(run, db)
         if run.mode == "lg12i_intake":
             return cls._recover_running_lg12i_projection(run, db)
+        if run.mode == "lg16_video_project" and run.graph_thread_id:
+            config = cls._config(cls._thread_id(run))
+            with open_postgres_checkpointer() as checkpointer:
+                graph = cls._compiled_graph(checkpointer, run=run)
+                snapshot = graph.get_state(config)
+                checkpoint_video = dict((snapshot.values or {}).get("video") or {})
+                projected_video = dict((run.outputs_json or {}).get("langgraph_video") or {})
+                checkpoint_quality = dict((snapshot.values or {}).get("quality") or {})
+                projected_quality = dict((run.outputs_json or {}).get("langgraph_quality") or {})
+                if (checkpoint_video and checkpoint_video != projected_video) or (checkpoint_quality and checkpoint_quality != projected_quality):
+                    return cls._rebuild_projection_from_history(run, db, graph, config)
+            return run
         if run.mode == "lg15_social_kit" and run.graph_thread_id:
             config = cls._config(cls._thread_id(run))
             with open_postgres_checkpointer() as checkpointer:
@@ -3677,7 +4278,7 @@ class LangGraphRunService:
         """
 
         return bool(run.graph_thread_id) and str(run.mode or "") in {
-            "mock", "real", "lg11_edit", "lg12i_intake", "lg15_social_kit",
+            "mock", "real", "lg11_edit", "lg12i_intake", "lg15_social_kit", "lg16_video_project",
         }
 
     @classmethod
@@ -3866,7 +4467,7 @@ class LangGraphRunService:
                 raise GraphRunResumeRequired("This graph run failed; resume the same thread instead of starting again.")
             raise ValueError("Could not acquire the graph execution lease.")
         run = cls._find_run(run_id, workspace_id, db)
-        if run.mode not in {"lg11_edit", "lg12i_intake"}:
+        if run.mode not in {"lg11_edit", "lg12i_intake", "lg16_video_project"}:
             profile = (
                 "production"
                 if str(settings.APP_ENV).lower() == "production"
@@ -3909,6 +4510,16 @@ class LangGraphRunService:
                 workspace_id=run.workspace_id,
                 project_id=run.project_id,
                 social_request=dict((run.input_snapshot or {}).get("social_request") or {}),
+            )
+        elif run.mode == "lg16_video_project":
+            request = dict((run.input_snapshot or {}).get("video_request") or {})
+            initial_state = build_lg16_video_graph_input(
+                run_id=run.id,
+                workspace_id=run.workspace_id,
+                project_id=run.project_id,
+                source_video_project_ref=dict(request.get("source_video_project_ref") or {}),
+                creative_intent=str(request.get("creative_intent") or "product_demo"),
+                request_hash=str((run.input_snapshot or {}).get("video_request_hash") or ""),
             )
         else:
             initial_state = build_lg1_graph_input(
@@ -4114,6 +4725,61 @@ class LangGraphRunService:
             outputs_json={"social_master": {"id": master.id, "version": master.version, "hash": master.canonical_hash}},
             cost_approval_status="not_required",
             created_by=actor_id,
+        )
+        db.add(run)
+        db.commit()
+        return cls.start(run.id, workspace_id, db)
+
+    @classmethod
+    def start_video_project(
+        cls,
+        *,
+        project_id: str,
+        workspace_id: str,
+        actor_id: str,
+        request: dict[str, Any],
+        db: Session,
+    ) -> AgentRun:
+        """Start or replay one deterministic LG-16 storyboard run."""
+        from src.services.prompt_intelligence_service import canonical_hash
+        from src.services.video_storyboard_service import plan_video_storyboard, validate_video_graph_request
+        from src.services.video_project_version_service import validate_video_project_version
+        from src.db.models import VideoProjectVersion
+
+        project = db.query(ProductProject).filter_by(id=project_id, workspace_id=workspace_id).with_for_update().one_or_none()
+        if project is None:
+            raise GraphRunNotFound("Product project was not found in this workspace.")
+        normalized = validate_video_graph_request(request)
+        source_ref = normalized["source_video_project_ref"]
+        source = db.query(VideoProjectVersion).filter_by(
+            id=source_ref["id"], workspace_id=workspace_id, project_id=project_id,
+        ).one_or_none()
+        if source is None or {"id": source.id, "version": source.version, "hash": source.canonical_hash} != source_ref:
+            raise GraphRunNotFound("VideoProject source reference is out of scope or stale.")
+        validate_video_project_version(db, source)
+        normalized["scenes"] = plan_video_storyboard(
+            db, source, normalized["scenes"], creative_intent=normalized["creative_intent"],
+        )["scenes"]
+        request_hash = canonical_hash(normalized)
+        candidates = db.query(AgentRun).filter(
+            AgentRun.workspace_id == workspace_id,
+            AgentRun.project_id == project_id,
+            AgentRun.created_by == actor_id,
+            AgentRun.mode == "lg16_video_project",
+        ).order_by(AgentRun.created_at.desc()).all()
+        for existing in candidates:
+            if dict(existing.input_snapshot or {}).get("video_request_hash") != request_hash:
+                continue
+            if existing.status == "created":
+                return cls.start(existing.id, workspace_id, db)
+            if existing.status == "failed":
+                return cls.resume(existing.id, workspace_id, db)
+            return existing
+        run = AgentRun(
+            id=str(uuid.uuid4()), workspace_id=workspace_id, project_id=project_id,
+            mode="lg16_video_project", status="created", current_stage="video_requested",
+            input_snapshot={"video_request": normalized, "video_request_hash": request_hash},
+            outputs_json={}, cost_approval_status="not_required", created_by=actor_id,
         )
         db.add(run)
         db.commit()
