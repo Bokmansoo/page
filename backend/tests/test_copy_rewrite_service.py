@@ -10,8 +10,8 @@ from src.services.copy_rewrite_service import CopyRewriteCommand, CopyRewriteSer
         ("reduce_exaggeration", False, True),
         ("usage_context", False, True),
         ("beginner_seller_tone", True, True),
-        ("reduce_purchase_anxiety", False, True),
-        ("custom_edit", False, True),
+        ("reduce_purchase_anxiety", True, True),
+        ("custom_edit", True, True),
     ],
 )
 def test_mock_rewrite_changes_expected_fields(command, changes_title, changes_body):

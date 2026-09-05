@@ -114,14 +114,12 @@ def test_list_page_versions_returns_real_saved_versions(client, db_session):
     assert versions[0]["created_at"]
 
 
-def test_add_page_section_inserts_section_with_next_sort_order(client, db_session):
+def test_add_page_section_rejects_append_after_final_specification(client, db_session):
     headers = {
         "X-Mock-User-Id": "user-1",
         "X-Mock-Workspace-Id": "workspace-1",
     }
     project_id, page_data = _create_project_with_page(client, db_session, headers)
-    existing_count = len(page_data["sections"])
-
     res = client.post(
         f"/api/v1/projects/{project_id}/page/sections",
         json={
@@ -133,8 +131,5 @@ def test_add_page_section_inserts_section_with_next_sort_order(client, db_sessio
         headers=headers,
     )
 
-    assert res.status_code == 201
-    data = res.json()
-    assert data["section_type"] == "faq"
-    assert data["sort_order"] == existing_count
-    assert data["is_visible"] is True
+    assert res.status_code == 422
+    assert "must be the last visible section" in res.json()["detail"]

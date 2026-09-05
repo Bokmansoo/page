@@ -50,16 +50,12 @@ export default function BrowserAssistedSourcePanel({
 
     try {
       setIsParsing(true);
-      const uid = localStorage.getItem("X-Mock-User-Id") || "00000000-0000-0000-0000-000000000001";
-      const wid = localStorage.getItem("X-Mock-Workspace-Id") || "00000000-0000-0000-0000-000000000002";
-
       const res = await fetch(`http://localhost:8001/api/v1/projects/${projectId}/facts/bulk/parse`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Mock-User-Id': uid,
-          'X-Mock-Workspace-Id': wid,
         },
+        credentials: 'include',
         body: JSON.stringify({
           text: pastedText,
           max_items: 50,
@@ -97,16 +93,12 @@ export default function BrowserAssistedSourcePanel({
 
     try {
       setIsSaving(true);
-      const uid = localStorage.getItem("X-Mock-User-Id") || "00000000-0000-0000-0000-000000000001";
-      const wid = localStorage.getItem("X-Mock-Workspace-Id") || "00000000-0000-0000-0000-000000000002";
-
       const res = await fetch(`http://localhost:8001/api/v1/projects/${projectId}/facts/bulk`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Mock-User-Id': uid,
-          'X-Mock-Workspace-Id': wid,
         },
+        credentials: 'include',
         body: JSON.stringify({
           items: candidates,
           default_status: 'unknown', // 브라우저 수집은 사용자 검수를 거쳐야 하므로 초기 'unknown'

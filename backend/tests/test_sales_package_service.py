@@ -68,7 +68,7 @@ def setup_sales_package_data(db_session: Session):
     # 5. Asset 생성
     asset = Asset(
         project_id=project.id,
-        source_type="sourced",
+        source_type="uploaded",
         filename="test_image.jpg",
         file_path="uploads/test_image.jpg",
         mime_type="image/jpeg",
@@ -162,6 +162,7 @@ def test_sales_package_filters_unapproved_generated_assets(db_session: Session):
         id="unapproved-ai-asset",
         project_id=project.id,
         source_type="ai_generated",
+        usage_status="reference_only",
         filename="unapproved.png",
         file_path="uploads/unapproved.png",
         mime_type="image/png",
@@ -226,9 +227,13 @@ def test_sales_package_allows_approved_generated_asset(db_session: Session):
 
 
 def test_marketplace_submit_requires_explicit_approval(client: TestClient, db_session: Session):
+    headers = {
+        "X-Mock-User-Id": "owner-1",
+        "X-Mock-Workspace-Id": "workspace-1",
+    }
     project = ProductProject(
         id="approval-required-project",
-        workspace_id="00000000-0000-0000-0000-000000000002",
+        workspace_id="workspace-1",
         brand_id="00000000-0000-0000-0000-000000000001",
         name="승인 필요 상품",
         category="Living",
@@ -257,17 +262,29 @@ def test_marketplace_submit_requires_explicit_approval(client: TestClient, db_se
     )
     db_session.commit()
 
-    prepare_res = client.post(f"/api/v1/projects/{project.id}/marketplace/packages")
+    prepare_res = client.post(
+        f"/api/v1/projects/{project.id}/marketplace/packages",
+        headers=headers,
+    )
     assert prepare_res.status_code == 200
     assert prepare_res.json()["status"] == "ready"
 
-    submit_before_approval = client.post(f"/api/v1/projects/{project.id}/marketplaces/submit")
+    submit_before_approval = client.post(
+        f"/api/v1/projects/{project.id}/marketplaces/submit",
+        headers=headers,
+    )
     assert submit_before_approval.status_code == 409
     assert submit_before_approval.json()["detail"] == "Marketplace package must be approved before submit."
 
-    approve_res = client.post(f"/api/v1/projects/{project.id}/marketplace/packages/approve")
+    approve_res = client.post(
+        f"/api/v1/projects/{project.id}/marketplace/packages/approve",
+        headers=headers,
+    )
     assert approve_res.status_code == 200
 
-    submit_after_approval = client.post(f"/api/v1/projects/{project.id}/marketplaces/submit")
+    submit_after_approval = client.post(
+        f"/api/v1/projects/{project.id}/marketplaces/submit",
+        headers=headers,
+    )
     assert submit_after_approval.status_code == 200
     assert submit_after_approval.json()["status"] == "submitted"

@@ -33,7 +33,8 @@ def test_image_generation_returns_candidates_per_visual_slot():
     assert candidates["hero"][0].asset_id == "asset-1"
     assert candidates["hero"][0].is_recommended is True
     assert any(candidate.source_type == "url-extracted" for candidate in candidates["usage"])
-    assert any(candidate.source_type == "mock-generated" for candidate in candidates["usage"])
+    assert not any(candidate.source_type == "mock-generated" for candidate in candidates["usage"])
+    assert all(candidate.asset_id is not None for candidate in candidates["usage"])
 
 
 def test_page_assembly_uses_selected_image_candidate():
@@ -108,4 +109,62 @@ def test_page_assembly_does_not_repeat_uploaded_source_when_generation_failed():
 
     assert hero["visual_slot"]["status"] == "generation_failed"
     assert hero["visual_slot"]["asset_id"] is None
+    assert hero["image_asset_id"] is None
+
+
+def test_page_assembly_never_auto_assigns_low_resolution_candidate_to_hero():
+    state = AgentRunState(
+        project_id="project-1",
+        outputs={
+            "page_planning": {"sections": [{"section_id": "hero", "role": "hero"}]},
+            "copywriting": {"sections": {"hero": {"title": "저화질 HERO"}}},
+            "image_generation": {
+                "candidates": {
+                    "hero": [
+                        {
+                            "candidate_id": "candidate-hero-low-resolution",
+                            "asset_id": "asset-low-resolution",
+                            "source_type": "uploaded",
+                            "quality_warnings": ["LOW_RESOLUTION"],
+                            "is_recommended": False,
+                        }
+                    ]
+                }
+            },
+        },
+    )
+
+    result = PageAssemblyAgent().run(state)
+    hero = result.outputs["page_assembly"]["sections"][0]
+
+    assert hero["visual_slot"]["status"] == "quality_review_required"
+    assert hero["image_asset_id"] is None
+
+
+def test_page_assembly_never_auto_assigns_safe_crop_review_candidate_to_hero():
+    state = AgentRunState(
+        project_id="project-1",
+        outputs={
+            "page_planning": {"sections": [{"section_id": "hero", "role": "hero"}]},
+            "copywriting": {"sections": {"hero": {"title": "소재 확대컷 HERO 방지"}}},
+            "image_generation": {
+                "candidates": {
+                    "hero": [
+                        {
+                            "candidate_id": "candidate-hero-safe-crop-review",
+                            "asset_id": "asset-safe-crop-review",
+                            "source_type": "uploaded",
+                            "quality_warnings": ["SAFE_CROP_REVIEW_REQUIRED"],
+                            "is_recommended": False,
+                        }
+                    ]
+                }
+            },
+        },
+    )
+
+    result = PageAssemblyAgent().run(state)
+    hero = result.outputs["page_assembly"]["sections"][0]
+
+    assert hero["visual_slot"]["status"] == "quality_review_required"
     assert hero["image_asset_id"] is None

@@ -1,9 +1,70 @@
 try:
-    from src.services.export_service import build_export_manifest, build_export_render_path, normalize_sections_snapshot, run_export, load_export_font
+    from src.services.export_service import (
+        PlaywrightChromiumUnavailableError,
+        build_export_manifest,
+        build_export_render_path,
+        capture_next_render_export,
+        ensure_playwright_chromium_available,
+        normalize_sections_snapshot,
+        run_export,
+        load_export_font,
+    )
 except ImportError:
-    from backend.src.services.export_service import build_export_manifest, build_export_render_path, normalize_sections_snapshot, run_export, load_export_font
+    from backend.src.services.export_service import (
+        PlaywrightChromiumUnavailableError,
+        build_export_manifest,
+        build_export_render_path,
+        capture_next_render_export,
+        ensure_playwright_chromium_available,
+        normalize_sections_snapshot,
+        run_export,
+        load_export_font,
+    )
+
+import pytest
 
 from src.db.models import Brand, ProductProject, User, Workspace
+
+
+class _MissingChromium:
+    executable_path = r"C:\missing-playwright\chrome-headless-shell.exe"
+
+
+class _MissingChromiumPlaywright:
+    chromium = _MissingChromium()
+
+
+def test_playwright_preflight_reports_missing_chromium_with_install_command():
+    with pytest.raises(PlaywrightChromiumUnavailableError) as exc_info:
+        ensure_playwright_chromium_available(_MissingChromiumPlaywright())
+
+    assert "Chromium이 설치되지 않았습니다" in str(exc_info.value)
+    assert "uv run playwright install chromium" in str(exc_info.value)
+
+
+class _LaunchFailureChromium:
+    def launch(self, **_kwargs):
+        raise RuntimeError(
+            "BrowserType.launch: Executable doesn't exist. "
+            "Please run the following command: playwright install"
+        )
+
+
+class _LaunchFailurePlaywright:
+    chromium = _LaunchFailureChromium()
+
+
+def test_capture_wraps_playwright_launch_error_with_actionable_message(tmp_path):
+    with pytest.raises(PlaywrightChromiumUnavailableError) as exc_info:
+        capture_next_render_export(
+            project_id="project-missing-browser",
+            version_id="version-1",
+            output_dir=str(tmp_path),
+            playwright=_LaunchFailurePlaywright(),
+        )
+
+    assert "uv run playwright install chromium" in str(exc_info.value)
+    assert not list(tmp_path.iterdir())
 
 
 def test_build_export_manifest_for_long_image_and_section_zip():

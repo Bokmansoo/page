@@ -29,7 +29,13 @@ def test_runtime_schema_compatibility_adds_style_candidate_columns(monkeypatch):
     fake_engine = _FakeEngine()
 
     fake_inspector = SimpleNamespace(
-        get_table_names=lambda: ["product_projects", "agent_runs", "agent_run_steps"],
+        get_table_names=lambda: [
+            "product_projects",
+            "agent_runs",
+            "agent_run_steps",
+            "scene_prompt_versions",
+            "generation_jobs",
+        ],
         get_columns=lambda table_name: [
             {"name": "id"},
             {"name": "selected_style"},

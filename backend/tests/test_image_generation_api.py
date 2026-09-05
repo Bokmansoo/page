@@ -138,8 +138,9 @@ def test_api_workspace_scoping(client, api_test_data):
     assert res.status_code == 404
 
 
-@patch("src.services.image_generation_service.OpenAIImageProvider")
-def test_api_generate_approve_reject_flow(mock_provider_class, client, api_test_data, db_session):
+@patch("src.services.image_generation_service.get_image_generation_adapter")
+@patch("src.services.image_generation_service.ProductIdentityValidator.validate_identity_preservation", return_value=[])
+def test_api_generate_approve_reject_flow(_mock_identity_check, mock_provider_class, client, api_test_data, db_session):
     project = api_test_data["project1"]
     sec = api_test_data["sec1"]
 

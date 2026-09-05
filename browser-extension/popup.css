@@ -1,0 +1,19 @@
+body { width: 360px; margin: 0; font: 13px/1.45 system-ui, sans-serif; color: #172033; }
+main { padding: 14px; }
+h1 { margin: 0 0 8px; font-size: 18px; }
+.policy { padding: 8px; border-radius: 8px; background: #eefbf5; color: #126b4b; }
+label { display: block; margin: 10px 0; font-weight: 600; }
+input, textarea, select { box-sizing: border-box; display: block; width: 100%; margin-top: 4px; padding: 7px; border: 1px solid #cbd5e1; border-radius: 6px; font: inherit; }
+textarea { min-height: 86px; resize: vertical; }
+button { margin: 5px 0; padding: 8px 10px; border: 0; border-radius: 7px; background: #079669; color: white; font-weight: 700; cursor: pointer; }
+button[disabled] { opacity: .5; cursor: not-allowed; }
+.hint { color: #64748b; }
+#imageChoices { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; max-height: 190px; overflow: auto; }
+.image-choice { border: 1px solid #dbe2ea; border-radius: 6px; padding: 3px; overflow: hidden; }
+.image-choice img { display: block; width: 100%; height: 72px; object-fit: cover; }
+.image-choice input { width: auto; margin: 5px auto; }
+#documentChoices { max-height: 130px; overflow: auto; border: 1px solid #e2e8f0; border-radius: 6px; padding: 4px; }
+.document-choice { display: flex; align-items: flex-start; gap: 6px; margin: 4px 0; font-weight: 400; }
+.document-choice input { width: auto; margin: 3px 0 0; }
+#status { min-height: 18px; color: #9f1239; }
+#status.ok { color: #047857; }

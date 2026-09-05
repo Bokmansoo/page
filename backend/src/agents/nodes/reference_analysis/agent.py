@@ -1,5 +1,6 @@
 from src.agents.nodes.base import AgentNode
 from src.agents.state import AgentRunState
+from typing import Any
 
 class ReferenceAnalysisAgent(AgentNode):
     name = "reference_analysis"
@@ -25,3 +26,10 @@ class ReferenceAnalysisAgent(AgentNode):
                 "recommended_rewrite_direction": "참고 페이지의 흐름만 활용하고 문구와 섹션명은 새로 작성합니다.",
             }
         return state
+
+    def run_delta(self, *, run_id: str, source_collection: dict[str, Any]) -> dict[str, Any]:
+        """LG-2 adapter that returns structural guidance, never copied text."""
+
+        from src.services.langgraph_discovery_service import run_reference_analysis
+
+        return run_reference_analysis(run_id=run_id, source_state=source_collection)

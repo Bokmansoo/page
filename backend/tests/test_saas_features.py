@@ -13,7 +13,7 @@ def test_brand_management(client):
     assert res.status_code == 200
     brands = res.json()
     assert len(brands) == 1
-    assert brands[0]["name"] == "Default Brand"
+    assert brands[0]["name"] == "기본 브랜드"
 
     # 2. Create brand
     payload = {

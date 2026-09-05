@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import patch
 
-from src.db.models import AgentRun, AgentRunStep
+from src.db.models import AgentRun, AgentRunStep, ProductFact
 from src.services.url_evidence_collector import URLEvidence
 
 
@@ -53,6 +53,30 @@ def test_create_agent_run_preserves_confirmed_structured_intake(
     assert run.input_snapshot["desired_mood"] == ["안전한", "감성적인"]
 
 
+def test_create_agent_run_persists_direct_numeric_specs_as_confirmed_facts(
+    client,
+    auth_headers,
+    db_session,
+):
+    response = client.post(
+        "/api/agent-runs",
+        headers=auth_headers,
+        json={
+            "product_name": "미니 마사지건",
+            "description": "260g, 10분, 800mAh",
+        },
+    )
+
+    assert response.status_code == 201
+    facts = (
+        db_session.query(ProductFact)
+        .filter(ProductFact.project_id == response.json()["project_id"])
+        .all()
+    )
+    assert [fact.source_text for fact in facts] == ["260g", "10분", "800mAh"]
+    assert all(fact.verification_status == "seller_confirmed" for fact in facts)
+
+
 def test_create_agent_run_collects_product_and_reference_url_evidence(
     client,
     auth_headers,
@@ -98,6 +122,26 @@ def test_run_mock_generation_returns_page_assembly(client, auth_headers):
     data = response.json()
     assert data["current_stage"] == "review_editor"
     assert data["outputs"]["page_assembly"]["sections"]
+
+
+def test_legacy_generation_writers_are_closed_when_langgraph_is_authoritative(
+    client, auth_headers, monkeypatch
+):
+    from src.config import settings
+
+    created = client.post(
+        "/api/agent-runs",
+        headers=auth_headers,
+        json={"product_name": "legacy writer probe"},
+    ).json()
+    monkeypatch.setattr(settings, "SELLFORM_GRAPH_RUNTIME", "langgraph")
+
+    mock_response = client.post(f"/api/agent-runs/{created['id']}/run-mock", headers=auth_headers)
+    real_response = client.post(f"/api/agent-runs/{created['id']}/run", headers=auth_headers)
+
+    assert mock_response.status_code == 410
+    assert real_response.status_code == 410
+    assert mock_response.json()["detail"]["code"] == "legacy_generation_writer_disabled"
 
 
 def test_run_mock_rejects_other_workspace_agent_run(client, auth_headers):

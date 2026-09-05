@@ -1,5 +1,5 @@
 from typing import List, Optional, Dict, Any, Protocol, Literal
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ImageGenerationRequest(BaseModel):
@@ -36,10 +36,34 @@ class ImageGenerationResult(BaseModel):
     model: str
     revised_prompt: Optional[str] = None
     usage_metadata: Dict[str, Any] = Field(default_factory=dict)
+    # A provider may return the small set of explicitly observed product
+    # identity labels that its generation/review contract produced.  This is
+    # evidence only: callers still compare it with frozen Truth and seller
+    # confirmation during QA; it never promotes a commercial fact.
+    observed_identity: Dict[str, str] = Field(default_factory=dict)
     
     # Sprint 52 / 56 fields
     status: str = "success"
     assets: List[str] = Field(default_factory=list)
+
+    @field_validator("observed_identity")
+    @classmethod
+    def _bounded_observed_identity(cls, value: Dict[str, str]) -> Dict[str, str]:
+        allowed = {
+            "product_identity", "product_name", "model", "model_name", "sku",
+            "variant", "product_variant", "color", "colour", "finish", "material",
+            "material_grade", "component", "components", "component_count",
+        }
+        if len(value) > len(allowed):
+            raise ValueError("observed_identity contains too many fields")
+        normalized: Dict[str, str] = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key or "").strip().lower()
+            text = str(raw_value or "").strip()
+            if key not in allowed or not text or len(text) > 160:
+                raise ValueError("observed_identity contains an invalid field")
+            normalized[key] = text
+        return dict(sorted(normalized.items()))
 
 
 
@@ -59,10 +83,16 @@ class MockImageGenerationProvider:
                 status="blocked_cost_approval"
             )
             
-        # Draw a simple 512x512 dummy image using PIL
+        # Draw a deterministic image at the requested bounded canvas.
         from PIL import Image, ImageDraw
         import io
-        img = Image.new("RGB", (512, 512), color="red")
+        try:
+            width, height = (int(part) for part in request.size.lower().split("x", 1))
+            if width <= 0 or height <= 0 or width > 4096 or height > 4096:
+                raise ValueError
+        except (TypeError, ValueError):
+            width, height = 512, 512
+        img = Image.new("RGB", (width, height), color="red")
         draw = ImageDraw.Draw(img)
         draw.rectangle([10, 10, 100, 100], fill="blue")
         buf = io.BytesIO()
@@ -101,7 +131,13 @@ class ImageGenerationProviderRouter:
             # Return dummy mock placeholder image
             from PIL import Image, ImageDraw
             import io
-            img = Image.new("RGB", (512, 512), color="red")
+            try:
+                width, height = (int(part) for part in request.size.lower().split("x", 1))
+                if width <= 0 or height <= 0 or width > 4096 or height > 4096:
+                    raise ValueError
+            except (TypeError, ValueError):
+                width, height = 512, 512
+            img = Image.new("RGB", (width, height), color="red")
             draw = ImageDraw.Draw(img)
             draw.rectangle([10, 10, 100, 100], fill="blue")
             buf = io.BytesIO()

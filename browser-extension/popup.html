@@ -1,0 +1,9 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width" /><title>Sellform 상품 수집</title><link rel="stylesheet" href="popup.css" /></head><body><main>
+<h1>Sellform 상품 수집</h1><p class="policy">현재 탭에서 직접 선택한 공개 상품 정보만 참고용으로 전송합니다. 쿠키·로그인·주문·회원 정보는 수집하지 않습니다.</p>
+<label>Sellform API 주소 <input id="apiBase" value="http://127.0.0.1:8001/api/v1" /></label>
+<section id="connectPanel"><label>연결 코드 <input id="connectionCode" placeholder="SFC-ABCDE-12345" /></label><button id="connect">연결</button></section>
+<section id="capturePanel" hidden><p id="connectionState"></p><button id="chooseDom" type="button">페이지에서 DOM 영역 선택</button><button id="capture">현재 탭 상품 정보 미리보기</button><label>대상 상세페이지 <select id="projectSelect"><option value="">프로젝트를 불러오는 중...</option></select></label>
+<label>선택한 문구/스펙 <textarea id="selectedText" placeholder="페이지에서 텍스트를 드래그한 뒤 미리보기를 누르거나, 필요한 내용만 직접 입력하세요."></textarea></label>
+<p class="hint">페이지 제목·사양도 아래에서 항목별로 체크하세요. 체크하지 않은 항목은 전송하지 않습니다.</p><div id="documentChoices"></div>
+<p class="hint">이미지는 체크한 항목만 실제 파일로 검증·저장합니다. 사이트가 이미지를 막으면 스크린샷을 포함할 수 있습니다.</p><div id="imageChoices"></div><button id="takeScreenshot" type="button">현재 보이는 화면 스크린샷 포함</button><button id="send" disabled>검토한 자료를 프로젝트로 전송</button></section>
+<p id="status" role="status"></p></main><script src="popup.js"></script></body></html>

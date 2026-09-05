@@ -31,6 +31,21 @@ def test_scene_plan_keeps_spec_table_as_html_graphic():
     assert spec["identity_risk"] == "low"
 
 
+def test_scene_plan_uses_second_real_photo_for_product_introduction():
+    plan = build_scene_plan(
+        product_name="아이 LED 자전거",
+        asset_ids=["asset-main", "asset-detail"],
+        confirmed_facts=[],
+        desired_mood=[],
+    )
+
+    introduction = next(section for section in plan["sections"] if section["target_slot_id"] == "comparison")
+    assert introduction["section_id"] == "product_introduction"
+    assert introduction["visual_strategy"] == "cutout_composite"
+    assert introduction["source_asset_ids"] == ["asset-detail"]
+    assert introduction["image_prompt"]
+
+
 def test_visual_planning_turns_scene_plan_into_generation_jobs():
     from src.agents.nodes.visual_planning.agent import VisualPlanningAgent
     from src.agents.state import AgentRunState, ProductInput

@@ -20,7 +20,7 @@
 - Create: `backend/tests/test_visual_contract_backfill.py`
 - Create: `backend/tests/test_page_readiness_service.py`
 - Create: `frontend/e2e/upload-ready-golden-path.spec.ts`
-- Modify: `docs/runbooks/2026-07-03-sellform-server-start-and-llm-mode-guide.md`
+- Modify: `docs/runbooks/실행가이드.md`
 
 ### Task 1: 기존 프로젝트 idempotent backfill
 
@@ -309,7 +309,7 @@ git commit -m "fix: unify visual planning status"
 
 **Files:**
 - Create: `frontend/e2e/upload-ready-golden-path.spec.ts`
-- Modify: `docs/runbooks/2026-07-03-sellform-server-start-and-llm-mode-guide.md`
+- Modify: `docs/runbooks/실행가이드.md`
 
 - [ ] **Step 1: Golden path E2E 작성**
 
@@ -359,7 +359,7 @@ frontend/backend port와 `NEXT_PUBLIC_API_BASE_URL`을 문서의 단일 표로 �
 - [ ] **Step 4: Commit**
 
 ```powershell
-git add frontend/e2e/upload-ready-golden-path.spec.ts docs/runbooks/2026-07-03-sellform-server-start-and-llm-mode-guide.md
+git add frontend/e2e/upload-ready-golden-path.spec.ts docs/runbooks/실행가이드.md
 git commit -m "test: cover upload ready detail page golden path"
 ```
 

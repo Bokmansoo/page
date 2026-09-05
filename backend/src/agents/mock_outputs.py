@@ -1,306 +1,239 @@
-from urllib.parse import quote
+"""Deterministic, safe outputs used by the local Mock generation pipeline."""
+
+from __future__ import annotations
+
+import re
 
 
-def _mock_placeholder_url(role: str, product_name: str) -> str:
-    title = (product_name or "Sellform product")[:48]
-    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="960" height="640" viewBox="0 0 960 640">
-  <rect width="960" height="640" fill="#F4FAF6"/>
-  <rect x="96" y="80" width="768" height="480" rx="36" fill="#FFFFFF" stroke="#B8DEC6" stroke-width="4"/>
-  <circle cx="480" cy="260" r="96" fill="#DDF2E5"/>
-  <rect x="280" y="392" width="400" height="24" rx="12" fill="#A8D8B8"/>
-  <rect x="340" y="440" width="280" height="18" rx="9" fill="#D7EDE0"/>
-  <text x="480" y="528" text-anchor="middle" font-family="Arial, sans-serif" font-size="28" font-weight="700" fill="#2F6B4F">{role}</text>
-  <text x="480" y="570" text-anchor="middle" font-family="Arial, sans-serif" font-size="22" fill="#5B6B63">{title}</text>
-</svg>"""
-    return "data:image/svg+xml;charset=utf-8," + quote(svg)
+FINAL_OUTPUT_SOURCE_TYPES = {"uploaded", "self_shot"}
+
+# A local Mock run does not have the database inspection record available in
+# every code path.  Keep this small, conservative screen here as a first line
+# of defence; the persisted page materializer performs the full inspection
+# again using AssetInspectionRecord before a page is saved.
+FOREIGN_TEXT_PATTERN = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\u0400-\u04ff]")
+PHONE_PATTERN = re.compile(r"(?<!\d)(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{2,4}\)?[-.\s]?)\d{3,4}[-.\s]?\d{4}(?!\d)")
+PRICE_PATTERN = re.compile(r"(?:[$¥€₩]\s?\d[\d,]*(?:\.\d+)?|\d[\d,]*(?:원|위안|元|rmb|usd|krw))", re.IGNORECASE)
+QR_PATTERN = re.compile(r"(?:\bqr\b|qrcode|二维码)", re.IGNORECASE)
+MARKET_PATTERN = re.compile(r"(?:1688|taobao|淘宝|tmall|拼多多|aliexpress|amazon|coupang|쿠팡|smartstore|스마트스토어)", re.IGNORECASE)
+SUPPLIER_PATTERN = re.compile(r"(?:factory|supplier|manufacturer|공장|도매|제조사|厂家|工厂|供应商)", re.IGNORECASE)
 
 
 def build_mock_product_understanding(product_name: str, description: str = "") -> dict:
-    desc = description or "뛰어난 편의성과 디자인을 자랑하는 제품"
     return {
-        "product_type": product_name,
-        "target_customer": f"{product_name} 구매를 고려하는 스마트한 소비자",
-        "verified_facts": [
-            f"공식 정품 {product_name}",
-            f"{desc}",
-            "안전 규격 준수 및 철저한 품질 관리"
-        ],
-        "assumptions": ["사용자 편의성과 실용성을 중시하는 고객 군"],
-        "verification_required": ["추가 색상 및 크기 옵션 정보 확인 필요"],
-        "forbidden_claims": ["비교 불가능한 최고의 품질", "절대 고장 나지 않는 내구성"],
+        "product_type": product_name or "상품",
+        "target_customer": "상품 정보를 확인하고 구매를 검토하는 고객",
+        "verified_facts": [item for item in [product_name, description] if item],
+        "assumptions": [],
+        "verification_required": ["모델·규격·구성품은 판매자 입력 정보를 확인합니다."],
+        "forbidden_claims": ["인증", "안전성", "치료·효능", "보증", "A/S"],
     }
 
 
 def build_mock_sales_strategy(product_name: str, description: str = "") -> dict:
     return {
-        "hook_headline": f"더욱 새로워진 일상의 변화, {product_name}와 함께 시작하세요!",
-        "selling_points": [
-            f"{product_name}의 혁신적 설계",
-            f"실용적인 성능과 {description or '뛰어난 사용 편의성'}",
-            "철저한 사후 보장 혜택 제공"
-        ],
-        "tone_and_manner": "신뢰할 수 있고, 모던하며, 직관적인 마케팅 톤",
+        "hook_headline": f"{product_name or '상품'} 정보를 한눈에 확인하세요",
+        "selling_points": ["판매자 입력 정보 중심", "구매 전 사양 확인", "과장 표현 제외"],
+        "tone_and_manner": "차분하고 명확한 정보형",
     }
 
 
 def build_mock_page_plan(product_name: str) -> dict:
     return {
-        "layout_concept": "세련되고 신뢰감을 주는 모던한 레이아웃",
+        "layout_concept": "쿠팡형 세로 정보 페이지",
         "sections": [
-            {"id": "sec-1", "name": "인트로 헤로"},
-            {"id": "sec-2", "name": "기존 제품 대비 개선점"},
-            {"id": "sec-3", "name": "핵심 특장점 1"},
-            {"id": "sec-4", "name": "핵심 특장점 2"},
-            {"id": "sec-5", "name": "구매 보장 & 안내"},
+            {"id": "hero", "name": "대표 상품 소개"},
+            {"id": "pain_point", "name": "구매 전 확인 포인트"},
+            {"id": "feature_1", "name": "확인된 핵심 정보 1"},
+            {"id": "feature_2", "name": "확인된 핵심 정보 2"},
+            {"id": "feature_3", "name": "확인된 핵심 정보 3"},
+            {"id": "usage_guide", "name": "사용 방법 또는 충전 안내"},
+            {"id": "details_components", "name": "제품 디테일과 구성품"},
+            {"id": "product_information", "name": "제품 사양·주의사항·필수 고지"},
         ],
     }
 
 
-def build_mock_copy_set(product_name: str, description: str = "") -> dict:
-    desc = description or "일상에 새로운 가치를 더하는 혁신적인 제품"
-    return {
-        "hero_title": f"공간의 가치를 더하는 {product_name}",
-        "hero_subtitle": f"{desc}으로 한 차원 높은 경험을 시작해 보세요",
-        "painpoint_title": "아직도 번거로운 방식을 고집하시나요?",
-        "painpoint_body": "불편함을 해소하고 일상을 더 스마트하고 효율적으로 바꿀 수 있습니다.",
-        "feature_1_title": "기능과 디자인을 모두 잡은 최적화 설계",
-        "feature_1_body": "세련된 외관과 실용적인 구조로 설계되어 사용 시 최상의 만족도를 제공합니다.",
-        "feature_2_title": "안전 검증 및 신뢰 마크 획득 완료",
-        "feature_2_body": "공식 검증 기관을 통해 입증된 높은 안전 기준을 바탕으로 완벽히 통과했습니다.",
-        "guarantee_title": "공식 정품 안심 보장 서비스",
-        "guarantee_body": "제조사 정품 인증을 마친 제품으로, 구매 후에도 철저한 사후 관리를 보장합니다.",
-        "cta_text": "지금 특별 혜택가로 만나보기",
-    }
+def build_mock_copy_set(product_name: str, description: str = "", **context) -> dict:
+    from src.services.rule_based_copy_service import build_rule_based_copy
+
+    return build_rule_based_copy(product_name, description=description, **context)
 
 
 def build_mock_visual_plan(product_name: str) -> dict:
     return {
-        "hero_image_prompt": f"A beautiful editorial product photography of {product_name} in a modern clean interior, studio lighting",
-        "detail_image_prompt": f"Close up details of {product_name}, clean minimalist view, macro shot",
+        "hero_image_prompt": f"Seller-owned product photo of {product_name}",
+        "detail_image_prompt": f"Seller-owned detail photo of {product_name}",
         "color_palette": ["#10B981", "#14B8A6", "#FFFFFF", "#F3F4F6"],
     }
 
 
-def build_mock_generated_assets(
-    product_name: str,
-    uploaded_assets: list = None,
-    product_url: str = None
-) -> dict:
-    if uploaded_assets is None:
-        uploaded_assets = []
+def build_mock_generated_assets(product_name: str, uploaded_assets: list | None = None, product_url: str | None = None) -> dict:
+    return {"images": list(uploaded_assets or [])}
 
-    images = []
 
-    # 1. Map uploaded assets first
-    for idx, asset in enumerate(uploaded_assets):
-        images.append({
-            "id": asset["id"],
-            "role": f"uploaded_asset_{idx}",
-            "url": asset["url"],
-            "source_type": "uploaded",
-            "label": asset["filename"]
-        })
+def _automatic_placement_risk_codes(asset: dict) -> list[str]:
+    text = " ".join(
+        str(asset.get(key) or "")
+        for key in ("filename", "ocr_text", "caption", "alt_text", "description")
+    )
+    return [
+        code
+        for code, pattern in (
+            ("foreign_text_exposed", FOREIGN_TEXT_PATTERN),
+            ("phone_number_exposed", PHONE_PATTERN),
+            ("price_exposed", PRICE_PATTERN),
+            ("qr_code_review", QR_PATTERN),
+            ("market_or_competitor_text", MARKET_PATTERN),
+            ("supplier_text_exposed", SUPPLIER_PATTERN),
+        )
+        if pattern.search(text)
+    ]
 
-    # 2. Add URL extracted asset if product_url exists
-    if product_url:
-        images.append({
-            "id": "mock-url-extracted-image",
-            "role": "extracted",
-            "url": _mock_placeholder_url("url-extracted", product_name),
-            "source_type": "url-extracted",
-            "label": "url-extracted-image.png"
-        })
 
-    # 3. Add default mock generated assets
-    images.append({
-        "id": "mock-hero-visual",
-        "role": "hero",
-        "url": _mock_placeholder_url("hero", product_name),
-        "source_type": "mock-generated",
-        "label": "hero-placeholder.png"
-    })
-    images.append({
-        "id": "mock-detail-1-visual",
-        "role": "detail_1",
-        "url": _mock_placeholder_url("detail_1", product_name),
-        "source_type": "mock-generated",
-        "label": "detail-1-placeholder.png"
-    })
-    images.append({
-        "id": "mock-detail-2-visual",
-        "role": "detail_2",
-        "url": _mock_placeholder_url("detail_2", product_name),
-        "source_type": "mock-generated",
-        "label": "detail-2-placeholder.png"
-    })
-    images.append({
-        "id": "mock-guarantee-visual",
-        "role": "guarantee",
-        "url": _mock_placeholder_url("guarantee", product_name),
-        "source_type": "mock-generated",
-        "label": "guarantee-placeholder.png"
-    })
+def _allowed_asset(asset: dict) -> bool:
+    return (
+        (asset.get("source_type") or "").lower() in FINAL_OUTPUT_SOURCE_TYPES
+        and (asset.get("usage_status") or "seller_owned").lower() == "seller_owned"
+        and not _automatic_placement_risk_codes(asset)
+    )
 
-    return {"images": images}
+
+def _automatic_candidate(asset: dict) -> bool:
+    return (
+        (asset.get("source_type") or "").lower() in FINAL_OUTPUT_SOURCE_TYPES
+        and (asset.get("usage_status") or "seller_owned").lower() == "seller_owned"
+        and str(asset.get("mime_type") or "image/jpeg").startswith("image/")
+        and asset.get("quality_status") != "rejected"
+    )
+
+
+def _duplicate_candidate_ids(assets: list[dict]) -> set[str]:
+    """Return only copies discarded by the one-original automatic policy."""
+    seen_groups: set[str] = set()
+    duplicates: set[str] = set()
+    for asset in assets:
+        content_hash = str(asset.get("content_hash") or "")
+        asset_id = str(asset.get("id") or "")
+        if not content_hash or not asset_id:
+            continue
+        if content_hash in seen_groups:
+            duplicates.add(asset_id)
+        else:
+            seen_groups.add(content_hash)
+    return duplicates
+
+
+def _visual_slot(asset: dict | None, role: str) -> tuple[str | None, dict]:
+    if asset is None:
+        return None, {
+            "source_type": "html-graphic",
+            "asset_id": None,
+            "label": "HTML 정보 섹션",
+            "role": role,
+        }
+    return asset["id"], {
+        "source_type": asset.get("source_type") or "uploaded",
+        "asset_id": asset["id"],
+        "label": asset.get("filename") or "상품 사진",
+        "role": role,
+    }
 
 
 def build_mock_page_assembly(
     product_name: str,
-    uploaded_assets: list = None,
-    product_url: str = None,
-    copy_set: dict = None
+    uploaded_assets: list | None = None,
+    product_url: str | None = None,
+    copy_set: dict | None = None,
 ) -> dict:
-    if uploaded_assets is None:
-        uploaded_assets = []
-
-    if not copy_set:
-        copy_set = build_mock_copy_set(product_name)
-
-    # Determine visuals for each slot
-    # 1. Hero
-    if uploaded_assets:
-        hero_visual = {
-            "source_type": "uploaded",
-            "asset_id": uploaded_assets[0]["id"],
-            "label": uploaded_assets[0]["filename"]
-        }
-        hero_image_id = uploaded_assets[0]["id"]
-    elif product_url:
-        hero_visual = {
-            "source_type": "url-extracted",
-            "asset_id": "mock-url-extracted-image",
-            "label": "url-extracted-image.png"
-        }
-        hero_image_id = "mock-url-extracted-image"
-    else:
-        hero_visual = {
-            "source_type": "mock-generated",
-            "asset_id": "mock-hero-visual",
-            "label": "hero-placeholder.png"
-        }
-        hero_image_id = "mock-hero-visual"
-
-    # 2. Comparison
-    if len(uploaded_assets) > 1:
-        comp_visual = {
-            "source_type": "uploaded",
-            "asset_id": uploaded_assets[1]["id"],
-            "label": uploaded_assets[1]["filename"]
-        }
-        comp_image_id = uploaded_assets[1]["id"]
-    elif product_url:
-        comp_visual = {
-            "source_type": "url-extracted",
-            "asset_id": "mock-url-extracted-image",
-            "label": "url-extracted-image.png"
-        }
-        comp_image_id = "mock-url-extracted-image"
-    else:
-        comp_visual = {
-            "source_type": "mock-generated",
-            "asset_id": "mock-detail-1-visual",
-            "label": "detail-1-placeholder.png"
-        }
-        comp_image_id = "mock-detail-1-visual"
-
-    # 3. Detail_1
-    if len(uploaded_assets) > 2:
-        d1_visual = {
-            "source_type": "uploaded",
-            "asset_id": uploaded_assets[2]["id"],
-            "label": uploaded_assets[2]["filename"]
-        }
-        d1_image_id = uploaded_assets[2]["id"]
-    else:
-        d1_visual = {
-            "source_type": "mock-generated",
-            "asset_id": "mock-detail-1-visual",
-            "label": "detail-1-placeholder.png"
-        }
-        d1_image_id = "mock-detail-1-visual"
-
-    # 4. Detail_2
-    if len(uploaded_assets) > 3:
-        d2_visual = {
-            "source_type": "uploaded",
-            "asset_id": uploaded_assets[3]["id"],
-            "label": uploaded_assets[3]["filename"]
-        }
-        d2_image_id = uploaded_assets[3]["id"]
-    else:
-        d2_visual = {
-            "source_type": "mock-generated",
-            "asset_id": "mock-detail-2-visual",
-            "label": "detail-2-placeholder.png"
-        }
-        d2_image_id = "mock-detail-2-visual"
-
-    # 5. Guarantee
-    if len(uploaded_assets) > 4:
-        guar_visual = {
-            "source_type": "uploaded",
-            "asset_id": uploaded_assets[4]["id"],
-            "label": uploaded_assets[4]["filename"]
-        }
-        guar_image_id = uploaded_assets[4]["id"]
-    else:
-        guar_visual = {
-            "source_type": "mock-generated",
-            "asset_id": "mock-guarantee-visual",
-            "label": "guarantee-placeholder.png"
-        }
-        guar_image_id = "mock-guarantee-visual"
-
-    sections = [
-        {
-            "id": "sec-1",
-            "title": copy_set.get("hero_title", f"공간의 가치를 더하는 {product_name}"),
-            "body": copy_set.get("hero_subtitle", "편리함으로 가득한 일상을 시작해 보세요."),
-            "visual_role": "hero",
-            "image_id": hero_image_id,
-            "visual_slot": hero_visual
-        },
-        {
-            "id": "sec-2",
-            "title": copy_set.get("painpoint_title", "번거로움은 이제 그만"),
-            "body": copy_set.get("painpoint_body", "더 간편하고 스마트한 선택을 도와드립니다."),
-            "visual_role": "comparison",
-            "image_id": comp_image_id,
-            "visual_slot": comp_visual
-        },
-        {
-            "id": "sec-3",
-            "title": copy_set.get("feature_1_title", "믿을 수 있는 기술력"),
-            "body": copy_set.get("feature_1_body", "오직 고객을 위해 설계된 뛰어난 기능성"),
-            "visual_role": "detail_1",
-            "image_id": d1_image_id,
-            "visual_slot": d1_visual
-        },
-        {
-            "id": "sec-4",
-            "title": copy_set.get("feature_2_title", "엄격한 안전 검증 통과"),
-            "body": copy_set.get("feature_2_body", "가족 모두 안심하고 사용할 수 있는 제품"),
-            "visual_role": "detail_2",
-            "image_id": d2_image_id,
-            "visual_slot": d2_visual
-        },
-        {
-            "id": "sec-5",
-            "title": copy_set.get("guarantee_title", "정품 등록 및 철저한 A/S"),
-            "body": copy_set.get("guarantee_body", "구매 이후에도 지속적인 사후 혜택을 약속합니다."),
-            "visual_role": "guarantee",
-            "image_id": guar_image_id,
-            "visual_slot": guar_visual
-        }
+    """Build the UX-2 page without using supplier or URL reference images."""
+    copy = copy_set or build_mock_copy_set(product_name)
+    section_fact_ids = copy.get("section_fact_ids") or {}
+    source_assets = list(uploaded_assets or [])
+    automatic_candidates = [
+        {**asset, "mime_type": asset.get("mime_type") or "image/jpeg"}
+        for asset in source_assets
+        if _automatic_candidate(asset)
     ]
+    allowed_assets = [asset for asset in automatic_candidates if _allowed_asset(asset)]
 
+    definitions = [
+        ("hero", "hero", "hero_title", "hero_subtitle"),
+        ("pain_point", "comparison", "painpoint_title", "painpoint_body"),
+        ("feature_1", "detail_1", "feature_1_title", "feature_1_body"),
+        ("feature_2", "detail_2", "feature_2_title", "feature_2_body"),
+        ("feature_3", "detail_3", "feature_3_title", "feature_3_body"),
+        ("usage_guide", "usage_guide", "usage_title", "usage_body"),
+        ("details_components", "details_components", "details_title", "details_body"),
+    ]
+    from src.services.image_asset_mapper import map_with_upload_order_fallback
+
+    section_inputs = [
+        {"id": section_id, "section_type": section_id}
+        for section_id, _, _, _ in definitions
+    ]
+    assignments = map_with_upload_order_fallback(section_inputs, allowed_assets)
+    # Map the original candidate sequence once more for explanation only.
+    # Giving every candidate a temporary unique group lets us identify the
+    # *specific* section that would have received a blocked OCR image or a
+    # same-hash copy. The actual assignment above remains deduplicated.
+    explanation_assets = [
+        {**asset, "content_hash": f"explanation:{asset.get('id')}"}
+        for asset in automatic_candidates
+    ]
+    explanation_assignments = map_with_upload_order_fallback(
+        section_inputs, explanation_assets
+    )
+    assigned_asset_ids = {
+        str(item["section_id"]): str(item["asset_id"]) for item in assignments
+    }
+    assets_by_id = {str(asset["id"]): asset for asset in allowed_assets}
+    candidate_by_id = {str(asset["id"]): asset for asset in automatic_candidates}
+    explanation_asset_by_section = {
+        str(item["section_id"]): str(item["asset_id"])
+        for item in explanation_assignments
+    }
+    duplicate_candidate_ids = _duplicate_candidate_ids(automatic_candidates)
+    sections: list[dict] = []
+    for index, (section_id, visual_role, title_key, body_key) in enumerate(definitions):
+        asset = assets_by_id.get(assigned_asset_ids.get(section_id, ""))
+        image_id, visual_slot = _visual_slot(asset, visual_role)
+        assignment = next(
+            (item for item in assignments if item["section_id"] == section_id),
+            None,
+        )
+        section = {
+            "id": section_id,
+            "section_type": section_id,
+            "title": copy.get(title_key) or title_key.replace("_", " "),
+            "body": copy.get(body_key) or "판매자 입력 상품 정보를 기준으로 안내합니다.",
+            "visual_role": visual_role,
+            "image_id": image_id,
+            "visual_slot": visual_slot,
+            "image_assignment": assignment,
+            "associated_fact_ids": list(section_fact_ids.get(section_id) or []),
+        }
+        explanation_asset_id = explanation_asset_by_section.get(section_id)
+        explanation_asset = candidate_by_id.get(explanation_asset_id or "")
+        replacement_reasons = (
+            _automatic_placement_risk_codes(explanation_asset)
+            if explanation_asset else []
+        )
+        if explanation_asset_id in duplicate_candidate_ids:
+            replacement_reasons.append("duplicate_asset_group")
+        if image_id is None and replacement_reasons:
+            section["ux2d1_auto_replacement"] = {
+                "strategy": "html_information",
+                "reason_codes": sorted(set(replacement_reasons)),
+            }
+        sections.append(section)
     return {"sections": sections}
 
 
 def build_mock_qa_report(product_name: str) -> dict:
     return {
         "status": "passed",
-        "checked_at": "2026-07-03T14:30:00Z",
+        "checked_at": "2026-08-06T00:00:00Z",
         "warnings": [],
-        "passed_checks": ["과장 표현 검증 완료", "유해 성분 언급 적합성 통과"],
+        "passed_checks": ["근거 없는 인증·안전·효능·보증 문구를 사용하지 않았습니다."],
     }

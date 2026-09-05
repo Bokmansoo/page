@@ -18,17 +18,11 @@ interface ProjectWorklistResponse {
   items: ProjectWorklistItem[];
 }
 
-function mockHeaders(): Record<string, string> {
-  if (typeof window === "undefined") return {};
-  return {
-    "X-Mock-User-Id": localStorage.getItem("X-Mock-User-Id") || "00000000-0000-0000-0000-000000000001",
-    "X-Mock-Workspace-Id": localStorage.getItem("X-Mock-Workspace-Id") || "00000000-0000-0000-0000-000000000002",
-  };
-}
+function sessionHeaders(): Record<string, string> { return {}; }
 
 export async function fetchProjectWorklist(): Promise<ProjectWorklistItem[]> {
   const response = await fetch(apiUrl("/api/v1/projects/worklist"), {
-    headers: mockHeaders(),
+    headers: sessionHeaders(), credentials: "include",
     cache: "no-store",
   });
   if (!response.ok) {

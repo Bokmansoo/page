@@ -34,7 +34,7 @@ def mock_agent_runner(db_session):
             asset = Asset(
                 id=uploaded_asset_id,
                 project_id=project.id,
-                source_type="sourced",
+                source_type="uploaded",
                 filename=uploaded_filename,
                 file_path=f"./uploads/{uploaded_filename}",
                 mime_type="image/png",
@@ -94,36 +94,30 @@ def test_mock_generation_prefers_uploaded_image_for_visual_slots(mock_agent_runn
     assert "삼탠바이미.png" in hero_visual["label"]
 
 
-def test_mock_generation_without_upload_or_url_uses_only_mock_generated_sources(mock_agent_runner):
+def test_mock_generation_without_upload_or_url_requests_a_product_photo(mock_agent_runner):
     result = mock_agent_runner(
         product_name="Samsung Smart Monitor Moving Stand",
         description="A movable smart monitor for living rooms and bedrooms",
     )
 
-    generated_images = result["generated_assets"]["images"]
     page_sections = result["page_assembly"]["sections"]
     source_types = {
-        image["source_type"] for image in generated_images
-    } | {
         section["visual_slot"]["source_type"] for section in page_sections
     }
 
-    assert source_types == {"mock-generated", "html-graphic"}
-    assert "mock-uploaded-dummy" not in {image["id"] for image in generated_images}
-    assert "mock-comparison-visual" not in {image["id"] for image in generated_images}
-    assert not any("images.unsplash.com" in image["url"] for image in generated_images)
+    assert source_types == {"missing-image", None}
+    assert "generated_assets" not in result
 
 
-def test_mock_generation_with_url_marks_only_url_extracted_slots(mock_agent_runner):
+def test_mock_generation_with_unmaterialized_url_requests_a_product_photo(mock_agent_runner):
     result = mock_agent_runner(
         product_name="Samsung Smart Monitor Moving Stand",
         product_url="https://example.com/products/smart-monitor",
     )
 
-    generated_images = result["generated_assets"]["images"]
-    url_images = [image for image in generated_images if image["source_type"] == "url-extracted"]
-    source_types = {image["source_type"] for image in generated_images}
+    source_types = {
+        section["visual_slot"]["source_type"]
+        for section in result["page_assembly"]["sections"]
+    }
 
-    assert source_types <= {"url-extracted", "mock-generated"}
-    assert len(url_images) == 1
-    assert url_images[0]["id"] == "mock-url-extracted-image"
+    assert source_types == {"missing-image", None}

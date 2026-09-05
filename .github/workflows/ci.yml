@@ -5,10 +5,33 @@ on:
     branches: [ master, main ]
   pull_request:
     branches: [ master, main ]
+  workflow_dispatch:
 
 jobs:
   backend-tests:
     runs-on: ubuntu-latest
+    services:
+      postgres-test:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: sellform_test
+          POSTGRES_USER: sellform_test
+          POSTGRES_PASSWORD: test-only-password
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U sellform_test -d sellform_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      APP_ENV: test
+      SELLFORM_ALLOW_TEST_DATABASE: "1"
+      TEST_DATABASE_URL: postgresql+psycopg://sellform_test:test-only-password@127.0.0.1:5433/sellform_test
+      E2E_DATABASE_URL: postgresql+psycopg://sellform_test:test-only-password@127.0.0.1:5433/sellform_test
+      DATABASE_URL: postgresql+psycopg://sellform_test:test-only-password@127.0.0.1:5433/sellform_test
+      SELLFORM_LANGGRAPH_CHECKPOINT_DATABASE_URL: postgresql+psycopg://sellform_test:test-only-password@127.0.0.1:5433/sellform_test
+      SELLFORM_IMAGE_WORKER_ENABLED: "false"
     steps:
       - uses: actions/checkout@v4
 
@@ -23,6 +46,16 @@ jobs:
           echo "$HOME/.local/bin" >> $GITHUB_PATH
           cd backend
           uv sync --dev
+
+      - name: Install Playwright Chromium
+        run: |
+          cd backend
+          uv run playwright install --with-deps chromium
+
+      - name: Prepare PostgreSQL test schema
+        run: |
+          cd backend
+          uv run python -m scripts.run_postgres_test_migrations
 
       - name: Run Backend Tests
         run: |

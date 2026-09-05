@@ -72,6 +72,28 @@ interface CachedGenerationResult {
   outputs: AgentOutputs;
 }
 
+// React development mode verifies effect cleanup by running an effect twice.
+// Both mounts must await the same generation request; otherwise one browser
+// visit can start two backend pipelines and materialize two ProductPage rows.
+const generationRequests = new Map<string, Promise<RunResponse>>();
+
+function requestGenerationOnce(runId: string): Promise<RunResponse> {
+  const pending = generationRequests.get(runId);
+  if (pending) return pending;
+
+  const request = fetch(apiUrl(`/api/agent-runs/${runId}/run`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+  }).then(async (response) => {
+    if (!response.ok) throw new Error("상세페이지 생성 요청에 실패했습니다.");
+    return response.json() as Promise<RunResponse>;
+  });
+  generationRequests.set(runId, request);
+  void request.catch(() => generationRequests.delete(runId));
+  return request;
+}
+
 const GENERATION_STEPS = [
   "상품 이해",
   "판매 방향 추천",
@@ -138,18 +160,15 @@ export default function GenerationProgressShell({ runId }: GenerationProgressShe
     }
 
     let cancelled = false;
-    const uid = localStorage.getItem("X-Mock-User-Id") || "00000000-0000-0000-0000-000000000001";
-    const wid = localStorage.getItem("X-Mock-Workspace-Id") || "00000000-0000-0000-0000-000000000002";
     const headers = {
       "Content-Type": "application/json",
-      "X-Mock-User-Id": uid,
-      "X-Mock-Workspace-Id": wid,
     };
 
     const pollProgress = async () => {
       try {
         const res = await fetch(apiUrl(`/api/agent-runs/${runId}/status`), {
           headers,
+          credentials: "include",
           cache: "no-store",
         });
         if (!res.ok || cancelled) return;
@@ -178,13 +197,7 @@ export default function GenerationProgressShell({ runId }: GenerationProgressShe
 
     const runGeneration = async () => {
       try {
-        const res = await fetch(apiUrl(`/api/agent-runs/${runId}/run`), {
-          method: "POST",
-          headers,
-        });
-
-        if (!res.ok) throw new Error("상세페이지 생성 요청에 실패했습니다.");
-        const data = (await res.json()) as RunResponse;
+        const data = await requestGenerationOnce(runId);
         if (cancelled) return;
         setProjectId(data.project_id);
         setOutputs(data.outputs);

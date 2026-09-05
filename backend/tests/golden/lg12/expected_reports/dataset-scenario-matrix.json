@@ -1,0 +1,50 @@
+{
+  "contract_v1": {
+    "case_count": 15,
+    "content_hash": "<sha256>",
+    "version": "v1"
+  },
+  "coverage": {
+    "categories": [
+      "뷰티",
+      "생활용품",
+      "식품",
+      "전자제품",
+      "패션"
+    ],
+    "channels": [
+      "smartstore",
+      "coupang"
+    ],
+    "design_directions": [
+      "safe_information",
+      "image_centric",
+      "balanced_sale"
+    ],
+    "modes": [
+      "manual",
+      "owned_product_url",
+      "photo_only"
+    ],
+    "scenarios": [
+      "PASS",
+      "COPY_REWORK_TO_PASS",
+      "VISUAL_REWORK_TO_PASS",
+      "PLAN_REWORK_TO_PASS",
+      "IMAGE_REWORK_TO_PASS",
+      "NEEDS_REVIEW",
+      "FAIL_POLICY_BLOCK",
+      "MAX_TWO_EXHAUSTED",
+      "STALE_PROMOTION_EXPORT_BLOCKED"
+    ]
+  },
+  "intake_v2": {
+    "case_count": 15,
+    "content_hash": "<sha256>",
+    "parent": {
+      "hash": "<sha256>",
+      "version": "v1"
+    },
+    "version": "v2"
+  }
+}

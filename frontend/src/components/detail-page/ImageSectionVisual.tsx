@@ -19,6 +19,8 @@ export default function ImageSectionVisual({
   const badges = payload.badges || [];
   const title = section.title || "";
   const body = section.body_copy || section.body || "";
+  const isAiRedesignRequired = payload.missing_state === "ai_redesign_required";
+  const imageFit = payload.image_fit === "cover" ? "object-cover" : "object-contain";
 
   if (!imageSrc) {
     return (
@@ -26,7 +28,9 @@ export default function ImageSectionVisual({
         className="mt-8 flex aspect-[4/3] items-center justify-center border border-amber-200 bg-amber-50 text-sm font-bold text-amber-700"
         data-section-visual="image"
       >
-        이미지 확인이 필요합니다
+        {isAiRedesignRequired
+          ? "AI 리디자인 이미지 생성 및 검토가 필요합니다"
+          : "대표 상품 사진을 추가해 주세요"}
       </div>
     );
   }
@@ -46,7 +50,7 @@ export default function ImageSectionVisual({
       <img
         src={imageSrc}
         alt={section.title || ""}
-        className="aspect-[4/3] w-full object-cover"
+        className={`aspect-[4/3] w-full bg-white ${imageFit}`}
       />
       <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-slate-950/85 via-slate-950/25 to-transparent" />
       <figcaption className="absolute inset-x-0 bottom-0 p-5 text-white">

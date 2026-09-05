@@ -1,5 +1,6 @@
 from typing import Any, Dict, List
 from src.db.models import ProductFact, ProductProject
+from src.services.commerce_policy import is_confirmed_fact_status
 
 class PageComposerService:
     @staticmethod
@@ -20,20 +21,38 @@ class PageComposerService:
                 fact_id = fact.get("id")
                 fact_text = fact.get("fact_text") or fact.get("text")
                 fact_source = fact.get("source_text") or fact.get("source") or "unknown"
-                fact_status = fact.get("verification_status", "confirmed")
+                fact_status = fact.get("verification_status", "extracted")
             else:
                 fact_id = fact.id
                 fact_text = fact.fact_text
                 fact_source = fact.extraction_source or "unknown"
                 fact_status = fact.verification_status
 
+            field_key = fact.get("field_key") if is_dict else fact.field_key
+            normalized_value = fact.get("normalized_value") if is_dict else fact.normalized_value
+            normalized_unit = fact.get("normalized_unit") if is_dict else fact.normalized_unit
+            if field_key == "charging_port" and str(normalized_value or "").replace("-", "").lower() in {
+                "typec",
+                "usbc",
+            }:
+                normalized_value = "Type-C"
+            display_text = fact_text
+            if normalized_value not in (None, "") and ":" in (fact_text or ""):
+                label = fact_text.split(":", 1)[0].strip()
+                display_text = f"{label}: {str(normalized_value).strip()}{str(normalized_unit or '').strip()}"
+
             fact_data = {
                 "id": fact_id,
-                "text": fact_text,
+                "text": display_text,
                 "source": fact_source,
+                "field_key": field_key,
+                "normalized_value": normalized_value,
+                "normalized_unit": normalized_unit,
+                "scope": (fact.get("scope") if is_dict else fact.scope) or "product",
+                "model_option": fact.get("model_option") if is_dict else fact.model_option,
             }
 
-            if fact_status == "confirmed":
+            if is_confirmed_fact_status(fact_status):
                 confirmed_facts.append(fact_data)
             else:
                 needs_verification.append(fact_data)
@@ -41,17 +60,10 @@ class PageComposerService:
         # 2. Prioritize URL source if present
         confirmed_facts.sort(key=lambda f: 0 if f["source"] == "url" else 1)
 
-        # 3. Incorporate user inputs, options, and image descriptions
+        # 3. Keep seller input as context only. Raw intake text may contain
+        # unreviewed numbers or claims, so it must never be promoted into the
+        # confirmed fact list used for section copy and grounding checks.
         snapshot = project.intake_snapshot if isinstance(project.intake_snapshot, dict) else {}
-        
-        # User input text
-        if project.raw_input_text:
-            if not any(f["text"] == project.raw_input_text for f in confirmed_facts):
-                confirmed_facts.append({
-                    "id": "raw_input_text",
-                    "text": project.raw_input_text,
-                    "source": "manual_text"
-                })
 
         # Product options from snapshot
         options = snapshot.get("options")
@@ -83,5 +95,6 @@ class PageComposerService:
 
         return {
             "product_facts": confirmed_facts,
-            "needs_verification": needs_verification
+            "needs_verification": needs_verification,
+            "seller_context": project.raw_input_text or "",
         }

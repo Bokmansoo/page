@@ -5,6 +5,7 @@ from src.api.auth import DEFAULT_BRAND_ID, DEFAULT_USER_ID, DEFAULT_WORKSPACE_ID
 from src.api.pages import create_page_snapshot
 from src.db.models import Asset, Brand, DetailPageVersion, ImageGenerationJobRecord, ProductProject, ProductFact, ProductPage, PageSection, PageVersion, User, Workspace
 from src.services.page_generator import PageGenerationService
+from src.services.detail_page_orchestrator import DetailPageOrchestrator
 
 
 def _create_project_with_page(client, db_session, headers=None):
@@ -103,6 +104,70 @@ def test_get_page_backfills_incomplete_html_visual_payloads(client, db_session):
     assert by_id["comparison-incomplete"]["visual_payload"]["cards"]
     assert by_id["detail-incomplete"]["visual_payload"]["cards"]
     assert by_id["guarantee-incomplete"]["visual_payload"]["table_rows"]
+
+
+def test_get_page_keeps_html_graphic_after_legacy_image_repair(client, db_session, monkeypatch):
+    """A second legacy repair must not reattach a repeated body photo."""
+    headers = {
+        "X-Mock-User-Id": DEFAULT_USER_ID,
+        "X-Mock-Workspace-Id": DEFAULT_WORKSPACE_ID,
+    }
+    user = User(id=DEFAULT_USER_ID, email="default@sellform.local", name="Default Seller")
+    workspace = Workspace(id=DEFAULT_WORKSPACE_ID, name="Default Workspace", owner_id=user.id)
+    brand = Brand(id=DEFAULT_BRAND_ID, workspace_id=workspace.id, name="Default Brand")
+    project = ProductProject(
+        id="page-graphic-wins-project",
+        workspace_id=workspace.id,
+        brand_id=brand.id,
+        name="Graphic Wins Product",
+    )
+    page = ProductPage(id="page-graphic-wins", project_id=project.id)
+    detail = PageSection(
+        id="page-graphic-wins-detail",
+        page_id=page.id,
+        section_type="detail_1",
+        title="핵심 장점",
+        body_copy="확인된 상품 정보입니다.",
+        sort_order=0,
+    )
+    asset = Asset(
+        id="page-graphic-wins-main-image",
+        project_id=project.id,
+        source_type="uploaded",
+        filename="product.jpg",
+        file_path="uploads/product.jpg",
+        mime_type="image/jpeg",
+        file_size=1,
+        asset_role="product_main",
+    )
+    fact = ProductFact(
+        project_id=project.id,
+        fact_text="확인된 상품 정보",
+        source_text="판매자 제공 정보",
+        verification_status="confirmed",
+    )
+    db_session.add_all([user, workspace, brand, project, page, detail, asset, fact])
+    db_session.commit()
+
+    def repair_legacy_images(_project, db):
+        section = db.query(PageSection).filter(PageSection.id == detail.id).one()
+        section.image_asset_id = asset.id
+        section.visual_kind = "image"
+        db.commit()
+        return 1
+
+    monkeypatch.setattr(
+        DetailPageOrchestrator,
+        "repair_mock_visual_assets",
+        staticmethod(repair_legacy_images),
+    )
+
+    response = client.get(f"/api/v1/projects/{project.id}/page", headers=headers)
+
+    assert response.status_code == 200
+    section = response.json()["sections"][0]
+    assert section["visual_kind"] == "html_graphic"
+    assert section["image_asset_id"] is None
 
 # 기본적으로 conftest에서 제공하는 클라이언트 및 db_session fixture 활용
 
@@ -494,7 +559,7 @@ def test_page_snapshot_includes_fact_and_asset_evidence(client, db_session):
     )
     asset = Asset(
         project_id=project.id,
-        source_type="sourced",
+        source_type="self_shot",
         filename="fan-main.png",
         file_path="/tmp/fan-main.png",
         mime_type="image/png",

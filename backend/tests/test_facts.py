@@ -40,7 +40,7 @@ def test_create_and_list_facts(client, setup_project):
     fact = res.json()
     assert fact["fact_text"] == "???곹뭹??媛濡?湲몄씠??100cm?낅땲??"
     assert fact["source_text"] == "Width 100cm"
-    assert fact["verification_status"] == "unknown"
+    assert fact["verification_status"] == "extracted"
     fact_id = fact["id"]
 
     # 2. List facts
@@ -70,13 +70,13 @@ def test_update_fact_and_verify_history(client, setup_project):
     # 2. Update fact text and status
     update_payload = {
         "fact_text": "???곹뭹???ㅼ젣 ?믪씠??50cm?대ŉ 源딆씠??20cm?낅땲??",
-        "verification_status": "confirmed"
+        "verification_status": "seller_confirmed"
     }
     update_res = client.patch(f"/api/v1/projects/{project_id}/facts/{fact_id}", json=update_payload, headers=headers)
     assert update_res.status_code == 200
     updated_fact = update_res.json()
     assert updated_fact["fact_text"] == "???곹뭹???ㅼ젣 ?믪씠??50cm?대ŉ 源딆씠??20cm?낅땲??"
-    assert updated_fact["verification_status"] == "confirmed"
+    assert updated_fact["verification_status"] == "seller_confirmed"
 
     # 3. Check history log
     history_res = client.get(f"/api/v1/projects/{project_id}/facts/{fact_id}/history", headers=headers)
@@ -84,7 +84,7 @@ def test_update_fact_and_verify_history(client, setup_project):
     history = history_res.json()
     assert len(history) == 1
     assert history[0]["previous_fact_text"] == "???곹뭹???몃줈 湲몄씠??50cm?낅땲??"
-    assert history[0]["previous_verification_status"] == "unknown"
+    assert history[0]["previous_verification_status"] == "extracted"
     assert history[0]["updated_by"] == "user-1"
 
 
@@ -104,7 +104,7 @@ def test_fact_confirmed_filter(client, setup_project):
     fact1_id = res1.json()["id"]
 
     # Mark as confirmed
-    client.patch(f"/api/v1/projects/{project_id}/facts/{fact1_id}", json={"verification_status": "confirmed"}, headers=headers)
+    client.patch(f"/api/v1/projects/{project_id}/facts/{fact1_id}", json={"verification_status": "seller_confirmed"}, headers=headers)
 
     # 2. Create one unknown fact
     res2 = client.post(f"/api/v1/projects/{project_id}/facts", json={
@@ -232,7 +232,7 @@ def test_auto_extract_creates_reviewable_fact_candidates_from_manual_text(client
     assert body["skipped_duplicates"] == 0
     assert body["failed_sources"] == []
     assert len(body["facts"]) == body["created_count"]
-    assert all(fact["verification_status"] in {"unknown", "needs_revision"} for fact in body["facts"])
+    assert all(fact["verification_status"] in {"extracted", "needs_review"} for fact in body["facts"])
     assert all(fact["needs_review"] is True for fact in body["facts"])
     assert {fact["extraction_source"] for fact in body["facts"]} == {"manual_text"}
 
@@ -382,7 +382,7 @@ def test_bulk_create_facts_deduplicates_existing_fact(client, setup_project):
                     "source_text": "FAN JET ULTRA",
                 },
             ],
-            "default_status": "confirmed",
+            "default_status": "seller_confirmed",
         },
         headers=headers,
     )
@@ -397,7 +397,7 @@ def test_bulk_create_facts_deduplicates_existing_fact(client, setup_project):
     list_res = client.get(f"/api/v1/projects/{project_id}/facts", headers=headers)
     facts = list_res.json()
     assert len(facts) == 3
-    confirmed_facts = [f for f in facts if f["verification_status"] == "confirmed"]
+    confirmed_facts = [f for f in facts if f["verification_status"] == "seller_confirmed"]
     assert len(confirmed_facts) == 2
 
 
@@ -412,7 +412,7 @@ def test_bulk_create_facts_rejects_empty_items(client, setup_project):
         f"/api/v1/projects/{project_id}/facts/bulk",
         json={
             "items": [],
-            "default_status": "unknown",
+            "default_status": "extracted",
         },
         headers=headers,
     )
@@ -438,7 +438,7 @@ def test_bulk_create_facts_rejects_more_than_fifty_items(client, setup_project):
                 }
                 for index in range(51)
             ],
-            "default_status": "unknown",
+            "default_status": "extracted",
         },
         headers=headers,
     )
@@ -467,7 +467,7 @@ def test_bulk_create_facts_counts_blank_fact_as_failed(client, setup_project):
                     "source_text": "4,800mAh battery",
                 },
             ],
-            "default_status": "needs_revision",
+            "default_status": "needs_review",
         },
         headers=headers,
     )
@@ -477,7 +477,7 @@ def test_bulk_create_facts_counts_blank_fact_as_failed(client, setup_project):
     assert body["created_count"] == 1
     assert body["failed_count"] == 1
     assert body["duplicate_count"] == 0
-    assert body["created"][0]["verification_status"] == "needs_revision"
+    assert body["created"][0]["verification_status"] == "needs_review"
 
     list_res = client.get(f"/api/v1/projects/{project_id}/facts", headers=headers)
     assert list_res.status_code == 200
@@ -502,7 +502,7 @@ def test_bulk_create_facts_uses_fact_text_as_source_when_source_is_blank(client,
                     "source_text": "   ",
                 },
             ],
-            "default_status": "confirmed",
+            "default_status": "seller_confirmed",
         },
         headers=headers,
     )
@@ -664,7 +664,7 @@ def test_auto_extract_uses_openai_adapter_when_api_key_is_configured(client, db_
     assert body["created_count"] == 2
     assert body["failed_sources"] == []
     assert {fact["extraction_source"] for fact in body["facts"]} == {"ai"}
-    assert {fact["verification_status"] for fact in body["facts"]} == {"unknown"}
+    assert {fact["verification_status"] for fact in body["facts"]} == {"extracted"}
     assert all(fact["needs_review"] is True for fact in body["facts"])
 
 
@@ -695,7 +695,7 @@ def test_auto_extract_falls_back_when_openai_adapter_fails(client, monkeypatch):
     body = res.json()
     assert body["created_count"] >= 1
     assert any(failed["source"] == "ai" and failed["reason"] == "ai_adapter_failed" for failed in body["failed_sources"])
-    assert all(fact["verification_status"] in {"unknown", "needs_revision"} for fact in body["facts"])
+    assert all(fact["verification_status"] in {"extracted", "needs_review"} for fact in body["facts"])
 
 
 def test_auto_extract_uses_web_browsing_when_url_fetch_is_blocked(client, db_session, setup_project, monkeypatch):

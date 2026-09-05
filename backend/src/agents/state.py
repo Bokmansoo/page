@@ -25,7 +25,11 @@ class AgentStage(str, Enum):
 
 class ProductInput(BaseModel):
     product_name: str | None = None
+    category: str | None = None
     description: str | None = None
+    feature_details: str | None = None
+    components: str | None = None
+    cautions: str | None = None
     product_url: str | None = None
     freeform_input: str | None = None
     asset_ids: list[str] = Field(default_factory=list)
@@ -33,6 +37,7 @@ class ProductInput(BaseModel):
     selling_points: list[str] = Field(default_factory=list)
     price: str | None = None
     shipping: str | None = None
+    model_options: str | None = None
     desired_mood: list[str] = Field(default_factory=list)
 
 

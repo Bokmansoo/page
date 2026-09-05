@@ -10,6 +10,7 @@ from src.db.models import (
     ProductFact,
     ProductPage,
     ProductProject,
+    PageSection,
 )
 from src.services.detail_page_orchestrator import DetailPageOrchestrator
 
@@ -58,7 +59,7 @@ def source_asset(db_session: Session, orchestrator_project, tmp_path):
     asset = Asset(
         id="orch-remediation-source",
         project_id=orchestrator_project,
-        source_type="sourced",
+        source_type="uploaded",
         filename="source.png",
         file_path=str(img_path),
         mime_type="image/png",
@@ -95,6 +96,9 @@ def test_cost_approved_generation_pauses_at_image_review(
     source_asset,
     monkeypatch,
 ):
+    from src.config import settings
+
+    monkeypatch.setattr(settings, "SELLFORM_IMAGE_GENERATION_MODE", "real")
     DetailPageOrchestrator.run_orchestration_pipeline(
         orchestrator_project,
         db_session,
@@ -174,3 +178,93 @@ def test_url_failure_continues_when_manual_input_exists(
     status = DetailPageOrchestrator.run_orchestration_pipeline(orchestrator_project, db_session)
 
     assert status != "failed_needs_input"
+
+
+def test_mock_mode_reuses_uploaded_photo_without_calling_image_provider(
+    db_session: Session,
+    orchestrator_project,
+    source_asset,
+    monkeypatch,
+):
+    from src.config import settings
+
+    project = db_session.query(ProductProject).filter(ProductProject.id == orchestrator_project).first()
+    page = ProductPage(project_id=project.id, theme_color="#ffffff", font_family="sans")
+    db_session.add(page)
+    db_session.flush()
+    section = PageSection(id="mock-mode-section", page_id=page.id, section_type="hero", sort_order=0)
+    job = ImageGenerationJobRecord(
+        project_id=project.id,
+        job_id="mock-mode-job",
+        section_id=section.id,
+        role="representative_product",
+        source_asset_ids=[source_asset.id],
+        prompt="Product hero",
+        cost_tier="premium",
+        status="awaiting_cost_approval",
+    )
+    db_session.add_all([section, job])
+    db_session.commit()
+    monkeypatch.setattr(settings, "SELLFORM_IMAGE_GENERATION_MODE", "mock")
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("Mock image provider must not be called")
+
+    monkeypatch.setattr("src.services.detail_page_orchestrator.execute_image_generation", fail_if_called)
+
+    assert DetailPageOrchestrator._handle_images(project, db_session) == "copy_ready"
+    db_session.refresh(job)
+    db_session.refresh(section)
+    assert job.status == "approved"
+    assert job.output_asset_id == source_asset.id
+    assert job.provider == "source_asset"
+    assert section.image_asset_id == source_asset.id
+
+
+def test_legacy_mock_output_is_repaired_to_uploaded_photo(
+    db_session: Session,
+    orchestrator_project,
+    source_asset,
+):
+    project = db_session.query(ProductProject).filter(ProductProject.id == orchestrator_project).first()
+    page = ProductPage(project_id=project.id, theme_color="#ffffff", font_family="sans")
+    mock_asset = Asset(
+        id="legacy-red-mock",
+        project_id=project.id,
+        source_type="ai_generated",
+        filename="legacy-mock.png",
+        file_path=source_asset.file_path,
+        mime_type="image/png",
+        file_size=source_asset.file_size,
+    )
+    db_session.add_all([page, mock_asset])
+    db_session.flush()
+    section = PageSection(
+        id="legacy-mock-section",
+        page_id=page.id,
+        section_type="hero",
+        image_asset_id=mock_asset.id,
+        sort_order=0,
+    )
+    job = ImageGenerationJobRecord(
+        project_id=project.id,
+        job_id="legacy-mock-job",
+        section_id=section.id,
+        role="representative_product",
+        source_asset_ids=[],
+        prompt="Old mock output",
+        cost_tier="premium",
+        status="approved",
+        provider="mock",
+        model="mock-model",
+        output_asset_id=mock_asset.id,
+    )
+    db_session.add_all([section, job])
+    db_session.commit()
+
+    assert DetailPageOrchestrator.repair_mock_visual_assets(project, db_session) == 1
+    db_session.refresh(job)
+    db_session.refresh(section)
+    assert job.output_asset_id == source_asset.id
+    assert job.provider == "source_asset"
+    assert section.image_asset_id == source_asset.id

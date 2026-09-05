@@ -56,6 +56,14 @@ def _create_page(db_session):
                 body_copy="대표 설명",
                 image_asset_id="asset-hero",
                 associated_fact_ids=["fact-1"],
+                visual_kind="composed_product",
+                visual_payload={
+                    "layout_variant": "hero_product_right",
+                    "product_fit": "contain",
+                    "text_safe_area": "left",
+                    "background_token": "surface_mint",
+                    "decoration_tokens": ["soft_circle", "accent_line"],
+                },
                 sort_order=1,
                 is_visible=True,
             ),
@@ -97,6 +105,9 @@ def test_finalize_page_creates_single_final_snapshot(db_session):
         "features",
     ]
     assert final_version.sections_json["sections"][0]["image_asset_id"] == "asset-hero"
+    assert final_version.sections_json["sections"][0]["visual_kind"] == "composed_product"
+    assert final_version.sections_json["sections"][0]["visual_payload"]["product_fit"] == "contain"
+    assert "ux2d_content_quality" in final_version.sections_json
 
     finals = (
         db_session.query(DetailPageVersion)

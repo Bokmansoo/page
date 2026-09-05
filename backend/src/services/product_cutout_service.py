@@ -63,6 +63,7 @@ class ProductCutoutService:
         cutout_asset = Asset(
             project_id=source_asset.project_id,
             source_type="ai_corrected",
+            usage_status="derived_graphic",
             filename=filename,
             file_path=file_path,
             mime_type="image/png",

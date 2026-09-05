@@ -14,6 +14,8 @@ __pycache__/
 *.py[oc]
 .pytest_cache/
 backend/.pytest_cache/
+.pytest-cache/
+backend/.pytest-cache/
 
 # Virtual environments
 .venv/
@@ -46,14 +48,19 @@ playwright-report/
 frontend/test-results*/
 frontend/.pw-test-results*/
 frontend/.e2e-*/
+.playwright-cli/
+frontend/.playwright-cli/
 .pytest-tmp*/
 backend/.pytest-tmp*/
+backend/.pytest-temp*/
 backend/.test-tmp*/
 backend/.pytest_cache_temp/
 
 # Temp / generated output
 tmp/
 output/
+backend/.runtime/
+.tmp-tesseract-langs/
 
 # Runtime uploads
 uploads/
@@ -69,3 +76,19 @@ integrations/figma-bridge/dist/
 integrations/figma-plugin/node_modules/
 integrations/figma-plugin/dist/
 integrations/figma-plugin/manifest.json
+
+# Pytest temporary artifacts
+.tmp/
+
+# Stale Next.js build folders
+frontend/.next-stale*/
+frontend/.next.stale*/
+
+# Test / build temporary artifacts
+.tmp/
+.test-tmp/
+frontend/.next-stale*/
+frontend/.next.stale*/
+backend/.pytest-cache-codex/
+# Added by code-review-graph
+.code-review-graph/

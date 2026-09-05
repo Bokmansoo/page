@@ -2,6 +2,7 @@ from src.agents.mock_outputs import build_mock_product_understanding
 from src.agents.nodes.base import AgentNode
 from src.agents.schemas import ProductUnderstandingOutput
 from src.agents.state import AgentRunState
+from typing import Any
 
 
 class ProductUnderstandingAgent(AgentNode):
@@ -21,3 +22,22 @@ class ProductUnderstandingAgent(AgentNode):
             ProductUnderstandingOutput,
         )
         return state
+
+    def run_delta(
+        self,
+        *,
+        run_id: str,
+        project_id: str,
+        input_snapshot: dict[str, Any],
+        mode: str = "mock",
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        """LG-2 adapter grounded in an approved FactSnapshot reference."""
+
+        from src.services.langgraph_discovery_service import run_product_understanding
+
+        return run_product_understanding(
+            run_id=run_id,
+            project_id=project_id,
+            mode=mode,
+            input_snapshot=input_snapshot,
+        )

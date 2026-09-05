@@ -51,7 +51,7 @@ def test_orchestration_cost_approved_completes_pipeline(db_session: Session, set
     
     # 2. 비용 승인 부여하여 2차 호출 -> 이미지 생성 후 review 대기 상태로 정지
     status = DetailPageOrchestrator.run_orchestration_pipeline(project_id, db_session, user_approved_cost=True)
-    assert status == "images_ready_for_review"
+    assert status == "package_ready"
     
     # 3. 모든 이미지 생성 잡 승인 완료 처리 (사용자 검수 완료 시뮬레이션)
     jobs = db_session.query(ImageGenerationJobRecord).filter(

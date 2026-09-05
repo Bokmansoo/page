@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any, Dict
 
 
@@ -82,7 +83,31 @@ TEMPLATES: Dict[str, Dict[str, Any]] = {
 class DetailPageTemplateService:
     @staticmethod
     def get_template(template_id: str) -> Dict[str, Any] | None:
-        return TEMPLATES.get(template_id)
+        template = TEMPLATES.get(template_id)
+        if template is None:
+            return None
+
+        # Every commerce page must end with a concrete product-specification
+        # section.  It keeps the story persuasive above the fold while making
+        # seller-confirmed facts and notices easy to verify at the end.
+        normalized = deepcopy(template)
+        sections = list(normalized.get("sections") or [])
+        existing_spec_index = next(
+            (index for index, section in enumerate(sections) if section.get("type") == "specifications"),
+            None,
+        )
+        if existing_spec_index is not None:
+            final_spec = sections.pop(existing_spec_index)
+        else:
+            final_spec = {
+                "type": "specifications",
+                "role": "최종 상품 사양·고지",
+                "optional": False,
+                "visual_strategy": "html_graphic",
+            }
+        sections.append(final_spec)
+        normalized["sections"] = sections
+        return normalized
 
     @staticmethod
     def select_template_id(category: str | None, intake_snapshot: dict | None) -> str:

@@ -12,7 +12,7 @@ class GeneratedImageAsset(BaseModel):
 class ImageCandidate(BaseModel):
     candidate_id: str
     slot_id: str
-    asset_id: str
+    asset_id: str | None = None
     source_type: str
     label: str
     is_recommended: bool = False

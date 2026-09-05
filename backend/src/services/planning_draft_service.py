@@ -83,6 +83,22 @@ class PlanningDraftService:
         fact_texts = [f["text"] for f in product_facts]
         evidence_hint = fact_texts[0] if fact_texts else (project.raw_input_text or "")[:80]
 
+        def facts_for_fields(*field_keys: str, limit: int | None = None) -> list[dict[str, Any]]:
+            selected = [
+                fact
+                for field_key in field_keys
+                for fact in product_facts
+                if fact.get("field_key") == field_key
+                and (fact.get("scope") or "product") == "product"
+            ]
+            return selected if limit is None else selected[:limit]
+
+        def fact_ids_for(items: list[dict[str, Any]]) -> list[str]:
+            return [str(item["id"]) for item in items if item.get("id")]
+
+        def fact_texts_for(items: list[dict[str, Any]]) -> list[str]:
+            return [str(item["text"]) for item in items if item.get("text")]
+
         mock_templates_database = {
             "problem": (
                 "매일 겪는 사소한 번거로움, 해결할 방법이 없을까 고민하셨나요?",
@@ -121,8 +137,8 @@ class PlanningDraftService:
                 ["간편한 사용 방식과 실용성을 가장 중요하게 생각하시는 분", "기존 제품들의 번거로움에 지쳐 새로운 대안을 찾고 계셨던 분"],
             ),
             "caution": (
-                "안전한 제품 사용을 위해 반드시 지켜주실 주의사항",
-                ["기기에 무리한 힘을 가하거나 임의로 분해하지 말아주세요.", "직사광선이 닿지 않고 습기가 없는 건조한 곳에 보관을 권장합니다."],
+                "사용 전 확인할 주의사항",
+                ["사용 전 제품 설명서와 구성품을 확인해 주세요.", "제품 상태와 사용 환경을 확인한 뒤 안내에 따라 사용해 주세요."],
             ),
             "cta": (
                 f"지금 {product_name}와 함께 한결 더 편리한 하루를 시작해 보세요",
@@ -155,8 +171,53 @@ class PlanningDraftService:
             # Fallback mock values
             title, bullets = mock_templates_database.get(card_type, (f"{role} 타이틀", ["상세 카피 내용"]))
             
-            # Map source facts dynamically
-            source_facts = fact_ids[idx:idx+1] if idx < len(fact_ids) else []
+            # A final spec block must show every seller-confirmed fact, not a
+            # generic placeholder or only the last remaining fact.
+            if card_type == "specifications":
+                source_facts = fact_ids
+                if fact_texts:
+                    title = "확인된 제품 사양·고지"
+                    bullets = fact_texts
+            elif card_type == "features":
+                feature_facts = facts_for_fields(
+                    "massage_head_count",
+                    "heating_temperature",
+                    "charging_port",
+                    "battery_capacity",
+                    "total_use_time",
+                    "single_operation_time",
+                    limit=4,
+                )
+                source_facts = fact_ids_for(feature_facts)
+                title = "확인된 핵심 기능을 한눈에"
+                bullets = fact_texts_for(feature_facts) or [
+                    "판매자가 확인한 제품 기능과 사용 정보를 확인해 보세요."
+                ]
+            elif card_type == "hero":
+                hero_facts = facts_for_fields(
+                    "total_use_time",
+                    "massage_head_count",
+                    "heating_temperature",
+                    "battery_capacity",
+                    limit=2,
+                )
+                source_facts = fact_ids_for(hero_facts)
+                title = f"{product_name}, 필요한 순간 편안한 휴식을 위한 선택"
+                bullets = fact_texts_for(hero_facts) or [
+                    "판매자가 확인한 제품 정보를 바탕으로 핵심 특징을 소개합니다."
+                ]
+            elif card_type in {"target_customer", "caution", "cta", "problem"}:
+                # Narrative guidance must not receive the next fact merely by
+                # extraction order. That produced unrelated voltage and
+                # temperature chips under caution and CTA sections.
+                source_facts = []
+            else:
+                narrative_facts = [
+                    fact
+                    for fact in product_facts
+                    if (fact.get("scope") or "product") == "product"
+                ]
+                source_facts = fact_ids_for(narrative_facts[idx:idx + 1])
 
             cards.append(
                 {

@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from src.db.models import ProductProject, ProductFact
 from src.services.detail_page_template_service import DetailPageTemplateService
 from src.services.planning_draft_service import PlanningDraftService
+from src.services.page_composer_service import PageComposerService
 
 @pytest.fixture
 def sample_project(db_session: Session):
@@ -48,7 +49,27 @@ def test_generate_draft_mock(db_session: Session, sample_project):
     
     # 사실 매핑 확인 (첫번째 카드에 mapping)
     first_card = draft["cards"][0]
-    assert first_card["source_fact_ids"] == [fact.id]
+    assert first_card["source_fact_ids"] == []
+
+
+def test_raw_seller_input_is_context_not_confirmed_generation_fact(db_session: Session, sample_project):
+    sample_project.raw_input_text = "사용 시간 2시간, 무게 1kg, 근거 없는 친환경 표현"
+    fact = ProductFact(
+        project_id=sample_project.id,
+        fact_text="무게: 1000g",
+        verification_status="seller_confirmed",
+    )
+    db_session.add(fact)
+    db_session.commit()
+
+    normalized = PageComposerService.normalize_facts(sample_project, [fact])
+
+    assert [item["id"] for item in normalized["product_facts"]] == [fact.id]
+    assert normalized["seller_context"] == sample_project.raw_input_text
+    draft = PlanningDraftService.generate_draft(sample_project, [fact], db_session)
+    specification = next(card for card in draft["cards"] if card["type"] == "specifications")
+    assert specification["source_fact_ids"] == [fact.id]
+    assert specification["bullets"] == ["무게: 1000g"]
 
 def test_planning_draft_quality_rules(db_session: Session, sample_project):
     fact = ProductFact(
@@ -80,3 +101,55 @@ def test_planning_draft_quality_rules(db_session: Session, sample_project):
             assert pattern not in title, f"Title '{title}' contains forbidden pattern '{pattern}'"
             for bullet in bullets:
                 assert pattern not in bullet, f"Bullet '{bullet}' contains forbidden pattern '{pattern}'"
+
+
+def test_mock_draft_uses_semantic_facts_and_canonical_spec_copy(db_session: Session, sample_project):
+    sample_project.category = "living"
+    facts = [
+        ProductFact(
+            project_id=sample_project.id,
+            fact_text="마사지 헤드 수: 4개",
+            field_key="massage_head_count",
+            normalized_value="4",
+            normalized_unit="개",
+            scope="product",
+            source_text="4个마사지 헤드",
+            verification_status="seller_confirmed",
+        ),
+        ProductFact(
+            project_id=sample_project.id,
+            fact_text="사용 가능 시간: 2시간",
+            field_key="total_use_time",
+            normalized_value="2",
+            normalized_unit="시간",
+            scope="product",
+            source_text="使用时间：2小时",
+            verification_status="seller_confirmed",
+        ),
+        ProductFact(
+            project_id=sample_project.id,
+            fact_text="외박스 크기: 53 × 41.5 × 32cm",
+            field_key="product_size",
+            normalized_value="53 × 41.5 × 32",
+            normalized_unit="cm",
+            scope="master_carton",
+            source_text="53x41.5x32cm",
+            verification_status="seller_confirmed",
+        ),
+    ]
+    db_session.add_all(facts)
+    db_session.commit()
+
+    draft = PlanningDraftService.generate_draft(sample_project, facts, db_session)
+    features = next(card for card in draft["cards"] if card["type"] == "features")
+    hero = next(card for card in draft["cards"] if card["type"] == "hero")
+    specifications = next(card for card in draft["cards"] if card["type"] == "specifications")
+
+    assert features["title"] == "확인된 핵심 기능을 한눈에"
+    assert features["source_fact_ids"] == [facts[0].id, facts[1].id]
+    assert features["bullets"] == ["마사지 헤드 수: 4개", "사용 가능 시간: 2시간"]
+    assert facts[2].id not in features["source_fact_ids"]
+    assert hero["source_fact_ids"] == [facts[1].id, facts[0].id]
+    assert specifications["source_fact_ids"] == [fact.id for fact in facts]
+    assert "소구점 정리 타이틀" not in features["title"]
+    assert "상세 카피 내용" not in features["bullets"]

@@ -13,7 +13,7 @@ Sellform 로컬 개발, 서버 실행, 테스트, 외부 도구 연동 절차를
 
 ## 빠른 실행 / 로컬 서버
 
-- [Sellform 서버 실행 및 LLM 모드 가이드](./2026-07-03-sellform-server-start-and-llm-mode-guide.md)
+- [Sellform 서버 실행 및 LLM 모드 가이드](./실행가이드.md)
 - [Sellform 현재 서버 실행 가이드](./2026-07-02-sellform-current-server-start-guide.md)
 - [Sellform 로컬 서버 실행 Runbook](./2026-06-24-sellform-local-server-runbook.md)
 - [Sellform CMD 기준 로컬 서버 실행 가이드](./2026-06-26-sellform-cmd-server-start-guide.md)

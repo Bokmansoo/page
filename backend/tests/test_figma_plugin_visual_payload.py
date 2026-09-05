@@ -46,7 +46,7 @@ def test_figma_payload_contains_visual_commerce_layout():
     asset.source_type = "uploaded"
     asset.mime_type = "image/png"
     asset.mime_type = "image/png"
-    asset.source_type = "sourced"
+    asset.source_type = "uploaded"
 
     db = MagicMock()
     db.query.return_value.filter.return_value.all.return_value = [asset]

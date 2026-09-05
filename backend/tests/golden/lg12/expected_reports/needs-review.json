@@ -1,0 +1,179 @@
+{
+  "frozen_page": {
+    "artifact_sha256": "f296611d6da663fdf91d2e4a7dbd0183a5c795806ae97cfba9ee24c6daffacb2",
+    "brand_kit_ref": {
+      "brand_kit_hash": "<sha256>",
+      "brand_kit_version_id": "<uuid>"
+    },
+    "id": "<uuid>",
+    "manifest_hash": "<sha256>",
+    "page_plan_ref": {
+      "artifact_hash": "<sha256>",
+      "artifact_id": "page-plan:<fixture>",
+      "artifact_key": "page_planning",
+      "artifact_version": 1,
+      "schema_version": "lg3-v1"
+    },
+    "section_ids": [
+      "hero",
+      "feature_1",
+      "product_information"
+    ],
+    "snapshot_hash": "<sha256>"
+  },
+  "graph": {
+    "attempt_ledger": [],
+    "promotion_export_readiness": "blocked",
+    "stage": "quality_review",
+    "status": "awaiting_review"
+  },
+  "lineage": {
+    "brand_kit": {
+      "hash": "<sha256>",
+      "id": "<uuid>",
+      "version": 1
+    },
+    "brief": {
+      "hash": "<sha256>",
+      "id": "<uuid>",
+      "version": 1
+    },
+    "confirmation": {
+      "hash": "<sha256>",
+      "id": "<uuid>",
+      "version": 1
+    },
+    "master": {
+      "hash": "<sha256>",
+      "id": "<uuid>",
+      "version": 1
+    },
+    "source": {
+      "hash": "<sha256>",
+      "id": "<uuid>",
+      "version": 1
+    },
+    "truth": {
+      "hash": "<sha256>",
+      "id": "<uuid>",
+      "version": 1
+    }
+  },
+  "quality_bar": {
+    "blocking_domains": [
+      "channel_preview_export_parity"
+    ],
+    "canonical_hash": "<sha256>",
+    "rework_target_types": [
+      "channel_preview_export_parity:QualityDomainResult"
+    ],
+    "routing_code": "VISUAL_REWORK",
+    "verdict": "NEEDS_REVIEW"
+  },
+  "quality_report": {
+    "canonical_hash": "<sha256>",
+    "domains": [
+      {
+        "approved_asset_manifest_hash": "<sha256>",
+        "critical_count": 0,
+        "critical_rule_ids": [],
+        "domain_id": "channel_preview_export_parity",
+        "evaluation_hash": "<sha256>",
+        "evaluator_version": "lg12-channel-preview-export-parity-v1",
+        "finding_rule_ids": [
+          "channel_parity.missing_frozen_export_artifact"
+        ],
+        "frozen_target_ref": {
+          "hash": "<sha256>",
+          "id": "<uuid>",
+          "type": "DetailPageVersion",
+          "version": "lg10-detail-page-version-v1"
+        },
+        "score": 0.0,
+        "status": "needs_review"
+      },
+      {
+        "approved_asset_manifest_hash": "<sha256>",
+        "critical_count": 0,
+        "critical_rule_ids": [],
+        "domain_id": "factual_rights_policy",
+        "evaluation_hash": "<sha256>",
+        "evaluator_version": "lg12-factual-rights-policy-v1",
+        "finding_rule_ids": [],
+        "frozen_target_ref": {
+          "hash": "<sha256>",
+          "id": "<uuid>",
+          "type": "DetailPageVersion",
+          "version": "lg10-detail-page-version-v1"
+        },
+        "score": 100,
+        "status": "complete"
+      },
+      {
+        "approved_asset_manifest_hash": "<sha256>",
+        "critical_count": 0,
+        "critical_rule_ids": [],
+        "domain_id": "image_identity_quality",
+        "evaluation_hash": "<sha256>",
+        "evaluator_version": "lg12-image-identity-quality-v1",
+        "finding_rule_ids": [],
+        "frozen_target_ref": {
+          "hash": "<sha256>",
+          "id": "<uuid>",
+          "type": "DetailPageVersion",
+          "version": "lg10-detail-page-version-v1"
+        },
+        "score": 100,
+        "status": "complete"
+      },
+      {
+        "approved_asset_manifest_hash": "<sha256>",
+        "critical_count": 0,
+        "critical_rule_ids": [],
+        "domain_id": "korean_copy_readability",
+        "evaluation_hash": "<sha256>",
+        "evaluator_version": "lg12-korean-copy-readability-v2",
+        "finding_rule_ids": [],
+        "frozen_target_ref": {
+          "hash": "<sha256>",
+          "id": "<uuid>",
+          "type": "DetailPageVersion",
+          "version": "lg10-detail-page-version-v1"
+        },
+        "score": 100,
+        "status": "complete"
+      },
+      {
+        "approved_asset_manifest_hash": "<sha256>",
+        "critical_count": 0,
+        "critical_rule_ids": [],
+        "domain_id": "layout_typography_brand_flow",
+        "evaluation_hash": "<sha256>",
+        "evaluator_version": "lg12-layout-typography-brand-flow-v2",
+        "finding_rule_ids": [],
+        "frozen_target_ref": {
+          "hash": "<sha256>",
+          "id": "<uuid>",
+          "type": "DetailPageVersion",
+          "version": "lg10-detail-page-version-v1"
+        },
+        "score": 100,
+        "status": "complete"
+      }
+    ],
+    "id": "<uuid>",
+    "threshold_profile_ref": {
+      "hash": "<sha256>",
+      "id": "<uuid>",
+      "version": 1
+    },
+    "version": 1
+  },
+  "scenario_details": {
+    "export": false,
+    "promotion": false,
+    "review_required": true
+  },
+  "schema_version": "lg12-quality-golden-baseline-v1",
+  "semantic_hash": "<sha256>"
+}
